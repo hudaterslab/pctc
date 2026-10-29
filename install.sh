@@ -1,5 +1,5 @@
 #!/bin/bash
-# 항만 AI CCTV(multi_event_integrated.py) 단말기 설치 스크립트.
+# 항만 AI CCTV(multi_event_port.py) 단말기 설치 스크립트.
 #   bash install.sh                 : 전체 설치(NPU 드라이버·펌웨어, 패키지, 설정). 크레인 ID를 묻습니다.
 #   bash install.sh --config-only   : 관제 설정만 다시 합니다(크레인 ID, cameras.csv → cctv 번호). 카메라를 바꾼 뒤에 씁니다.
 #   CRANE_ID=1 bash install.sh      : 크레인 ID를 묻지 않고 이 값으로 넣습니다.
@@ -24,7 +24,7 @@ POWER_LIMIT_SCRIPT_PATH="/usr/local/sbin/hai-power-limit.sh"
 CAM_CONFIG_FILE="$PROJECT_DIR/cameras.json"
 CAM_CSV_FILE="$PROJECT_DIR/cameras.csv"
 SYS_CONFIG_FILE="$PROJECT_DIR/system_config.json"
-TARGET_SCRIPT="$PROJECT_DIR/multi_event_integrated.py"
+TARGET_SCRIPT="$PROJECT_DIR/multi_event_port.py"
 DX_DIR="$USER_HOME/dx-runtime"
 NUMPY_VERSION="1.26.4"
 DX_FW_TAG="v2.5.6"
@@ -44,11 +44,11 @@ as_user() {
 # system_config.json이 없으면 통합본을 import해 기본값으로 만듭니다(load_system_config(), 카메라 처리는 시작하지 않음).
 ensure_system_config() {
     if [ ! -f "$SYS_CONFIG_FILE" ]; then
-        echo "-> multi_event_integrated.py 기본값으로 system_config.json을 만듭니다..."
-        (cd "$PROJECT_DIR" && as_user python3 -c 'import multi_event_integrated' > /dev/null 2>&1) || true
+        echo "-> multi_event_port.py 기본값으로 system_config.json을 만듭니다..."
+        (cd "$PROJECT_DIR" && as_user python3 -c 'import multi_event_port' > /dev/null 2>&1) || true
     fi
     if [ ! -f "$SYS_CONFIG_FILE" ]; then
-        echo "⚠️ system_config.json을 만들지 못했습니다. multi_event_integrated.py를 한 번 직접 실행해 주세요."
+        echo "⚠️ system_config.json을 만들지 못했습니다. multi_event_port.py를 한 번 직접 실행해 주세요."
         return 1
     fi
     echo "-> system_config.json: $SYS_CONFIG_FILE"
@@ -78,7 +78,7 @@ with open(cfg_path, encoding="utf-8") as f:
     cfg = json.load(f)
 before = json.dumps(cfg, sort_keys=True, ensure_ascii=False)
 
-# cameras.csv 읽기: multi_event_integrated.py의 load_rtsp_list_from_csv와 같은 규칙입니다
+# cameras.csv 읽기: multi_event_port.py의 load_rtsp_list_from_csv와 같은 규칙입니다
 # (빈 줄·# 줄·제목 줄 제외, 첫 칸, 공백·비ASCII 제거, 중복 제거). 프로그램은 이 순서로 cctv 번호 1, 2, 3...을 붙입니다.
 urls = []
 if os.path.exists(csv_path):
@@ -181,11 +181,11 @@ echo " Raspberry Pi Edge AI CCTV 서비스 하이브리드 설치"
 echo "====================================================="
 
 if [ ! -f "$TARGET_SCRIPT" ]; then
-    echo "❌ [설치 중단] 현재 폴더에 'multi_event_integrated.py' 파일이 존재하지 않습니다."
+    echo "❌ [설치 중단] 현재 폴더에 'multi_event_port.py' 파일이 존재하지 않습니다."
     exit 1
 fi
 
-# 2. system_config.json은 multi_event_integrated.py가 직접 만듭니다(처음 실행할 때 기본값으로 생성하고,
+# 2. system_config.json은 multi_event_port.py가 직접 만듭니다(처음 실행할 때 기본값으로 생성하고,
 #    이후 실행 때마다 빠진 기본값을 채워 저장). 예전 multi_event.py용 템플릿(침입·안전모 등)은 통합본과 맞지 않아
 #    쓰지 않습니다. 파일이 없으면 아래 7-1단계에서 통합본 기본값으로 만듭니다.
 
@@ -548,7 +548,7 @@ if systemctl is-enabled --quiet "$AI_SERVICE_NAME" 2>/dev/null || systemctl is-a
     echo "   끄려면: sudo systemctl disable --now $AI_SERVICE_NAME"
 else
     echo "-> 자동 실행 서비스는 등록하지 않습니다. 프로그램은 직접 실행합니다:"
-    echo "   cd $PROJECT_DIR && python3 multi_event_integrated.py --gui"
+    echo "   cd $PROJECT_DIR && python3 multi_event_port.py --gui"
 fi
 
 sudo apt install -y openssh-server
