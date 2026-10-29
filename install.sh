@@ -4,8 +4,8 @@
 #   bash install.sh --config-only   : 관제 설정만 다시 합니다(크레인 ID, cameras.csv → cctv 번호). 카메라를 바꾼 뒤에 씁니다.
 #   CRANE_ID=1 bash install.sh      : 크레인 ID를 묻지 않고 이 값으로 넣습니다.
 # cctv 번호는 묻지 않습니다. 프로그램이 cameras.csv 줄 순서대로 1, 2, 3...을 붙이므로, 그 번호를 모두 관제 전송 대상으로 넣습니다.
-# 실험 단계라 아직 넣지 않은 것(완성되면 추가): 모델 자동 다운로드(downdxnn.sh, 허깅페이스 업로드 전),
-# AI 프로그램 자동 실행 서비스(cctv_ai.service). 지금은 모델을 직접 복사하고 프로그램도 직접 실행합니다.
+# 모델은 bash download.sh로 허깅페이스(HudatersU/port)에서 받습니다. 이 스크립트는 모델을 받지 않고 있는지만 확인합니다.
+# 실험 단계라 아직 넣지 않은 것(완성되면 추가): AI 프로그램 자동 실행 서비스(cctv_ai.service). 지금은 프로그램을 직접 실행합니다.
 
 # 1. 사용자 및 경로 설정
 ACTUAL_USER=${SUDO_USER:-$USER}
@@ -387,8 +387,8 @@ fi
 echo "-----------------------------------------------------"
 echo " 8. 모델 파일 확인"
 echo "-----------------------------------------------------"
-# 모델 자동 다운로드(downdxnn.sh)는 아직 모델을 허깅페이스에 올리지 않아 넣지 않았습니다(완성되면 추가).
-# 지금은 모델 파일(.dxnn)을 이 폴더에 직접 복사하고, 여기서는 system_config.json의 models가 다 있는지만 봅니다.
+# 모델은 bash download.sh로 허깅페이스(HudatersU/port)에서 받습니다. 여기서는 받지 않고,
+# system_config.json의 models가 이 폴더에 다 있는지만 봅니다.
 if ! python3 - "$SYS_CONFIG_FILE" "$PROJECT_DIR" << 'PY'
 import json
 import os
@@ -417,7 +417,7 @@ if missing:
 print("[model-check] all configured model files exist")
 PY
 then
-    echo "⚠️ 모델 파일이 부족합니다. system_config.json의 models에 적힌 .dxnn 파일을 $PROJECT_DIR 에 복사하세요."
+    echo "⚠️ 모델 파일이 부족합니다. $PROJECT_DIR 에서 bash download.sh 로 받으세요."
 fi
 
 echo "-----------------------------------------------------"
