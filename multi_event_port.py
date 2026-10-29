@@ -351,7 +351,8 @@ def load_system_config():
                           "idle_infer_fps": 3.0},
             # YT 헤드압착(관제 11)과 양하 중 위험구역 사람 진입(관제 10 QC_APRON_HDS). Backreach와 같은 topdown을 씁니다.
             # 판단 기준값(정지 10초, 이탈 5초 등)은 YT_DEFAULT_CONFIG이고, 바꿀 값만 yt_head_crush에 적습니다(두 이벤트가 같이 씀).
-            # 사람 진입만 쓰는 값(person_hold_sec, 위험구역 가로 비율 danger_zone_width_ratio)은 yt_zone_person에 적습니다.
+            # 사람 진입만 쓰는 값(person_hold_sec, 끊김 허용 프레임 person_miss_frames, 위험구역 가로 비율
+            # danger_zone_width_ratio)은 yt_zone_person에 적습니다.
             YT_HEAD_CRUSH_EVENT: {"enabled": True, "cooldown_sec": 600, "api_event_type": 11,
                                   "blur_face": True, "blur_plate": True},
             YT_ZONE_PERSON_EVENT: {"enabled": True, "cooldown_sec": 600, "api_event_type": 10,
@@ -4273,6 +4274,9 @@ YT_DEFAULT_CONFIG = {
     # 위험구역(노랑) 안에 사람이 이 시간 이상 있으면 알람합니다(사람마다 따로, 구역을 나가면 다시 0초). 0이면 바로 알람합니다.
     # 사람 진입(yt_zone_person) 설정에 적습니다.
     "person_hold_sec": 3.0,
+    # 사람이 구역 안으로 안 잡힌 프레임(검출이 끊기거나 박스가 경계 밖으로 잠깐 흔들림)이 연속 이 수 이하면
+    # 머문 시간을 이어 셉니다. 이보다 길면 구역을 나간 것으로 보고 다시 0초부터입니다. 사람 진입(yt_zone_person) 설정에 적습니다.
+    "person_miss_frames": 3,
     # 위험구역(노랑) 가로 = 빈 샤시 높이(차선 방향 길이) × 이 값, 샤시 가운데 기준입니다. 높이는 빈 샤시 그대로입니다.
     # 예: 1.5면 가로가 샤시 높이의 1.5배. 사람 진입(yt_zone_person) 설정에 적습니다.
     "danger_zone_width_ratio": 1.0,
@@ -4670,12 +4674,14 @@ class YTHeadCrushDetector(_YTDetectorBase):
 class YTZonePersonDetector(_YTDetectorBase):
     """YT 양하 감시 중(YT 헤드+빈 샤시가 10초 정지)에 위험구역(노랑) 안에 작업자가 있으면 알람합니다.
     위험구역은 감시 중인 YT마다 빈 샤시 박스로 만듭니다(yt_danger_zone, 가로 비율 danger_zone_width_ratio).
-    사람 박스가 구역에 조금이라도 겹치거나 닿으면 안으로 봅니다."""
+    사람 박스가 구역에 조금이라도 겹치거나 닿으면 안으로 봅니다. 안으로 안 잡힌 프레임이 연속 person_miss_frames
+    이하면 머문 시간을 이어 셉니다(검출 깜빡임)."""
     gui_name = "YT ZONE PERSON"
 
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(config, roi_poly, roi_lines)
-        self.inside_since = {}
+        self.inside_since = {}   # 추적 번호 -> 구역 안으로 처음 잡힌 시각
+        self.missed = {}         # 추적 번호 -> 구역 안으로 안 잡힌 연속 프레임 수
 
     def danger_zones(self, snapshot):
         """감시 중인 YT마다 (YT 상태, 위험구역 [x1, y1, x2, y2]). 화면(Camera.draw)도 이 구역을 그립니다."""
@@ -4688,7 +4694,7 @@ class YTZonePersonDetector(_YTDetectorBase):
         t = snapshot.get("timestamp")
         zones = self.danger_zones(snapshot)
         if t is None or not zones:
-            self.inside_since = {}
+            self.inside_since, self.missed = {}, {}
             return []
         persons = [obj for obj in _yt_parse_tracks(kwargs.get('topdown_tracks'))
                    if obj.name in self.config["person_classes"]]
@@ -4726,7 +4732,11 @@ class YTZonePersonDetector(_YTDetectorBase):
                     'inside_sec': round(t - since, 2), 'person_hold_sec': hold,
                 },
             })
-        self.inside_since = {tid: since for tid, since in self.inside_since.items() if tid in inside}
+        # 이번 프레임에 구역 안으로 안 잡힌 사람은 끊긴 프레임을 세고, person_miss_frames를 넘으면 지웁니다(다시 0초).
+        limit = int(self.config["person_miss_frames"])
+        missed = {tid: 0 if tid in inside else self.missed.get(tid, 0) + 1 for tid in self.inside_since}
+        self.missed = {tid: n for tid, n in missed.items() if n <= limit}
+        self.inside_since = {tid: since for tid, since in self.inside_since.items() if tid in self.missed}
         return triggered
 
 
