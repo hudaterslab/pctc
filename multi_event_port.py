@@ -1844,23 +1844,13 @@ def moving_tracks(hist_store, tracks, now):
 
 
 def record_frame_from_display(display_fr, size):
-    """GUI 화면 그림(Camera.draw 결과)을 녹화 크기(size = (가로, 세로), 추론 프레임 크기)로 맞추고 오른쪽 아래에 시각을 적습니다.
+    """녹화용 그림(Camera.draw(for_record=True) 결과)을 녹화 크기(size = (가로, 세로), 추론 프레임 크기)로 맞춥니다.
     과속(고해상도 원본)·콘(가로 1280) 카메라는 화면이 추론 프레임보다 커서 줄입니다(녹화 메모리는 예전과 같음).
-    GUI 화면은 그대로 두도록 새 그림에 씁니다."""
+    관제 요청으로 시각(Event Time)은 적지 않습니다."""
     w, h = int(size[0]), int(size[1])
     if display_fr.shape[1] != w or display_fr.shape[0] != h:
-        out = cv2.resize(display_fr, (w, h), interpolation=cv2.INTER_AREA)
-    else:
-        out = display_fr.copy()
-    ui = max(1.0, w / 720.0)
-    text = f"Event Time: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-    size_px, thick, pad = 0.5 * ui, max(1, int(round(ui))), int(round(4 * ui))
-    (tw, tht), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, size_px, thick)
-    # 알람 빨간 테두리(두께 20 × 배율)에 가리지 않게 안쪽에 적습니다.
-    x, y = w - tw - int(round(16 * ui)), h - base - int(round(16 * ui))
-    cv2.rectangle(out, (x - pad, y - tht - pad), (x + tw + pad, y + base + pad), (0, 0, 0), -1)
-    cv2.putText(out, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, size_px, (255, 255, 255), thick, cv2.LINE_AA)
-    return out
+        return cv2.resize(display_fr, (w, h), interpolation=cv2.INTER_AREA)
+    return display_fr
 
 
 class VideoRecorder:
@@ -8385,11 +8375,12 @@ class Camera:
 
         return t_main, t_topdown, {t: info['evt'] for t, info in self.visual_alarms.items()}, newly_triggered_events
 
-    def draw(self, fr, t_main, t_topdown, alarms, connected=True, inference_shape=None):
+    def draw(self, fr, t_main, t_topdown, alarms, connected=True, inference_shape=None, for_record=False):
         """카메라 한 대의 화면(박스·ROI·상태 글자)을 그립니다.
 
         과속 카메라는 GUI에서 받은 원본(화면용) 프레임에 추론 좌표를 변환해 그리고 레이더 속도·투영점을 표시합니다.
-        그 외 카메라는 추론 프레임에 그대로 그립니다(inference_shape 없음 = 배율 1)."""
+        그 외 카메라는 추론 프레임에 그대로 그립니다(inference_shape 없음 = 배율 1).
+        for_record=True는 관제 영상용 녹화 그림입니다. 관제 요청으로 AI FPS와 객체 점수(conf)를 적지 않습니다."""
         if fr is None or not connected:
             blank = np.zeros((360, 640, 3), dtype=np.uint8)
             cv2.putText(blank, f"CAM {self.cam_id} NO SIGNAL", (50, 180), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,255), 1)
@@ -8475,8 +8466,9 @@ class Camera:
             elif cls_id == ID_G_CAR: label, color = f"Car [{tid}]", (255, 100, 0)
             elif cls_id == ID_G_TRUCK: label, color = f"LineTruck [{tid}]", (255, 100, 0)
             else: label = f"OBJ [{tid}]"
-            # 객체 점수(conf): 추적이 마지막으로 맞춘 검출의 점수입니다.
-            label = f"{label} {float(t[5]):.2f}"
+            # 객체 점수(conf): 추적이 마지막으로 맞춘 검출의 점수입니다(관제 영상에는 적지 않음).
+            if not for_record:
+                label = f"{label} {float(t[5]):.2f}"
 
             if is_alarmed:
                 color = (0, 0, 255)
@@ -8507,7 +8499,8 @@ class Camera:
             if name == "PERSON": label, color = f"Person [{tid}]", (0, 255, 0)
             elif name == "VEHICLE": label, color = f"Car [{tid}]", (255, 100, 0)
             else: label, color = f"{name} [{tid}]", (0, 255, 0)
-            label = f"{label} {float(t[5]):.2f}"
+            if not for_record:
+                label = f"{label} {float(t[5]):.2f}"
             if is_alarmed:
                 color = (0, 0, 255)
                 label = f"ALARM: {label}"
@@ -8564,7 +8557,8 @@ class Camera:
                 color = (0, 255, 0) if is_picked else (160, 160, 160)
                 p1, p2 = cone_pt(*c["xyxy"][:2]), cone_pt(*c["xyxy"][2:])
                 cv2.rectangle(fr, p1, p2, color, th(2) if is_picked else th(1))
-                cv2.putText(fr, f"CONT {c['conf']:.2f}", (p1[0] + px(4), p1[1] + px(16)), cv2.FONT_HERSHEY_SIMPLEX, fs(0.5), color, th(1))
+                cont_label = "CONT" if for_record else f"CONT {c['conf']:.2f}"
+                cv2.putText(fr, cont_label, (p1[0] + px(4), p1[1] + px(16)), cv2.FONT_HERSHEY_SIMPLEX, fs(0.5), color, th(1))
             for roi in cone_overlay["rois"]:
                 cv2.rectangle(fr, cone_pt(*roi[:2]), cone_pt(*roi[2:]), (0, 255, 255), th(1))
             for k in cone_overlay["cones"]:
@@ -8576,7 +8570,8 @@ class Camera:
                     color = (0, 165, 255)
                 p1, p2 = cone_pt(*k["xyxy"][:2]), cone_pt(*k["xyxy"][2:])
                 cv2.rectangle(fr, p1, p2, color, th(2))
-                cv2.putText(fr, f"{k['conf']:.2f}", (p1[0], max(px(12), p1[1] - px(4))), cv2.FONT_HERSHEY_SIMPLEX, fs(0.5), color, th(1))
+                if not for_record:
+                    cv2.putText(fr, f"{k['conf']:.2f}", (p1[0], max(px(12), p1[1] - px(4))), cv2.FONT_HERSHEY_SIMPLEX, fs(0.5), color, th(1))
             banner_color = {"NG": (0, 0, 255), "ARMED": (0, 165, 255), "DEPARTING": (255, 0, 255)}.get(
                 cone_overlay["state"], (0, 255, 0))
             hud_text(f"CONE_NG #{cone_overlay['session']} {cone_overlay['state']} ({cone_overlay['stage']})",
@@ -8585,10 +8580,11 @@ class Camera:
         hud_y = px(20)
         hud_text(f"CAM {self.cam_id}", (px(10), hud_y), (0, 255, 255), 0.55)
         hud_y += px(24)
-        # AI FPS가 목표(10) 이상이면 초록, 미만이면 빨강
-        fps_color = (0, 255, 0) if self.current_fps >= 10.0 else (0, 0, 255)
-        hud_text(f"AI FPS: {self.current_fps:.1f}", (px(10), hud_y), fps_color, 0.55)
-        hud_y += px(24)
+        if not for_record:
+            # AI FPS가 목표(10) 이상이면 초록, 미만이면 빨강
+            fps_color = (0, 255, 0) if self.current_fps >= 10.0 else (0, 0, 255)
+            hud_text(f"AI FPS: {self.current_fps:.1f}", (px(10), hud_y), fps_color, 0.55)
+            hud_y += px(24)
 
         if BACKREACH_EVENT in self.handlers:
             twist_lock = (self._last_plc_state or (None, None))[0]
@@ -9551,25 +9547,30 @@ def main():
                     # 카메라마다 AI FPS(초당 추론·이벤트 판정 횟수)를 CURRENT_FPS_LOG_INTERVAL_SEC(기본 10초)마다 남깁니다.
                     logger.info(format_ai_fps_log(c))
 
-                # 녹화 영상은 GUI 화면과 같은 그림입니다(상자·이름·점수, 알람 빨간 테두리, ROI·YT 구역, 상태 글자).
+                # 녹화 영상은 GUI 화면과 같은 그림입니다(상자·이름, 알람 빨간 테두리, ROI·YT 구역, 상태 글자).
+                # 관제 요청으로 녹화에는 AI FPS·객체 점수(conf)를 빼고 따로 그립니다(GUI 화면은 그대로).
                 # GUI를 켜지 않고 돌려도 녹화할 화면(infer_meta 있음)은 같은 방법으로 그립니다.
                 if is_gui_mode or infer_meta:
+                    inference_shape = None
                     if SPEEDING_EVENT in c.events:
                         # 과속 카메라: 고해상도 원본에 그림(번호판·레이더 점 확인용)
                         display_source = source_fr if source_fr is not None else fr
-                        display_fr = c.draw(display_source.copy(), t_main, t_topdown, alarms, True, inference_shape=fr.shape)
+                        inference_shape = fr.shape
                     elif CONE_NG_EVENT in c.events and source_fr is not None:
                         # 콘 카메라: 원본을 가로 1280으로 줄여 그림(콘이 추론 프레임 640폭에서는 너무 작음)
                         sh, sw = source_fr.shape[:2]
                         dw = min(1280, sw)
                         display_source = cv2.resize(source_fr, (dw, int(round(sh * dw / float(sw)))), interpolation=cv2.INTER_AREA)
-                        display_fr = c.draw(display_source, t_main, t_topdown, alarms, True, inference_shape=fr.shape)
+                        inference_shape = fr.shape
                     else:
-                        display_fr = c.draw(fr.copy(), t_main, t_topdown, alarms, True)
-
-                if infer_meta:
-                    c.recorder.update(record_frame_from_display(display_fr, (fr.shape[1], fr.shape[0])),
-                                      infer_meta, timestamp=now_time)
+                        display_source = fr
+                    if is_gui_mode:
+                        display_fr = c.draw(display_source.copy(), t_main, t_topdown, alarms, True, inference_shape=inference_shape)
+                    if infer_meta:
+                        record_fr = c.draw(display_source.copy(), t_main, t_topdown, alarms, True,
+                                           inference_shape=inference_shape, for_record=True)
+                        c.recorder.update(record_frame_from_display(record_fr, (fr.shape[1], fr.shape[0])),
+                                          infer_meta, timestamp=now_time)
 
                 if is_gui_mode:
                     last_rendered_frames[c.ip] = display_fr
