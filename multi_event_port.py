@@ -130,7 +130,6 @@ try:
 except ImportError:
     fcntl = None
 
-from plc_simulator import PLCSimulator
 requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
 
 API_SEND_STATE = {"consecutive_failures": 0}
@@ -291,8 +290,6 @@ def load_system_config():
         "event_api": {"verify_tls": True},
         "video_api": {"verify_tls": True, "timeout_sec": 60},
         "roi_snapshot": {"interval_sec": 3600, "verify_tls": True},
-        # Backreach 가상 PLC(twist_lock 0/1 교대) 유지 시간
-        "plc_simulator": {"hold_time_sec": 15.0},
         "system_performance": {
             "target_fps": 10.0,
             "dynamic_cpu_adjust_enabled": False,
@@ -345,10 +342,12 @@ def load_system_config():
                 # 2x2 한 영상으로 합칩니다(관제로 보내지 않고 단말에만 저장). 카메라가 1대인 그룹은 만들지 않습니다.
                 "group_video": True
             },
-            # Backreach: PLC twist_lock=1일 때 topdown 객체 bbox가 다각형 ROI와 겹치면 이벤트(다른 이벤트와 같은 쿨다운·중복 제한).
-            # idle_infer_fps: PLC twist_lock이 1이 아닌 동안(이벤트를 낼 수 없음) topdown 추론 횟수(초당, 0 = 줄이지 않음).
+            # Backreach: 감시 ON일 때 topdown 객체 bbox가 다각형 ROI와 겹치면 이벤트(다른 이벤트와 같은 쿨다운·중복 제한).
+            # PLC 신호를 받을 수 없어 ON·OFF는 화면의 스프레더로 정합니다(BackreachSpreaderGate): topdown이 스프레더를
+            # spreader_on_sec(초) 넘게 보면 ON, spreader_miss_frames(추론 프레임)보다 오래 못 보면 OFF.
+            # idle_infer_fps: 감시 OFF인 동안(이벤트를 낼 수 없음) topdown 추론 횟수(초당, 0 = 줄이지 않음).
             "backreach": {"enabled": True, "cooldown_sec": 600, "api_event_type": 12, "blur_face": True, "blur_plate": True,
-                          "idle_infer_fps": 3.0},
+                          "idle_infer_fps": 3.0, "spreader_on_sec": 3.0, "spreader_miss_frames": 3},
             # YT 헤드압착(관제 11)과 양하 중 위험구역 사람 진입(관제 10 QC_APRON_HDS). Backreach와 같은 topdown을 씁니다.
             # 판단 기준값(정지 10초, 이탈 5초 등)은 YT_DEFAULT_CONFIG이고, 바꿀 값만 yt_head_crush에 적습니다(두 이벤트가 같이 씀).
             # 사람 진입만 쓰는 값(person_hold_sec, 끊김 허용 프레임 person_miss_frames, 위험구역 가로 비율
@@ -4153,16 +4152,62 @@ def format_ai_fps_log(cam):
             f"ai_fps={cam.current_fps:.1f} target={target:g}"
             + (f" receive_max={receive_max:g}" if receive_max else ""))
     if any(name in cam.events for name in PERSON_TOPDOWN_EVENTS):
-        # topdown 실제 추론 횟수입니다. 감시 대기 중(Backreach는 PLC 신호 0, YT는 양하 감시 전)에는 덜 돌리므로 따로 적습니다.
+        # topdown 실제 추론 횟수입니다. 감시 대기 중(Backreach는 감시 OFF, YT는 양하 감시 전)에는 덜 돌리므로 따로 적습니다.
         line += f" infer_fps={cam.backreach_infer_fps():.1f}(topdown)"
     if BACKREACH_EVENT in cam.events:
-        # PLC twist_lock 신호는 Backreach만 씁니다.
-        line += f" twist_lock={cam._read_plc_state()[0]}"
+        # Backreach 감시 ON·OFF(스프레더로 정함)
+        line += f" backreach={'ON' if cam._read_backreach_state()[0] == 1 else 'OFF'}"
     return line
 
 
+class BackreachSpreaderGate:
+    """Backreach 감시 ON·OFF(카메라마다). PLC 신호를 받을 수 없어(2026-10-30) 화면의 스프레더로 정합니다.
+
+    topdown이 스프레더를 spreader_on_sec(3초) 넘게 보면 ON, spreader_miss_frames(3) 추론 프레임보다 오래 못 보면 OFF입니다.
+    그 이하로 끊긴 것은 검출 깜빡임으로 보고 ON 상태와 ON까지의 3초 세기를 이어 갑니다.
+    read_state()는 PLC 때와 같은 (1·0, 변경 번호)입니다. 변경 번호는 ON·OFF가 바뀔 때마다 늘어, 추론·블러 중에
+    구간이 바뀐 이벤트를 버리는 데 씁니다."""
+
+    def __init__(self, config, name=""):
+        self.on_sec = float(config.get("spreader_on_sec", 3.0))
+        self.miss_frames = int(config.get("spreader_miss_frames", 3))
+        self.spreader_ids = {TOPDOWN_CLASS_NAMES.index(n) for n in config.get("spreader_classes", ["SPREADER"])
+                             if n in TOPDOWN_CLASS_NAMES}
+        self.name = name
+        self.on = False
+        self.generation = 0
+        self.seen_since = None   # 스프레더가 (끊김 허용 안에서) 계속 보이기 시작한 시각
+        self.missed = 0          # 스프레더를 못 본 연속 추론 프레임 수
+
+    def update(self, detections, now=None):
+        """새로 추론한 topdown 검출(행: x1, y1, x2, y2, 점수, 클래스)로 상태를 갱신합니다.
+        직전 검출을 다시 쓰는 프레임에는 부르지 않습니다(프레임 = topdown 추론 한 번)."""
+        now = time.monotonic() if now is None else now
+        seen = detections is not None and any(int(d[5]) in self.spreader_ids for d in detections)
+        if seen:
+            self.missed = 0
+            if self.seen_since is None:
+                self.seen_since = now
+            if not self.on and now - self.seen_since >= self.on_sec:
+                self._set(True, f"스프레더 {now - self.seen_since:.1f}초")
+        else:
+            self.missed += 1
+            if self.missed > self.miss_frames:
+                self.seen_since = None
+                if self.on:
+                    self._set(False, f"스프레더 {self.missed}프레임 안 보임")
+
+    def _set(self, on, reason):
+        self.on = on
+        self.generation += 1
+        logger.info(f"[BACKREACH] {self.name} {reason} → 감시 {'ON' if on else 'OFF'}")
+
+    def read_state(self):
+        return (1 if self.on else 0), self.generation
+
+
 class BackreachDetector(BaseEventDetector):
-    """Backreach 감시. PLC twist_lock=1이면 topdown의 모든 클래스(사람·차량 포함) 중
+    """Backreach 감시. 감시 ON(스프레더, BackreachSpreaderGate)이면 topdown의 모든 클래스(사람·차량 포함) 중
     bbox가 다각형 ROI와 조금이라도 겹치거나 경계에 닿는 객체를 이벤트로 냅니다.
     중심점·하단점 기준이 아니고, 오목한 ROI도 그대로 판정합니다. 빈 ROI에서는 이벤트가 없습니다.
     쿨다운(기본 600초)과 같은 객체 중복 제한은 Camera 공통 처리가 다른 이벤트와 똑같이 적용합니다."""
@@ -4173,7 +4218,7 @@ class BackreachDetector(BaseEventDetector):
     stream_max_width = 1280
 
     def process(self, tracks, track_map, frame, fid, **kwargs):
-        if kwargs.get('twist_lock') != 1:
+        if kwargs.get('backreach_on') != 1:
             return []
         contour = polygon_contour(self.roi_poly)
         if contour is None:
@@ -4201,8 +4246,8 @@ class BackreachDetector(BaseEventDetector):
                              'class_id': class_id, 'raw_tid': raw_tid}],
                 'decision_trace': {
                     'detector': 'BackreachDetector',
-                    'reason': 'twist_lock_on_and_bbox_overlaps_roi',
-                    'twist_lock': 1,
+                    'reason': 'spreader_on_and_bbox_overlaps_roi',
+                    'backreach_on': 1,
                     'signal_generation': kwargs.get('signal_generation'),
                     'model': TOPDOWN_MODEL,
                     'raw_tid': raw_tid,
@@ -7486,28 +7531,6 @@ class FramePacer:
         self.next_due = start + interval
 
 
-class BackreachPLCGroup:
-    """첫 Backreach 카메라가 참여할 때 공통 시뮬레이터를 한 번 시작합니다."""
-
-    def __init__(self):
-        self.source = None
-        self.lock = threading.Lock()
-
-    def get(self):
-        with self.lock:
-            if self.source is None:
-                self.source = PLCSimulator(
-                    hold_time=SYS_CFG["plc_simulator"]["hold_time_sec"], logger=logger,
-                )
-                self.source.start()
-            return self.source
-
-    def stop(self):
-        with self.lock:
-            if self.source is not None:
-                self.source.stop()
-
-
 class Camera:
     # 과속 차량을 판정 뒤 따라가는 시간: 이만큼 안 보이면 끝(초), 최대 이만큼(초, 판정 전 박스도 이만큼 앞까지 씀)
     PLR_FOLLOW_LOST_SEC = 0.7
@@ -7517,7 +7540,7 @@ class Camera:
     ALERTED_KEEP_SEC = 600.0
 
     def __init__(self, ip, conf, det_main_v2, det_face, det_plate, cam_id,
-                 det_topdown=None, plc_provider=None, radar_provider=None):
+                 det_topdown=None, radar_provider=None):
         self.ip = ip
         self.camera_key = ip
         self.conf = conf
@@ -7538,10 +7561,9 @@ class Camera:
         self.det_face = det_face
         self.det_plate = det_plate
         self.det_topdown = det_topdown
-        # Backreach 가상 PLC(twist_lock). Backreach가 설정된 카메라만 신호를 읽습니다.
-        self._plc_provider = plc_provider
-        self.plc = None
-        self._last_plc_state = None
+        # Backreach 감시 ON·OFF(스프레더, BackreachSpreaderGate). Backreach가 설정된 카메라만 있습니다.
+        self.backreach_gate = None
+        self._last_backreach_state = None
 
         # 추적기는 이벤트가 아니라 카메라 한 대 × 모델(검출 묶음)마다 하나입니다. 같은 모델을 쓰는 이벤트는 추적기를 같이 써서
         # 같은 물체가 이벤트마다 다른 번호를 받지 않습니다. 추적 방식이 달라야 하는 이벤트만 자기 추적기를 둡니다(과속 trk_speed).
@@ -7585,7 +7607,7 @@ class Camera:
         self.last_evt_t = {}
         self.visual_alarms = {}
         self._suppress_logged = {}  # (이벤트, tid) -> 마지막으로 남긴 억제 이유. EVENT SUPPRESSED를 객체마다 한 번만 남깁니다.
-        # Backreach 추론 줄이기(PLC 신호 0인 동안, backreach_inference_due): 마지막 추론 시각과 그 결과, 최근 추론 시각들
+        # Backreach 추론 줄이기(감시 OFF인 동안, backreach_inference_due): 마지막 추론 시각과 그 결과, 최근 추론 시각들
         self._last_backreach_infer = None
         self.last_topdown_res = None
         self._backreach_infer_times = deque(maxlen=30)
@@ -7595,7 +7617,7 @@ class Camera:
 
         self._load_roi_conf(conf)
         self._rebuild_handlers()
-        self._attach_plc()
+        self._attach_backreach_gate()
 
     def _rebuild_handlers(self):
         self.handlers = {}
@@ -7645,7 +7667,7 @@ class Camera:
                 self.radar_provider = None
             self._load_roi_conf(new_conf)
             self._rebuild_handlers()
-            self._attach_plc()
+            self._attach_backreach_gate()
 
             logger.info(
                 f" [CAM:{self.ip}] 무중단 설정 리로드 완료: "
@@ -7680,29 +7702,34 @@ class Camera:
             handler.roi_lines = roi_lines or []
 
     # ------------------------------------------------------------------
-    # Backreach 가상 PLC(twist_lock)
+    # Backreach 감시 ON·OFF(스프레더)
     # ------------------------------------------------------------------
-    def _attach_plc(self):
-        self.plc = None
-        if BACKREACH_EVENT in self.handlers and self._plc_provider is not None:
-            self.plc = self._plc_provider()
+    def _attach_backreach_gate(self):
+        handler = self.handlers.get(BACKREACH_EVENT)
+        self.backreach_gate = BackreachSpreaderGate(handler.config, f"CAM:{self.cam_id}({self.ip})") \
+            if handler is not None else None
 
-    def _read_plc_state(self):
-        """(twist_lock, 변경번호). Backreach가 없는 카메라는 (None, None)입니다."""
+    def update_backreach_gate(self, d_topdown, now=None):
+        """topdown을 새로 추론한 프레임마다 부릅니다(run_camera_inference). 스프레더로 감시 ON·OFF를 정합니다."""
+        if self.backreach_gate is not None:
+            self.backreach_gate.update(d_topdown, now)
+
+    def _read_backreach_state(self):
+        """(감시 ON 1·OFF 0, 변경번호). Backreach가 없는 카메라는 (None, None)입니다."""
         if BACKREACH_EVENT not in self.handlers:
             return None, None
-        return self.plc.read_state() if self.plc is not None else (0, 0)
+        return self.backreach_gate.read_state() if self.backreach_gate is not None else (0, 0)
 
     def _clear_backreach_alarms(self):
         self.visual_alarms = {tid: info for tid, info in self.visual_alarms.items() if info['evt'] != BACKREACH_EVENT}
 
-    def _sync_plc_state(self):
-        state = self._read_plc_state()
-        if self._last_plc_state is not None and state != self._last_plc_state:
-            # 신호 구간이 바뀌면 Backreach 화면 경고만 지웁니다. 추적 ID, 처리한 ID, 쿨다운은 유지해
-            # 0→1 전환으로 중복 제한을 우회하지 못하게 합니다.
+    def _sync_backreach_state(self):
+        state = self._read_backreach_state()
+        if self._last_backreach_state is not None and state != self._last_backreach_state:
+            # 감시 구간이 바뀌면 Backreach 화면 경고만 지웁니다. 추적 ID, 처리한 ID, 쿨다운은 유지해
+            # OFF→ON 전환으로 중복 제한을 우회하지 못하게 합니다.
             self._clear_backreach_alarms()
-        self._last_plc_state = state
+        self._last_backreach_state = state
         return state
 
     def _reader_spec(self):
@@ -7720,11 +7747,11 @@ class Camera:
         return globals()[own[0] if own else "FrameReader"], max_fps, max(width for _, _, width in specs)
 
     def backreach_inference_due(self, now=None):
-        """topdown(Backreach·YT)을 이번 프레임에 추론할지. PLC twist_lock이 1이거나 YT 양하 감시 중이면
+        """topdown(Backreach·YT)을 이번 프레임에 추론할지. Backreach 감시가 ON이거나 YT 양하 감시 중이면
         매 프레임, 아니면(이벤트를 낼 수 없는 동안) backreach.idle_infer_fps(기본 3, 0 = 줄이지 않음)장만 추론하고
-        그 사이는 직전 검출을 다시 씁니다(화면·추적은 계속). YT가 멈춰 10초를 기다리는 동안은 초당 3장으로 충분하고,
-        감시가 시작되면 5초 이탈·사람 진입을 놓치지 않게 매 프레임 추론합니다.
-        두 1280 모델이 NPU를 많이 써서, 신호 0인 동안 아낀 NPU를 콘 카메라가 씁니다.
+        그 사이는 직전 검출을 다시 씁니다(화면·추적은 계속). Backreach OFF·YT가 멈춰 10초를 기다리는 동안은 초당 3장으로
+        스프레더·YT를 충분히 찾고, 감시가 시작되면 객체·5초 이탈·사람 진입을 놓치지 않게 매 프레임 추론합니다.
+        1280 모델이 NPU를 많이 써서, 감시 OFF인 동안 아낀 NPU를 콘 카메라가 씁니다.
         해측 추락 방지는 위험 구역 근처(near_zone_m)에 사람이 보이는 동안 매 프레임 추론합니다."""
         now = time.monotonic() if now is None else now
         handler = self.handlers.get(BACKREACH_EVENT) or self.handlers.get(SEASIDE_PERSON_EVENT)
@@ -7732,7 +7759,7 @@ class Camera:
         yt_armed = self.yt_monitor is not None and self.yt_monitor.armed()
         seaside = self.handlers.get(SEASIDE_PERSON_EVENT)
         seaside_near = seaside is not None and seaside.near(now)
-        due = (self._read_plc_state()[0] == 1 or yt_armed or seaside_near or idle_fps <= 0
+        due = (self._read_backreach_state()[0] == 1 or yt_armed or seaside_near or idle_fps <= 0
                or self._last_backreach_infer is None or now - self._last_backreach_infer >= 1.0 / idle_fps)
         if due:
             self._last_backreach_infer = now
@@ -7924,7 +7951,7 @@ class Camera:
 
     def build_inference_log(self, fid, frame, d_main_res, d_topdown, t_main, t_topdown, alarms, new_events):
         h, w = frame.shape[:2] if frame is not None else (0, 0)
-        twist_lock, signal_generation = self._last_plc_state or (None, None)
+        backreach_on, signal_generation = self._last_backreach_state or (None, None)
         return {
             "ts": now_kst().isoformat(),
             "fid": int(fid),
@@ -7934,8 +7961,8 @@ class Camera:
             "events": list(self.events),
             "roi_poly": [[int(p[0]), int(p[1])] for p in (self.roi_poly or [])],
             "roi_lines": [[int(p[0]), int(p[1])] for p in (self.roi_lines or [])],
-            # Backreach 카메라의 PLC 신호값과 구간 변경 번호입니다. 그 외 카메라는 null입니다.
-            "twist_lock": twist_lock,
+            # Backreach 카메라의 감시 ON(1)·OFF(0, 스프레더로 정함)와 구간 변경 번호입니다. 그 외 카메라는 null입니다.
+            "backreach_on": backreach_on,
             "signal_generation": signal_generation,
             "detections": {
                 "main": [self._serialize_detection(d) for d in d_main_res],
@@ -8073,9 +8100,9 @@ class Camera:
             time_diff = self.fps_queue[-1] - self.fps_queue[0]
             self.current_fps = len(self.fps_queue) / time_diff if time_diff > 0 else 0.0
         self.current_frame_meta = self._frame_meta_for_logic(fid)
-        plc_state = self._sync_plc_state()
-        if plc_state[0] != 1:
-            # PLC가 0이면 Backreach 경고를 다음 처리 프레임에서 지웁니다(검출·추적·표시는 계속).
+        br_state = self._sync_backreach_state()
+        if br_state[0] != 1:
+            # 감시 OFF면 Backreach 경고를 다음 처리 프레임에서 지웁니다(검출·추적·표시는 계속).
             self._clear_backreach_alarms()
 
         self._ensure_roi(fr)
@@ -8129,12 +8156,12 @@ class Camera:
                                     else meta.get("recv_monotonic")),
                 }
             elif ename == BACKREACH_EVENT:
-                # topdown의 모든 클래스를 PLC 신호와 함께 넘깁니다. 블러는 topdown 트랙을 메인 모델 번호로 바꿔 씁니다.
+                # topdown의 모든 클래스를 감시 ON·OFF와 함께 넘깁니다. 블러는 topdown 트랙을 메인 모델 번호로 바꿔 씁니다.
                 kwargs = {
                     'privacy_tracks': topdown_privacy_tracks(t_topdown),
                     'topdown_tracks': t_topdown,
-                    'twist_lock': plc_state[0],
-                    'signal_generation': plc_state[1],
+                    'backreach_on': br_state[0],
+                    'signal_generation': br_state[1],
                 }
             elif ename in YT_EVENTS:
                 # YT: Backreach와 같은 topdown 추적 결과와 이번 프레임의 양하 감시 상태를 받습니다. 블러도 Backreach와 같습니다.
@@ -8185,8 +8212,8 @@ class Camera:
                 if tid in self.alerted:
                     self._alerted_seen[tid] = now
                 if ename not in self.alerted.get(tid, ()) and (now - self.last_evt_t.get(ename, 0) >= cooldown):
-                    if ename == BACKREACH_EVENT and self._read_plc_state() != plc_state:
-                        # 추론 중 PLC 신호 구간이 바뀌었으면 이전 구간의 결과로 이벤트를 만들지 않습니다.
+                    if ename == BACKREACH_EVENT and self._read_backreach_state() != br_state:
+                        # 추론 중 감시 구간(ON·OFF)이 바뀌었으면 이전 구간의 결과로 이벤트를 만들지 않습니다.
                         break
                     if ename == SEASIDE_PERSON_EVENT and not handler.group.claim(self.camera_key, now):
                         # 묶음 쿨다운: 같은 크레인의 다른 카메라가 방금 이벤트를 냈습니다(겹치는 화면의 같은 사람일 수 있음).
@@ -8215,8 +8242,8 @@ class Camera:
                         blur_face=blur_face_option,
                         blur_plate=blur_plate_option
                     )
-                    if ename == BACKREACH_EVENT and self._read_plc_state() != plc_state:
-                        # 블러 처리 중 신호 구간이 바뀌어도 이전 구간 결과는 저장하지 않습니다.
+                    if ename == BACKREACH_EVENT and self._read_backreach_state() != br_state:
+                        # 블러 처리 중 감시 구간이 바뀌어도 이전 구간 결과는 저장하지 않습니다.
                         break
 
                     # 블러 처리 메타데이터 로깅 (추적용)
@@ -8587,9 +8614,9 @@ class Camera:
             hud_y += px(24)
 
         if BACKREACH_EVENT in self.handlers:
-            twist_lock = (self._last_plc_state or (None, None))[0]
-            monitoring = twist_lock == 1 and self.receiver_event_status.get(BACKREACH_EVENT, True) is not False
-            # PLC twist_lock 값은 적지 않고 Backreach 감시 ON·OFF만 보입니다(ON = 신호 1이고 관제 On).
+            backreach_on = (self._last_backreach_state or (None, None))[0]
+            monitoring = backreach_on == 1 and self.receiver_event_status.get(BACKREACH_EVENT, True) is not False
+            # Backreach 감시 ON·OFF(ON = 스프레더로 감시 ON이고 관제 On)
             hud_text(f"BACKREACH {'ON' if monitoring else 'OFF'}", (px(10), hud_y),
                      (0, 255, 0) if monitoring else (0, 200, 255), 0.5)
             hud_y += px(24)
@@ -8949,7 +8976,7 @@ class HealthCheckDaemon:
                         continue
                     remote_name = RECEIVER_EVENT_NAMES.get(event_type)
                     if remote_name:
-                        # 이벤트 설정 상태입니다. PLC의 0/1이나 현재 검출 유무와는 별개입니다.
+                        # 이벤트 설정 상태입니다. Backreach 감시 ON·OFF(스프레더)나 현재 검출 유무와는 별개입니다.
                         enabled = name in cam.handlers and cam.receiver_event_status.get(name, True) is not False
                         statuses[remote_name] = statuses.get(remote_name, False) or enabled
         return [{"event_type": name, "event_status": enabled} for name, enabled in sorted(statuses.items())]
@@ -9204,9 +9231,6 @@ def main():
         logger.error(f"모델 로드 실패. 경로를 확인하십시오: {e}")
         return
 
-    # Backreach 카메라들만 가상 PLC 하나를 공유합니다. 첫 Backreach 카메라가 붙을 때 시작합니다.
-    plc_group = BackreachPLCGroup()
-
     def make_camera(ip, conf, cam_id):
         events = conf.get('events', [])
         return Camera(
@@ -9214,7 +9238,6 @@ def main():
             event_models.get("MAIN_V2") if "MAIN_V2" in event_model_keys(events) else None,
             d_face, d_plate, cam_id=cam_id,
             det_topdown=event_models.get(TOPDOWN_MODEL) if any(name in events for name in PERSON_TOPDOWN_EVENTS) else None,
-            plc_provider=plc_group.get,
         )
 
     cams = []
@@ -9292,11 +9315,13 @@ def main():
             d_main_res = filter_speed_main_detections(event_models["MAIN_V2"].infer(fr),
                                                       max_area_threshold=(h * w) * 0.5)
         if any(name in cam.events for name in PERSON_TOPDOWN_EVENTS):
-            # PLC 신호가 1이 아니고 YT 양하 감시 중도 아닌 동안은 초당 idle_infer_fps장만 추론하고,
+            # Backreach 감시 OFF이고 YT 양하 감시 중도 아닌 동안은 초당 idle_infer_fps장만 추론하고,
             # 그 사이 프레임은 직전 검출을 다시 씁니다(Camera.backreach_inference_due).
             if cam.backreach_inference_due():
                 model = event_models.get(TOPDOWN_MODEL)
                 cam.last_topdown_res = detection_array(model.infer(fr)) if model is not None else None
+                # 새로 추론한 검출의 스프레더로 Backreach 감시 ON·OFF를 정합니다(다시 쓰는 검출은 세지 않음).
+                cam.update_backreach_gate(cam.last_topdown_res)
             d_topdown = cam.last_topdown_res
         return d_main_res, d_topdown
 
@@ -9608,7 +9633,6 @@ def main():
         if not MseRadarHub.close_shared():
             logger.error('[Radar] MSE receiver shutdown did not finish')
 
-        plc_group.stop()
         for model in [*event_models.values(), d_face, d_plate]:
             try:
                 model.release()
