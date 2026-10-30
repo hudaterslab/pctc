@@ -4287,6 +4287,9 @@ YT_DEFAULT_CONFIG = {
     "depart_move_ratio": 0.25,
     "head_classes": ["YT_HEADER"],
     "empty_chassis_classes": ["YT_CHASSIS_EMPTY", "YT_CHASSIS_HALF"],
+    # 반 샤시(20ft 하나가 실림)는 상자가 비어 있는 절반(20ft 길이)만 감쌉니다. 그래서 샤시 전체 길이(40ft)를
+    # 상자 길이의 2배로 보고 바닥면 길이·여유·움직임 기준을 정하고, 헤드와 묶을 때 실린 20ft만큼 떨어져 있어도 묶습니다.
+    "half_chassis_classes": ["YT_CHASSIS_HALF"],
     "container_classes": {"CONTAINER_40FT": "40ft", "CONTAINER_20FT": "20ft", "TANK_20FT": "20ft"},
     # 스프레더와 겹친 컨테이너만 하역 중으로 봅니다.
     "spreader_classes": ["SPREADER"],
@@ -4391,8 +4394,9 @@ def _yt_parse_tracks(tracks):
     return objects
 
 
-def _yt_pair_heads(heads, chassis):
-    """헤드마다 차선 방향으로 붙어 있는 샤시를 짝짓습니다. 샤시가 안 보이면 None."""
+def _yt_pair_heads(heads, chassis, half_classes=()):
+    """헤드마다 차선 방향으로 붙어 있는 샤시를 짝짓습니다. 샤시가 안 보이면 None.
+    반 샤시(half_classes)는 비어 있는 절반만 잡히므로, 헤드와 그 사이에 실린 20ft(상자 길이)만큼 떨어져 있어도 짝짓습니다."""
     pairs, used = [], set()
     for head in sorted(heads, key=lambda obj: -obj.score):
         best, best_gap = None, None
@@ -4406,7 +4410,8 @@ def _yt_pair_heads(heads, chassis):
             if overlap < 0.5 * min(cross_len, head.box[cross + 2] - head.box[cross]):
                 continue
             gap = max(0.0, max(head.box[axis], ch.box[axis]) - min(head.box[axis + 2], ch.box[axis + 2]))
-            if gap > cross_len:
+            max_gap = cross_len + (ch.box[axis + 2] - ch.box[axis] if ch.name in half_classes else 0.0)
+            if gap > max_gap:
                 continue
             if best_gap is None or gap < best_gap:
                 best, best_gap = index, gap
@@ -4419,8 +4424,9 @@ def _yt_pair_heads(heads, chassis):
 class _YTUnit:
     """한 자리에 멈춘 YT 한 대(헤드 + 샤시)의 양하 감시 상태."""
 
-    def __init__(self, uid, head, chassis, t):
+    def __init__(self, uid, head, chassis, t, half=False):
         self.uid = uid
+        self.half = half   # 반 샤시(상자 = 비어 있는 절반)
         self.cycle = 0
         self.armed = False
         self.armed_at = None
@@ -4436,12 +4442,15 @@ class _YTUnit:
         self.dev_since = None
         self.set_geometry(head.box, chassis.box)
 
-    def set_geometry(self, head_box, chassis_box):
+    def set_geometry(self, head_box, chassis_box, half=None):
+        if half is not None:
+            self.half = bool(half)
         self.head_box = list(head_box)
         self.chassis_box = list(chassis_box)
         width, height = chassis_box[2] - chassis_box[0], chassis_box[3] - chassis_box[1]
         self.axis = 1 if height >= width else 0
-        self.length = max(1.0, max(width, height))
+        # length = 샤시 전체(40ft) 길이. 반 샤시 상자는 그 절반이라 2배로 봅니다.
+        self.length = max(1.0, max(width, height) * (2.0 if self.half else 1.0))
         self.width = max(1.0, min(width, height))
         self.head_side = 1 if _yt_center(head_box)[self.axis] > _yt_center(chassis_box)[self.axis] else -1
 
@@ -4469,10 +4478,11 @@ class _YTUnit:
             self.stop_since = t
             self.empty_seen = None
             self.disarm()
-            self.set_geometry(head.box, chassis_box)
+            self.set_geometry(head.box, chassis_box,
+                              None if chassis is None else chassis.name in cfg["half_chassis_classes"])
         elif not self.armed and chassis is not None:
-            # 감시 전에는 최신 박스를 따라가고, 감시 중에는 정차 위치를 고정합니다.
-            self.set_geometry(head.box, chassis.box)
+            # 감시 전에는 최신 박스를 따라가고, 감시 중에는 정차 위치(와 빈·반 샤시)를 고정합니다.
+            self.set_geometry(head.box, chassis.box, chassis.name in cfg["half_chassis_classes"])
         self.head = head
         self.head_seen = t
         self.last_seen = t
@@ -4531,6 +4541,8 @@ class _YTUnit:
 
         매달린 컨테이너는 카메라에 가까워 박스가 실제보다 크게 보이므로 박스 크기 대신
         샤시 길이에 대한 규격 비율(40ft=샤시 전체, 20ft=절반)로 바닥면을 추정합니다.
+        반 샤시는 상자(비어 있는 절반)의 2배를 샤시 길이로 보므로, 20ft 바닥면이 그 빈 절반만 하고
+        적재영역도 빈 절반 + 앞뒤 여유(샤시 전체 길이의 load_margin_ratio)입니다.
         """
         axis, cross = self.axis, 1 - self.axis
         start, end = self.chassis_box[axis], self.chassis_box[axis + 2]
@@ -4577,6 +4589,7 @@ class _YTUnit:
         return {
             "uid": self.uid, "cycle": self.cycle, "armed": self.armed,
             "head_box": list(self.head_box), "chassis_box": list(self.chassis_box),
+            "chassis_half": self.half, "chassis_length": round(self.length, 1),
             "head_tid": self.head.tid, "head_score": self.head.score,
             "head_label": self.head.name, "head_class_id": self.head.cls,
             "axis": "y" if self.axis == 1 else "x", "head_side": self.head_side,
@@ -4620,12 +4633,13 @@ class YTDischargeMonitor:
                 chassis = [o for o in chassis if point_in_polygon(roi, *_yt_center(o.box))]
 
             matched = set()
-            for head, ch in _yt_pair_heads(heads, chassis):
+            half_classes = cfg["half_chassis_classes"]
+            for head, ch in _yt_pair_heads(heads, chassis, half_classes):
                 unit = self._match_unit(head.box, matched)
                 if unit is None:
                     if ch is None:
                         continue
-                    unit = _YTUnit(self.next_uid, head, ch, t)
+                    unit = _YTUnit(self.next_uid, head, ch, t, ch.name in half_classes)
                     self.next_uid += 1
                     self.units.append(unit)
                 matched.add(unit.uid)
