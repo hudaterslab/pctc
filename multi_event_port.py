@@ -202,10 +202,13 @@ def check_topdown_class_count(count):
 # 메인 모델(hanjin_cctv_v2) 클래스 중 model_confidences에 이름으로 적을 수 있는 것(그 밖의 클래스는 번호로 적음).
 MAIN_CLASS_IDS = {"person": ID_G_PERSON, "normalvehicle": ID_G_CAR, "lowerbody": ID_PERSON_LOW,
                   "trunklinetruck": ID_G_TRUCK}
-# side.dxnn(콘 카메라 화면) 클래스. 콘 NG 컨테이너(0·1), NG 사진 사람(3), 컨테이너 번호 영역(4·5)을 씁니다.
-SIDE_CLASS_NAMES = ("container", "tank", "spreader", "person", "BIC", "TYPE")
+# side.dxnn(콘 카메라 화면) 클래스. 콘 NG 컨테이너(0·1), NG 사진 사람(3)을 씁니다.
+SIDE_CLASS_NAMES = ("container", "tank", "spreader", "person", "YT_HEADER")
+# container_ocr_detector.dxnn(컨테이너 번호 OCR의 글자 영역) 클래스. 0 BIC 컨테이너 번호, 1 TYPE 크기·형식 코드
+CONTAINER_OCR_DET_CLASS_NAMES = ("BIC", "TYPE")
 # 메인 V2를 뺀 모델의 클래스 이름(model_confidences에 이름으로 적음)
-MODEL_CLASS_NAMES = {TOPDOWN_MODEL: TOPDOWN_CLASS_NAMES, "FACE": ("face",), "PLATE": ("plate",), "SIDE": SIDE_CLASS_NAMES, "CONE": ("cone",)}
+MODEL_CLASS_NAMES = {TOPDOWN_MODEL: TOPDOWN_CLASS_NAMES, "FACE": ("face",), "PLATE": ("plate",), "SIDE": SIDE_CLASS_NAMES,
+                     "CONE": ("cone",), "CONTAINER_OCR_DET": CONTAINER_OCR_DET_CLASS_NAMES}
 
 
 def model_class_names(model_key):
@@ -362,12 +365,14 @@ def load_system_config():
             SEASIDE_PERSON_EVENT: {"enabled": True, "cooldown_sec": 60, "api_event_type": 14,
                                    "blur_face": True, "blur_plate": False, "groups": {}}
         },
-        # NPU 모델 6개. 키는 model_confidences·model_output_formats·model_engine_pool_sizes와 같습니다.
+        # NPU 모델 7개. 키는 model_confidences·model_output_formats·model_engine_pool_sizes와 같습니다.
         # - MAIN_V2(hanjin_cctv_v2): 과속. FACE(face): 사진 얼굴 가리기. PLATE(plate): 사진 번호판 가리기·과속 번호판 인식
         # - TOPDOWN(topdown 1280x736, 9클래스): YT 헤드압착·사람 진입·Backreach
-        # - SIDE(side 1280x736, 6클래스: 0 container, 1 tank, 2 spreader, 3 person, 4 BIC, 5 TYPE): 콘 NG의 컨테이너(0·1),
-        #   NG 사진 얼굴 가리기용 사람(3), 컨테이너 번호 영역(4·5, container_ocr)
+        # - SIDE(side 640x384, 5클래스: 0 container, 1 tank, 2 spreader, 3 person, 4 YT_HEADER): 콘 NG의 컨테이너(0·1),
+        #   NG 사진 얼굴 가리기용 사람(3)
         # - CONE(cone 640x384, 1클래스 콘): 콘 NG 모서리 크롭(1280x736을 반으로 줄여 넣음)
+        # - CONTAINER_OCR_DET(container_ocr_detector 1280x736, 2클래스: 0 BIC, 1 TYPE): 컨테이너 번호 OCR의 글자 영역.
+        #   콘 NG가 처음 난 뒤에 올립니다(container_ocr).
         # side·cone은 raw 출력이어야 합니다(PPU는 장치에서 0.25 미만을 버려 콘 0.01 기준을 못 씀).
         "models": {
             "MAIN_V2": "hanjin_cctv_v2.dxnn",
@@ -375,14 +380,16 @@ def load_system_config():
             "PLATE": "plate.dxnn",
             "TOPDOWN": "topdown.dxnn",
             "SIDE": "side.dxnn",
-            "CONE": "cone.dxnn"
+            "CONE": "cone.dxnn",
+            "CONTAINER_OCR_DET": "container_ocr_detector.dxnn"
         },
         # 모델별·클래스별 점수 기준. 모델마다 {"클래스": 기준}이고, 적지 않은 클래스는 버립니다(모델이 찾아도 쓰지 않음).
         # 클래스는 이름(대소문자 무관, model_class_names) 또는 번호("7")로 적습니다.
         # - 메인 V2: 과속이 쓰는 사람·하반신 0.5, 승용차·트럭 0.6
         # - topdown: 9클래스 모두 0.25(YT 헤드압착·사람 진입·Backreach가 같이 씀)
-        # - side: 컨테이너·탱크 0.25, NG 사진 얼굴 가리기용 사람 0.5, 컨테이너 번호 영역 BIC·TYPE 0.25
+        # - side: 컨테이너·탱크 0.25, NG 사진 얼굴 가리기용 사람 0.5(스프레더·YT_HEADER는 아직 쓰지 않음)
         # - cone: 콘 0.01
+        # - container_ocr_detector: 컨테이너 번호 영역 BIC·TYPE 0.25
         # - PPU 출력 모델(메인·얼굴)은 장치가 약 0.25 아래를 먼저 버려서 그보다 낮은 값은 효과가 없습니다.
         # 검출한 뒤의 판정 기준은 이벤트 설정에 따로 있습니다(콘 판정 cone_ng.logic container_conf 0.7·cone_conf 0.05,
         # 번호판 인식 plr.det_conf).
@@ -391,8 +398,9 @@ def load_system_config():
             "FACE": {"face": 0.35},
             "PLATE": {"plate": 0.1},
             "TOPDOWN": {name: 0.25 for name in TOPDOWN_CLASS_NAMES},
-            "SIDE": {"container": 0.25, "tank": 0.25, "person": 0.5, "BIC": 0.25, "TYPE": 0.25},
-            "CONE": {"cone": 0.01}
+            "SIDE": {"container": 0.25, "tank": 0.25, "person": 0.5},
+            "CONE": {"cone": 0.01},
+            "CONTAINER_OCR_DET": {"BIC": 0.25, "TYPE": 0.25}
         },
         "model_output_formats": {
             "MAIN_V2": "ppu",
@@ -400,18 +408,21 @@ def load_system_config():
             "PLATE": "yolo",
             "TOPDOWN": "yolo",
             "SIDE": "yolo",
-            "CONE": "yolo"
+            "CONE": "yolo",
+            "CONTAINER_OCR_DET": "yolo"
         },
         # NPU 엔진 수. 엔진 하나는 한 번에 한 장만 처리해(코어 하나), 여러 카메라가 같은 모델을 쓰면 엔진이 많아야 코어
         # 3개를 나눠 씁니다. 엔진마다 NPU 메모리를 따로 씁니다. 메인 V2(과속)·topdown(YT·Backreach 카메라 여러 대)·
         # side·cone(콘 카메라 여러 대, 모서리 크롭 두 장)은 2개입니다. 엔진이 많을수록 NPU 메모리가 늘고 온도가 빨리 오릅니다.
+        # container_ocr_detector는 NG 때 번호 OCR 스레드 하나만 써서 1개입니다.
         "model_engine_pool_sizes": {
             "MAIN_V2": 2,
             "FACE": 1,
             "PLATE": 1,
             "TOPDOWN": 2,
             "SIDE": 2,
-            "CONE": 2
+            "CONE": 2,
+            "CONTAINER_OCR_DET": 1
         },
         # topdown(1280x736 NHWC 입력)은 DXRT ORT 후처리를 씁니다.
         "model_use_ort": {"TOPDOWN": True},
@@ -456,9 +467,9 @@ def load_system_config():
             "plate_padding": 0.5,
             "compare_csv": "plr_compare.csv"
         },
-        # 컨테이너 번호 OCR(cone_ng NG 때). 번호 영역은 콘 NG의 side.dxnn(4 BIC, 5 TYPE, 같은 엔진, 점수 기준
-        # model_confidences.SIDE)으로 찾고, 글자는 PP-OCR 48x320으로 읽습니다. 모델 구성은 CPU(ONNX, container_ocr.onnx)이고,
-        # ONNX 파일이 없는 동안은 NPU용 container_rec_48x320.dxnn으로 읽습니다.
+        # 컨테이너 번호 OCR(cone_ng NG 때). 번호 영역은 models.CONTAINER_OCR_DET(container_ocr_detector.dxnn, 0 BIC,
+        # 1 TYPE, 점수 기준 model_confidences.CONTAINER_OCR_DET)으로 찾고, 글자는 PP-OCR 48x320으로 읽습니다.
+        # 모델 구성은 CPU(ONNX, container_ocr.onnx)이고, ONNX 파일이 없는 동안은 NPU용 container_rec_48x320.dxnn으로 읽습니다.
         "container_ocr": {
             "enabled": True,
             "ocr_npu_model": "container_rec_48x320.dxnn",
@@ -3309,7 +3320,7 @@ def _cone_crop_canvas(image, roi):
 
 
 class ConeObserver:
-    """콘 카메라 화면 검출(side.dxnn: 0 container, 1 tank, 3 person, 4 BIC, 5 TYPE)과 모서리 크롭의 콘 검출(cone.dxnn: 0 콘).
+    """콘 카메라 화면 검출(side.dxnn: 0 container, 1 tank, 3 person)과 모서리 크롭의 콘 검출(cone.dxnn: 0 콘).
 
     두 모델 모두 NPU(YoLoDeepX) raw 출력이어야 합니다. 콘은 0.05 아래 점수까지 판정에 쓰므로
     장치에서 0.25 미만을 버리는 PPU 출력은 쓸 수 없습니다.
@@ -3856,8 +3867,8 @@ class ConeNgDetector(BaseEventDetector):
 
 # ---------- 컨테이너 번호 OCR: 컨테이너 크롭 → 번호 상자 검출 → PP-OCR 48x320 CTC → 형식 검사 → 투표 ----------
 class ContainerOcrReader:
-    """번호·크기형식 코드 영역 검출(side.dxnn 4 BIC 컨테이너 번호, 5 TYPE 크기·형식 코드. 콘 NG 컨테이너 검출과 같은
-    엔진)과 인식(PP-OCR SVTR_LCNet, CTC). 글자 인식은 CPU(ONNX)가 기본이고, ONNX 파일이 없으면 NPU(dxnn)로 읽습니다.
+    """번호·크기형식 코드 영역 검출(container_ocr_detector.dxnn 0 BIC 컨테이너 번호, 1 TYPE 크기·형식 코드)과
+    인식(PP-OCR SVTR_LCNet, CTC). 글자 인식은 CPU(ONNX)가 기본이고, ONNX 파일이 없으면 NPU(dxnn)로 읽습니다.
 
     규칙:
     1) 상자 크롭 = 학습 크롭과 같은 AABB 내림/올림 + 2px (여백 10%는 세로 표기를 크게 떨어뜨림)
@@ -3865,11 +3876,21 @@ class ContainerOcrReader:
     3) 높이 48 비율 유지, 폭 <= 320, 오른쪽 128 채운 uint8 BGR 48x320. NPU는 그대로, CPU(ONNX)는 /255, (x-0.5)/0.5, CHW
     4) CTC 빔 상위 3개 중 형식 검사를 처음 통과한 것(통과 없으면 인식 실패)"""
     OCR_H, OCR_W = 48, 320
-    NUMBER_CLASS, SIZE_TYPE_CLASS = 4, 5  # side.dxnn: 4 BIC(컨테이너 번호), 5 TYPE(크기·형식 코드)
+    NUMBER_CLASS, SIZE_TYPE_CLASS = 0, 1  # container_ocr_detector.dxnn: 0 BIC(컨테이너 번호), 1 TYPE(크기·형식 코드)
 
-    def __init__(self, cfg, det):
+    def __init__(self, cfg):
         self.cfg = cfg
-        self.det = det  # 콘 NG의 side.dxnn 엔진(ConeObserver.det_container)
+        # 번호 영역 모델·출력 형식·엔진 수·점수 기준은 models·model_output_formats·model_engine_pool_sizes·
+        # model_confidences의 CONTAINER_OCR_DET
+        self.det = YoLoDeepX(resolve_model_path(SYS_CFG["models"]["CONTAINER_OCR_DET"]),
+                             output_format=get_model_output_format("CONTAINER_OCR_DET"),
+                             pool_size=get_model_engine_pool_size("CONTAINER_OCR_DET"))
+        apply_class_confidences(self.det, "CONTAINER_OCR_DET")
+        count = self.det.raw_yolo_num_classes()
+        if count is not None and count != len(CONTAINER_OCR_DET_CLASS_NAMES):
+            raise RuntimeError(f"번호 영역 모델 {os.path.basename(str(self.det.engine_path))}(클래스 {count}개)이 "
+                               f"BIC·TYPE 2클래스 모델이 아닙니다. models.CONTAINER_OCR_DET을 "
+                               f"container_ocr_detector.dxnn으로 바꾸세요.")
         with open(resolve_model_path(cfg["ocr_dict"]), encoding="utf-8") as f:
             self.chars = ["blank"] + [line.rstrip("\n") for line in f]
         self.ocr_npu = self.ocr_cpu = None
@@ -3888,7 +3909,7 @@ class ContainerOcrReader:
         else:
             raise RuntimeError("컨테이너 OCR 모델(cpu/npu)을 찾지 못했습니다.")
         self.ocr_name = ("cpu " + os.path.basename(cpu_path)) if self.ocr_cpu else ("npu " + os.path.basename(npu_path))
-        logger.info(f"[CONTAINER_OCR] 모델 로드: det={os.path.basename(det.engine_path)} ocr={self.ocr_name}")
+        logger.info(f"[CONTAINER_OCR] 모델 로드: det={os.path.basename(str(self.det.engine_path))} ocr={self.ocr_name}")
 
     def ocr_input(self, piece):
         if piece.shape[0] >= 1.5 * piece.shape[1]:
@@ -3935,11 +3956,9 @@ class ContainerOcrReader:
     def read_image(self, image):
         """컨테이너 크롭 한 장 → {'numbers': [...], 'size_types': [...], 'boxes': [...]} (형식 통과한 것만)."""
         h, w = image.shape[:2]
-        dets = self.det.infer(image)  # 점수 기준 model_confidences.SIDE의 BIC·TYPE
+        dets = self.det.infer(image)  # 점수 기준 model_confidences.CONTAINER_OCR_DET의 BIC·TYPE
         boxes = []
         for d in dets:
-            if int(d[5]) not in (self.NUMBER_CLASS, self.SIZE_TYPE_CLASS):
-                continue  # side의 컨테이너·사람 등
             x1, y1, x2, y2 = (float(v) for v in d[:4])
             cx1, cy1 = max(0, math.floor(x1) - 2), max(0, math.floor(y1) - 2)
             cx2, cy2 = min(w, math.ceil(x2) + 2), min(h, math.ceil(y2) + 2)
@@ -4016,10 +4035,7 @@ def get_container_ocr_reader():
     global CONTAINER_OCR_READER, CONTAINER_OCR_ERROR
     if CONTAINER_OCR_READER is None and CONTAINER_OCR_ERROR is None:
         try:
-            observer = get_cone_observer()
-            if observer is None:
-                raise RuntimeError("콘 NG 모델(side.dxnn)을 올리지 못해 번호 영역을 찾을 수 없습니다.")
-            CONTAINER_OCR_READER = ContainerOcrReader(SYS_CFG["container_ocr"], observer.det_container)
+            CONTAINER_OCR_READER = ContainerOcrReader(SYS_CFG["container_ocr"])
         except Exception as e:
             CONTAINER_OCR_ERROR = str(e)
             logger.error(f"[CONTAINER_OCR] 초기화 실패 → 컨테이너 번호 인식을 끕니다: {e}")
