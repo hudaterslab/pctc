@@ -1530,6 +1530,8 @@ def _draw_event_api_image(frame, event_type, bbox, tid, objects_meta=None):
         x1, y1, x2, y2 = int_box(obj.get('box', bbox))
         is_target = tid is not None and obj.get('tid') is not None and int(obj['tid']) == int(tid)
         cv2.rectangle(api_img, (x1, y1), (x2, y2), (0, 0, 255), 1 if is_target else 2)
+        if obj.get('label') == 'cone':
+            continue  # 콘 NG의 콘 상자는 작아서 글자 없이 상자만
         cv2.putText(api_img, str(event_type), (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2,
                     cv2.LINE_AA)
     return api_img
@@ -1638,7 +1640,8 @@ def _send_event_image_task(api_img_path, api_params):
     if ocr_future is not None:
         # 콘 NG: 로컬 저장은 저장 일꾼이 이미 했고, 관제 전송만 컨테이너 번호를 읽을 때까지 기다립니다.
         fields = container_ocr_api_fields(ocr_future, SYS_CFG["container_ocr"]["api_wait_sec"])
-        bboxes = [dict(b, **fields) for b in bboxes]
+        # 번호는 컨테이너 객체(cone_ng) 끝에만 붙이고, 콘 객체(cone)는 상자·점수만 보냅니다.
+        bboxes = [b if b.get("label") == "cone" else dict(b, **fields) for b in bboxes]
         logger.info(f"[CONTAINER_OCR] 관제 사진에 번호 포함 event_id={event_id} containerNo='{fields['containerNo']}' "
                     f"sizeType='{fields['containerSizeType']}' status={fields['ocrStatus']}")
     if api_params['event_name'] == SPEEDING_EVENT:
@@ -3705,6 +3708,7 @@ class ConeCameraState:
         self.shift_hist = deque()     # (t, shift) while landed, for stop detection
         self.repositions = 0
         self.cone_ts = deque()        # (t, best corner-cone score) per sample
+        self.cone_boxes = deque()     # (t, [{'xyxy', 'conf'}]) corner cones per sample, for the NG report
         self.entry = None             # first sighting: {'top': touched the top edge, 'cx': [min, max] since}
 
     @property
@@ -3762,12 +3766,18 @@ class ConeCameraState:
         while self.hist and self.hist[0][0] < t - 10.0:
             self.hist.popleft()
 
-        best = max((k['conf'] for k in o.cones if k.get('object_index') == idx
-                    and k['conf'] >= cfg['cone_conf'] and self._at_corner(c['xyxy'], k['xyxy'])), default=None)
-        if best is not None:
-            self.cone_ts.append((t, best))
+        corner = [k for k in o.cones if k.get('object_index') == idx
+                  and k['conf'] >= cfg['cone_conf'] and self._at_corner(c['xyxy'], k['xyxy'])]
+        if corner:
+            self.cone_ts.append((t, max(k['conf'] for k in corner)))
+            mid = (c['xyxy'][0] + c['xyxy'][2]) / 2
+            self.cone_boxes.append((t, [{'xyxy': list(k['xyxy']), 'conf': k['conf'], 'box': list(c['xyxy']),
+                                         'side': 'left' if (k['xyxy'][0] + k['xyxy'][2]) / 2 < mid else 'right'}
+                                        for k in corner]))
         while self.cone_ts and self.cone_ts[0][0] < t - cfg['cone_hold_sec'] - 30.0:
             self.cone_ts.popleft()
+        while self.cone_boxes and self.cone_boxes[0][0] < t - cfg['cone_hold_sec'] - 30.0:
+            self.cone_boxes.popleft()
 
         if self.anchor is None:
             self.min_bottom = bottom if self.min_bottom is None else min(self.min_bottom, bottom)
@@ -3858,6 +3868,31 @@ class ConeCameraState:
         cs = [c for ts, c in self.cone_ts if since <= ts <= t]
         return (len(cs) >= self.cfg['cone_min_hits']
                 and sum(c >= self.cfg['cone_strong_conf'] for c in cs) >= self.cfg['cone_min_strong'])
+
+    def last_corner_cones(self, t):
+        """NG 보고용: 모서리(왼쪽·오른쪽)마다 t 이전 carry_sec 안에서 마지막으로 찾은 콘 [{'xyxy', 'conf'}](원본 좌표).
+        콘은 프레임마다 한쪽만 잡히기도 해서 마지막 한 프레임이 아니라 모서리별로 모읍니다. 그사이 트럭이 움직였으면
+        그때 컨테이너의 같은 쪽 아래 모서리가 지금 상자(self.box)까지 옮겨 간 만큼 콘도 옮깁니다. 없으면 []."""
+        latest = {}
+        for ts, cones in reversed(self.cone_boxes):
+            if ts > t:
+                continue
+            if ts < t - self.cfg['carry_sec'] or len(latest) == 2:
+                break
+            for k in cones:
+                latest.setdefault(k['side'], k)
+        out = []
+        for side in ('left', 'right'):
+            k = latest.get(side)
+            if k is None:
+                continue
+            x1, y1, x2, y2 = k['xyxy']
+            if self.box is not None:
+                col = 0 if side == 'left' else 2
+                dx, dy = self.box[col] - k['box'][col], self.box[3] - k['box'][3]
+                x1, x2, y1, y2 = x1 + dx, x2 + dx, y1 + dy, y2 + dy
+            out.append({'xyxy': [x1, y1, x2, y2], 'conf': k['conf']})
+        return out
 
     def cone_departed_with_it(self, t):
         """This camera saw its container leave with a cone: dense cones just before it moved and the
@@ -4583,6 +4618,12 @@ class ConeNgDetector(BaseEventDetector):
             bbox = [box[0] * sx, box[1] * sy, box[2] * sx, box[3] * sy]
             tid = self.TID_BASE + int(e["session"])
             privacy = self._event_people(observer, image, sx, sy) or kwargs.get("privacy_tracks", [])
+            # 관제 detectedObjects: 컨테이너(label cone_ng) 다음에 이 카메라가 모서리에서 마지막으로 찾은 콘(label cone)
+            state = self.group.fusion.cams.get(camera_key)
+            cone_objs = [{"label": "cone", "box": [int(k["xyxy"][0] * sx), int(k["xyxy"][1] * sy),
+                                                    int(k["xyxy"][2] * sx), int(k["xyxy"][3] * sy)],
+                          "score": round(float(k["conf"]), 2)}
+                         for k in (state.last_corner_cones(t) if state is not None else [])]
             triggered.append({
                 "tid": tid,
                 "bbox": bbox,
@@ -4590,7 +4631,7 @@ class ConeNgDetector(BaseEventDetector):
                 "fid": fid,
                 "privacy_tracks": privacy,
                 "privacy_fid": fid,
-                "objects": [{"label": "cone_ng", "box": [int(v) for v in bbox], "score": 1.0, "tid": tid}],
+                "objects": [{"label": "cone_ng", "box": [int(v) for v in bbox], "score": 1.0, "tid": tid}] + cone_objs,
                 "decision_trace": {
                     "detector": "ConeNgDetector", "reason": "cone_on_departing_container", "group": self.group.name,
                     "session": e["session"], "t": e["t"], "move_start": e["move_start"],
