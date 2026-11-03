@@ -355,7 +355,9 @@ def load_system_config():
             # 판단 기준값(정지 10초, 이탈 5초 등)은 YT_DEFAULT_CONFIG이고, 바꿀 값만 yt_head_crush에 적습니다(두 이벤트가 같이 씀).
             # 사람 진입만 쓰는 값(person_hold_sec, 끊김 허용 프레임 person_miss_frames, 위험구역 가로 비율
             # danger_zone_width_ratio)은 yt_zone_person에 적습니다.
-            YT_HEAD_CRUSH_EVENT: {"enabled": True, "cooldown_sec": 600, "api_event_type": 11,
+            # 헤드압착은 목숨과 연결되어 쿨다운이 50초이고, 위험이 이어지면 같은 컨테이너에도 다시 알람합니다
+            # (YTHeadCrushDetector.alarm_once_per_object).
+            YT_HEAD_CRUSH_EVENT: {"enabled": True, "cooldown_sec": 50, "api_event_type": 11,
                                   "blur_face": True, "blur_plate": True},
             YT_ZONE_PERSON_EVENT: {"enabled": True, "cooldown_sec": 600, "api_event_type": 10,
                                    "blur_face": True, "blur_plate": True},
@@ -369,7 +371,7 @@ def load_system_config():
         # - MAIN_V2(hanjin_cctv_v2): 과속. FACE(face): 사진 얼굴 가리기. PLATE(plate): 사진 번호판 가리기·과속 번호판 인식
         # - TOPDOWN(topdown 1280x736, 9클래스): YT 헤드압착·사람 진입·Backreach
         # - SIDE(side 640x384, 5클래스: 0 container, 1 tank, 2 spreader, 3 person, 4 YT_HEADER): 콘 NG의 컨테이너(0·1),
-        #   NG 사진 얼굴 가리기용 사람(3)
+        #   NG 사진 얼굴 가리기용 사람(3). 5클래스 모두 콘 카메라 화면에 그립니다.
         # - CONE(cone 640x384, 1클래스 콘): 콘 NG 모서리 크롭(1280x736을 반으로 줄여 넣음)
         # - CONTAINER_OCR_DET(container_ocr_detector 1280x736, 2클래스: 0 BIC, 1 TYPE): 컨테이너 번호 OCR의 글자 영역.
         #   콘 NG가 처음 난 뒤에 올립니다(container_ocr).
@@ -387,7 +389,7 @@ def load_system_config():
         # 클래스는 이름(대소문자 무관, model_class_names) 또는 번호("7")로 적습니다.
         # - 메인 V2: 과속이 쓰는 사람·하반신 0.5, 승용차·트럭 0.6
         # - topdown: 9클래스 모두 0.25(YT 헤드압착·사람 진입·Backreach가 같이 씀)
-        # - side: 컨테이너·탱크 0.25, NG 사진 얼굴 가리기용 사람 0.5(스프레더·YT_HEADER는 아직 쓰지 않음)
+        # - side: 컨테이너·탱크 0.25, NG 사진 얼굴 가리기용 사람 0.5, 스프레더·YT_HEADER 0.25(화면 표시만, 판정에는 안 씀)
         # - cone: 콘 0.01
         # - container_ocr_detector: 컨테이너 번호 영역 BIC·TYPE 0.25
         # - PPU 출력 모델(메인·얼굴)은 장치가 약 0.25 아래를 먼저 버려서 그보다 낮은 값은 효과가 없습니다.
@@ -398,7 +400,7 @@ def load_system_config():
             "FACE": {"face": 0.35},
             "PLATE": {"plate": 0.1},
             "TOPDOWN": {name: 0.25 for name in TOPDOWN_CLASS_NAMES},
-            "SIDE": {"container": 0.25, "tank": 0.25, "person": 0.5},
+            "SIDE": {"container": 0.25, "tank": 0.25, "spreader": 0.25, "person": 0.5, "YT_HEADER": 0.25},
             "CONE": {"cone": 0.01},
             "CONTAINER_OCR_DET": {"BIC": 0.25, "TYPE": 0.25}
         },
@@ -499,7 +501,7 @@ def load_system_config():
         # zone·direction·speed_limit_kmh 등). 예: {"344114": {"radar_camera": {"colocated": {...}}, "speeding": {"zone": {...}}}}
         "radars": {},
         "BATCH_SIZE": 9,
-        "CURRENT_FPS_LOG_INTERVAL_SEC": 10.0,
+        "CURRENT_FPS_LOG_INTERVAL_SEC": 60.0,
         # 관제 이벤트 영상: 이벤트 순간 앞·뒤 초(API 담당자 요청 총 1분)
         "REC_PRE_SEC": 30,
         "REC_POST_SEC": 30,
@@ -1376,10 +1378,6 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, crane_id, cctv_
             stage="evidence_queued",
             status="queued"
         )
-        logger.info(
-            f"[EVIDENCE QUEUED] event_id={event_id} cam={cctv_id} event={event_type} "
-            f"tid={tid} image={img_path} api_image={api_img_path}"
-        )
         return evidence_paths
 
     except Exception as e:
@@ -1903,7 +1901,6 @@ class VideoRecorder:
             for clip in [clip for clip in self.clips if ts > clip["end"]]:
                 self.clips.remove(clip)
                 self.write_queue.put(("__clip_end__", clip))
-                logger.info(f" [녹화종료] {self.ip} - {clip['event']}")
             if not self.clips:
                 return
             if self.write_queue.qsize() >= self.MAX_QUEUED_FRAMES:
@@ -2093,6 +2090,8 @@ class BaseEventDetector:
     stream_reader = "FrameReader"    # 수신기 클래스 이름. 자기 수신 방식이 있는 이벤트만 바꿉니다(과속: "SpeedFrameReader").
     stream_max_width = 720           # 원본 그림 가로 상한(더 큰 그림이 필요한 이벤트만 키움)
     stream_all_frames = False        # True면 프레임을 줄이지 않고 모두 받습니다(과속: 레이더 시각 맞춤).
+    # 같은 객체(추적 번호)에 같은 이벤트는 한 번만 냅니다. 위험이 이어지는 동안 쿨다운마다 다시 내야 하는 이벤트만 False.
+    alarm_once_per_object = True
 
     @classmethod
     def stream_spec(cls):
@@ -3152,6 +3151,23 @@ class ConeCameraState:
                    and c >= cfg['carry_min_conf']]
         return len(carried) >= cfg['carry_min_hits']
 
+    def cone_evidence(self, t):
+        """Corner-cone numbers behind the departure check, for the NG / DEPARTED_OK records (same windows as
+        cone_departed_with_it): standing = hits, hits at cone_strong_conf+, best score in the cone_hold_sec before
+        the move (needs cone_min_hits / cone_min_strong); carried = hits at carry_min_conf+ and best score in the
+        carry_sec after it (needs carry_min_hits)."""
+        ms, cfg = self.moving_since, self.cfg
+        if ms is None:
+            return None
+        rest = self.rest_t if self.rest_t is not None and self.rest_t <= ms else ms
+        standing = [c for ts, c in self.cone_ts if rest - cfg['cone_hold_sec'] <= ts <= rest]
+        carried = [c for ts, c in self.cone_ts if ms <= ts <= min(t, ms + cfg['carry_sec'])]
+        return {"standing_hits": len(standing),
+                "standing_strong": sum(c >= cfg['cone_strong_conf'] for c in standing),
+                "standing_best": round(max(standing, default=0.0), 3),
+                "carried_hits": sum(c >= cfg['carry_min_conf'] for c in carried),
+                "carried_best": round(max(carried, default=0.0), 3)}
+
     @property
     def stage(self):
         if self.box is None:
@@ -3180,6 +3196,7 @@ class ConeNgFusion:
         self.depart_cams = []
         self.move_start = None
         self.ng_event = None
+        self.cone_evidence = {}   # 출발한 카메라마다 판단에 쓴 콘 숫자(ConeCameraState.cone_evidence)
 
     def update(self, o):
         cfg = self.cfg
@@ -3195,7 +3212,8 @@ class ConeNgFusion:
             self.last_present = max(seen)
         elif self.active and t - self.last_present >= cfg['end_sec']:
             if self.departed and not self.ng_sent:
-                events.append(self._event('DEPARTED_OK', t, move_cams=self.depart_cams))
+                events.append(dict(self._event('DEPARTED_OK', t, move_cams=self.depart_cams),
+                                   cone_evidence=self.cone_evidence))
             self.active = False
             return events
         if not self.active:
@@ -3211,12 +3229,14 @@ class ConeNgFusion:
             self.departed, self.depart_cams = True, move_cams
             first = min(self.cams[k].moving_since for k in move_cams)
             self.move_start = first if self.move_start is None else min(self.move_start, first)
+            self.cone_evidence = {k: self.cams[k].cone_evidence(t) for k in move_cams}
             # Evidence is never mixed across cameras: one camera must see the cone, the move and the
             # cone travelling with the container.
             held = [k for k in move_cams if self.cams[k].cone_departed_with_it(t)]
             if held and not self.ng_sent:
                 self.ng_sent = True
-                self.ng_event = self._event('NG', t, cone_cams=held, move_cams=move_cams)
+                self.ng_event = dict(self._event('NG', t, cone_cams=held, move_cams=move_cams),
+                                     cone_evidence=self.cone_evidence)
                 events.append(self.ng_event)
         return events
 
@@ -3320,7 +3340,8 @@ def _cone_crop_canvas(image, roi):
 
 
 class ConeObserver:
-    """콘 카메라 화면 검출(side.dxnn: 0 container, 1 tank, 3 person)과 모서리 크롭의 콘 검출(cone.dxnn: 0 콘).
+    """콘 카메라 화면 검출(side.dxnn: 0 container, 1 tank, 2 spreader, 3 person, 4 YT_HEADER)과 모서리 크롭의
+    콘 검출(cone.dxnn: 0 콘). 판정에는 컨테이너·탱크만, NG 사진 얼굴 가리기에는 사람만 쓰고, 5클래스 모두 화면에 그립니다.
 
     두 모델 모두 NPU(YoLoDeepX) raw 출력이어야 합니다. 콘은 0.05 아래 점수까지 판정에 쓰므로
     장치에서 0.25 미만을 버리는 PPU 출력은 쓸 수 없습니다.
@@ -3394,13 +3415,15 @@ class ConeObserver:
 
     def observe(self, image, keep_container=None, with_cones=True):
         """image(원본 BGR)에서 컨테이너 박스와 그 아래 모서리의 콘을 찾습니다.
-        반환 (containers, cones): containers는 면적 큰 순 [{'xyxy', 'conf'}],
-        cones는 [{'xyxy', 'conf', 'object_index'}] (object_index = containers 안 위치).
+        반환 (containers, cones, others): containers는 면적 큰 순 [{'xyxy', 'conf', 'cls'}](0 컨테이너, 1 탱크),
+        cones는 [{'xyxy', 'conf', 'object_index'}] (object_index = containers 안 위치),
+        others는 컨테이너·탱크 밖 클래스(2 스프레더, 3 사람, 4 YT_HEADER) [{'xyxy', 'conf', 'cls'}](화면 표시용).
         with_cones=False면 모서리 크롭 추론을 건너뜁니다(콘을 판정에 쓰지 않는 단계)."""
         h, w = image.shape[:2]
-        dets = self.det_container.infer(image)  # 점수 기준 model_confidences.SIDE container·tank
-        containers = [{"xyxy": [float(v) for v in d[:4]], "conf": float(d[4])}
-                      for d in dets if int(d[5]) in self.CONTAINER_CLASSES]
+        dets = self.det_container.infer(image)  # 점수 기준 model_confidences.SIDE
+        boxes = [{"xyxy": [float(v) for v in d[:4]], "conf": float(d[4]), "cls": int(d[5])} for d in dets]
+        containers = [b for b in boxes if b["cls"] in self.CONTAINER_CLASSES]
+        others = [b for b in boxes if b["cls"] not in self.CONTAINER_CLASSES]
         if keep_container is not None:
             containers = [c for c in containers if keep_container(c["xyxy"])]
         containers.sort(key=lambda c: -(c["xyxy"][2] - c["xyxy"][0]) * (c["xyxy"][3] - c["xyxy"][1]))
@@ -3416,7 +3439,7 @@ class ConeObserver:
             keep = cv2.dnn.NMSBoxes([[c["xyxy"][0], c["xyxy"][1], c["xyxy"][2] - c["xyxy"][0], c["xyxy"][3] - c["xyxy"][1]]
                                      for c in cones], [c["conf"] for c in cones], 0.0, 0.5)
             cones = [cones[int(i)] for i in np.array(keep).reshape(-1)]
-        return containers, cones
+        return containers, cones, others
 
 
 CONE_OBSERVER = None
@@ -3435,6 +3458,9 @@ def get_cone_observer():
                 logger.error(f"[CONE_NG] 모델 초기화 실패 → 콘 미제거 출차 판정을 끕니다: {e}")
     return CONE_OBSERVER
 
+
+# 콘 카메라 화면에 그리는 side.dxnn 나머지 클래스: 번호 -> (표시 이름, BGR 색)
+SIDE_OTHER_DRAW = {2: ("SPREADER", (255, 128, 0)), 3: ("PERSON", (203, 102, 255)), 4: ("YT_HEADER", (255, 255, 0))}
 
 CONE_GROUP_RECORDERS = {}   # 콘 카메라 키 -> (VideoRecorder, cam_id): 묶음 4분할 영상이 카메라별 녹화를 씁니다
 CONE_GROUP_VIDEO_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="cone-group-video")
@@ -3655,8 +3681,9 @@ class ConeNgGroup:
                         e["ocr_frames"] = [dict(f, cam=k) for k, fs in self.ocr_frames.items() for f in fs]
                     self.pending[target].append(e)
                 else:
+                    evidence = f" cone_evidence={e['cone_evidence']}" if e.get("cone_evidence") else ""
                     logger.info(f"[CONE_NG] group={self.name} {e['type']} session={e['session']} t={e['t']} "
-                                f"cone_cams={e['cone_cams']} move_cams={e['move_cams']}")
+                                f"cone_cams={e['cone_cams']} move_cams={e['move_cams']}{evidence}")
             self._landed_ocr(obs.t)
             self._group_video(obs.t)
             out = self.pending.pop(camera_key, [])
@@ -3748,7 +3775,8 @@ class ConeNgDetector(BaseEventDetector):
         self.overlay = None  # GUI용 마지막 관측(원본 좌표): 컨테이너·모서리 크롭·콘·판정 단계
 
     def _log_stats(self, camera_key, t, observe_ms, cones, state):
-        """10초마다 판정 횟수(Hz)·관측 시간·모서리 콘 점수를 남깁니다(ARMED 조건: 2초 안 3회, 그중 2회 0.3 이상)."""
+        """10초마다 판정 횟수(Hz)·관측 시간·모서리 콘 점수를 남깁니다(ARMED 조건: 2초 안 3회, 그중 2회 0.3 이상).
+        컨테이너가 없던(전부 IDLE) 10초는 숫자가 모두 0이라 남기지 않습니다."""
         s = self._stats
         if s is None or t < s["t0"]:
             s = self._stats = {"t0": t, "n": 0, "ms": [], "cone": [], "stages": Counter()}
@@ -3760,13 +3788,14 @@ class ConeNgDetector(BaseEventDetector):
         s["stages"][cam.stage if cam is not None else "-"] += 1
         if t - s["t0"] >= 10.0:
             span = t - s["t0"]
-            logger.info(f"[CONE_NG] stats cam={camera_key} rate={s['n'] / span:.1f}Hz "
-                        f"observe_ms={median(s['ms']):.0f}/{max(s['ms']):.0f} "
-                        f"corner_cones={len(s['cone'])} strong={sum(c >= 0.3 for c in s['cone'])} "
-                        f"best={max(s['cone'], default=0):.2f} stages={dict(s['stages'])} raw_cones={len(cones)}")
+            if set(s["stages"]) != {"IDLE"}:
+                logger.info(f"[CONE_NG] stats cam={camera_key} rate={s['n'] / span:.1f}Hz "
+                            f"observe_ms={median(s['ms']):.0f}/{max(s['ms']):.0f} "
+                            f"corner_cones={len(s['cone'])} strong={sum(c >= 0.3 for c in s['cone'])} "
+                            f"best={max(s['cone'], default=0):.2f} stages={dict(s['stages'])} raw_cones={len(cones)}")
             self._stats = None
 
-    def _make_overlay(self, observer, camera_key, wh, containers, cones, with_cones=True):
+    def _make_overlay(self, observer, camera_key, wh, containers, cones, others, with_cones=True, t=None):
         """화면 표시용 관측 요약. 모서리 크롭은 observe()와 같은 기준(판정 대상 컨테이너, max_containers)으로 다시 구합니다."""
         w, h = wh
         fusion = self.group.fusion
@@ -3777,11 +3806,11 @@ class ConeNgDetector(BaseEventDetector):
                 for i in (targets[:max_containers] if max_containers else targets) for side in ("left", "right")]
         picked = cam.box if cam is not None else None
         return {
-            "wh": wh, "containers": containers, "rois": rois, "picked": picked,
+            "wh": wh, "containers": containers, "others": others, "rois": rois, "picked": picked,
             "cones": [dict(k, corner=picked is not None and cam._at_corner(picked, k["xyxy"])) for k in cones],
             "strong": fusion.cfg["cone_strong_conf"],
             "state": fusion.state, "stage": cam.stage if cam is not None else "-",
-            "session": fusion.session,
+            "session": fusion.session, "t": t,
         }
 
     def process(self, tracks, track_map, frame, fid, **kwargs):
@@ -3820,11 +3849,12 @@ class ConeNgDetector(BaseEventDetector):
         # 콘은 착지 후(ARMED, 출발 전 콘)와 출발 중(콘이 따라가는지)에만 판정에 씁니다. 그 외 단계는 모서리 크롭을 건너뜁니다.
         with_cones = stage in ("LANDED", "DEPARTING")
         t_obs = time.perf_counter()
-        containers, cones = observer.observe(image, keep_container=keep, with_cones=with_cones)
+        containers, cones, others = observer.observe(image, keep_container=keep, with_cones=with_cones)
         observe_ms = (time.perf_counter() - t_obs) * 1000
         events, _ = self.group.update(camera_key, ConeCameraObs(camera_key, t, (iw, ih), containers, cones), image)
         self._log_stats(camera_key, t, observe_ms, cones, self.group.fusion)
-        self.overlay = self._make_overlay(observer, camera_key, (iw, ih), containers, cones, with_cones)
+        self.overlay = self._make_overlay(observer, camera_key, (iw, ih), containers, cones, others, with_cones,
+                                          t=round(t, 3))
 
         triggered = []
         for e in events:
@@ -3844,6 +3874,7 @@ class ConeNgDetector(BaseEventDetector):
                     "detector": "ConeNgDetector", "reason": "cone_on_departing_container", "group": self.group.name,
                     "session": e["session"], "t": e["t"], "move_start": e["move_start"],
                     "cone_cams": e["cone_cams"], "move_cams": e["move_cams"],
+                    "cone_evidence": e.get("cone_evidence"),
                     "boxes_source": {k: [round(float(v), 1) for v in b] for k, b in e["boxes"].items()},
                     "ocr_frames": len(e.get("ocr_frames") or []),
                 },
@@ -4160,7 +4191,7 @@ def event_model_keys(events):
 
 
 def format_ai_fps_log(cam):
-    """카메라 AI FPS 로그 한 줄. 메인 루프가 CURRENT_FPS_LOG_INTERVAL_SEC(기본 10초)마다 카메라별로 남깁니다.
+    """카메라 AI FPS 로그 한 줄. 메인 루프가 CURRENT_FPS_LOG_INTERVAL_SEC(기본 60초)마다 카메라별로 남깁니다.
     ai_fps는 초당 추론·이벤트 판정 횟수(Camera.current_fps, 화면의 AI FPS와 같음)입니다."""
     receive_max = cam.reader.max_fps
     target = SYS_CFG["system_performance"]["target_fps"]
@@ -4320,7 +4351,8 @@ YT_DEFAULT_CONFIG = {
     "deviation_hold_sec": 5.0,
     # 검출이 이 시간 이하로 끊기면 상태를 유지합니다.
     "lost_grace_sec": 1.0,
-    # YT와 컨테이너가 이 시간 동안 보이지 않으면 감시를 끝냅니다.
+    # YT가 이 시간 동안 보이지 않으면 감시를 끝냅니다. 감시 전에는 헤드, 감시 중에는 그 자리의 헤드·빈 샤시·컨테이너 중
+    # 하나라도 보이면 YT가 있는 것으로 봅니다(감시 중 헤드만 안 보이는 건 괜찮음, _YTUnit.keep_alive).
     "release_sec": 3.0,
     # 하역 중 컨테이너를 찾는 범위 = YT 박스를 샤시 폭 × 이 비율만큼 사방으로 넓힌 영역입니다.
     # 사람 진입(5번)의 위험구역(노랑)과는 관계없습니다(그 가로는 danger_zone_width_ratio).
@@ -4440,8 +4472,10 @@ def _yt_pair_heads(heads, chassis, half_classes=()):
 class _YTUnit:
     """한 자리에 멈춘 YT 한 대(헤드 + 샤시)의 양하 감시 상태."""
 
-    def __init__(self, uid, head, chassis, t, half=False):
+    def __init__(self, uid, head, chassis, t, half=False, name=""):
         self.uid = uid
+        self.name = name   # 로그의 카메라 이름(CAM:번호(ip))
+        self.waited = False   # 이번 정차에서 "10초가 찼는데 감시를 못 켬"을 남겼는지
         self.half = half   # 반 샤시(상자 = 비어 있는 절반)
         self.cycle = 0
         self.armed = False
@@ -4484,6 +4518,7 @@ class _YTUnit:
         moved = math.dist(center, self.anchor) > ratio * self.length
         if moved:
             # YT가 움직였으면 새 정차로 보고 처음부터 다시 판단합니다.
+            self.log_restart(t, cfg, f"헤드 {math.dist(center, self.anchor):.0f}px 움직임(기준 {ratio * self.length:.0f}px)")
             if chassis is None:
                 dx, dy = center[0] - self.anchor[0], center[1] - self.anchor[1]
                 chassis_box = [self.chassis_box[0] + dx, self.chassis_box[1] + dy,
@@ -4492,6 +4527,7 @@ class _YTUnit:
                 chassis_box = chassis.box
             self.anchor = center
             self.stop_since = t
+            self.waited = False
             self.empty_seen = None
             self.disarm()
             self.set_geometry(head.box, chassis_box,
@@ -4505,15 +4541,51 @@ class _YTUnit:
         if chassis is not None and chassis.name in cfg["empty_chassis_classes"]:
             self.empty_seen = t
 
+    def note_empty_chassis(self, chassis, t):
+        """헤드가 안 보인 프레임에도 정차 자리(샤시 박스 안)에 빈 샤시가 보이면 빈 샤시를 본 것으로 둡니다."""
+        if any(_yt_point_in_box(_yt_center(c.box), self.chassis_box) for c in chassis):
+            self.empty_seen = t
+
+    def log_restart(self, t, cfg, reason):
+        """감시가 끝나거나, 정차 시간(arm_stop_sec)의 절반 넘게 센 정차가 처음부터 다시 시작될 때 이유를 한 줄 남깁니다
+        (거의 다 됐다 실패한 순간, 정탐·오탐 분석용)."""
+        stopped = t - self.stop_since
+        if self.armed:
+            logger.info(f"[YT] {self.name} YT{self.uid} 감시 끝(감시 {t - self.armed_at:.1f}초): {reason}")
+        elif stopped >= cfg["arm_stop_sec"] / 2:
+            logger.info(f"[YT] {self.name} YT{self.uid} 정차 {stopped:.1f}초에서 처음부터 다시 셈: {reason}")
+
+    def _log_deviation_end(self, t, cfg, reason):
+        """알람 기준(deviation_hold_sec)의 절반 넘게 이어진 이탈이 끝날 때 몇 초였는지 남깁니다."""
+        hold = cfg["deviation_hold_sec"]
+        if self.dev_since is None or t - self.dev_since < hold / 2:
+            return
+        result = "알람 기준 채움" if t - self.dev_since >= hold else f"알람 기준 {hold:g}초 못 채움"
+        logger.info(f"[YT] {self.name} YT{self.uid} 이탈 {t - self.dev_since:.1f}초 만에 끝남({result}): {reason}")
+
     def update_arming(self, t, cfg):
         if self.armed:
             return
         recent_empty = (self.empty_seen is not None and self.empty_seen >= self.stop_since
                         and t - self.empty_seen <= cfg["lost_grace_sec"])
-        if self.head_seen == t and recent_empty and t - self.stop_since >= cfg["arm_stop_sec"]:
+        # 10초가 찬 순간 헤드가 안 보여도 release_sec(3초) 안에 봤으면 켭니다(10초를 세는 동안의 헤드 끊김 허용과 같은 기준).
+        head_recent = t - self.head_seen <= cfg["release_sec"]
+        if head_recent and recent_empty and t - self.stop_since >= cfg["arm_stop_sec"]:
             self.armed = True
             self.armed_at = t
             self.cycle += 1
+            logger.info(f"[YT] {self.name} YT{self.uid} 감시 시작: 정차 {t - self.stop_since:.1f}초, "
+                        f"헤드 {t - self.head_seen:.1f}초 전·빈 샤시 {t - self.empty_seen:.1f}초 전에 봄")
+        elif t - self.stop_since >= cfg["arm_stop_sec"] and not self.waited:
+            # 정차 시간이 찼는데 못 켠 이유를 이번 정차에 한 번만 남깁니다(조건이 채워지면 그때 켜짐).
+            self.waited = True
+            if not head_recent:
+                why = f"헤드를 {t - self.head_seen:.1f}초 동안 못 봄(기준 {cfg['release_sec']:g}초)"
+            elif self.empty_seen is None or self.empty_seen < self.stop_since:
+                why = "이번 정차에서 빈 샤시를 못 봄"
+            else:
+                why = f"빈 샤시를 {t - self.empty_seen:.1f}초 동안 못 봄(기준 {cfg['lost_grace_sec']:g}초)"
+            logger.info(f"[YT] {self.name} YT{self.uid} 정차 {t - self.stop_since:.1f}초가 찼는데 감시를 못 켬: {why}")
 
     def load_area(self, cfg):
         margin = cfg["load_margin_ratio"] * self.length
@@ -4523,6 +4595,13 @@ class _YTUnit:
         """하역 중 컨테이너를 찾는 범위: YT(헤드+샤시) 박스를 샤시 폭 × danger_margin_ratio만큼 넓힌 영역."""
         margin = cfg["danger_margin_ratio"] * self.width
         return _yt_expand(_yt_union(self.head_box, self.chassis_box), margin, margin)
+
+    def keep_alive(self, objects, t, cfg):
+        """감시 중에는 헤드가 안 보여도 그 자리(container_search_zone)에 YT 헤드·빈 샤시·컨테이너가 하나라도 보이면
+        YT가 있는 것으로 봅니다. YT가 출발하거나(observe) 그 자리에 release_sec 동안 아무것도 없으면 감시가 끝납니다."""
+        zone = self.container_search_zone(cfg)
+        if any(_yt_point_in_box(_yt_center(o.box), zone) for o in objects):
+            self.last_seen = t
 
     def track_container(self, containers, spreaders, t, cfg):
         zone = self.container_search_zone(cfg)
@@ -4545,8 +4624,10 @@ class _YTUnit:
             if self.evaluation["deviated"]:
                 self.dev_since = self.dev_since if self.dev_since is not None else t
             else:
+                self._log_deviation_end(t, cfg, "적재영역 안으로 돌아옴")
                 self.dev_since = None
         elif self.container is not None and t - self.container_seen > cfg["lost_grace_sec"]:
+            self._log_deviation_end(t, cfg, f"하역 중 컨테이너를 {t - self.container_seen:.1f}초 동안 못 봄")
             self.container = None
             self.container_seen = None
             self.evaluation = None
@@ -4619,8 +4700,9 @@ class _YTUnit:
 class YTDischargeMonitor:
     """카메라 한 대의 YT 양하 감시 상태(Camera.yt_monitor). 같은 프레임은 한 번만 계산합니다."""
 
-    def __init__(self, config=None):
+    def __init__(self, config=None, name=""):
         self.lock = threading.RLock()
+        self.name = name   # 로그의 카메라 이름
         self.config = deep_merge_dict(YT_DEFAULT_CONFIG, config)
         self.units = []
         self.next_uid = 1
@@ -4655,15 +4737,23 @@ class YTDischargeMonitor:
                 if unit is None:
                     if ch is None:
                         continue
-                    unit = _YTUnit(self.next_uid, head, ch, t, ch.name in half_classes)
+                    unit = _YTUnit(self.next_uid, head, ch, t, ch.name in half_classes, self.name)
                     self.next_uid += 1
                     self.units.append(unit)
                 matched.add(unit.uid)
                 unit.observe(head, ch, t, cfg)
             for unit in self.units:
+                if unit.uid not in matched:
+                    unit.note_empty_chassis(chassis, t)
                 unit.update_arming(t, cfg)
                 if unit.armed:
                     unit.track_container(containers, spreaders, t, cfg)
+                    unit.keep_alive(heads + chassis + containers, t, cfg)
+            for unit in self.units:
+                gone = t - unit.last_seen
+                if gone > cfg["release_sec"]:
+                    what = "그 자리에 헤드·빈 샤시·컨테이너가" if unit.armed else "헤드가"
+                    unit.log_restart(t, cfg, f"{what} {gone:.1f}초 동안 안 보임(기준 {cfg['release_sec']:g}초)")
             self.units = [unit for unit in self.units if t - unit.last_seen <= cfg["release_sec"]]
             self.snapshot = {"timestamp": t, "units": [unit.view(t, cfg) for unit in self.units]}
             return self.snapshot
@@ -4699,6 +4789,7 @@ class _YTDetectorBase(BaseEventDetector):
 class YTHeadCrushDetector(_YTDetectorBase):
     """하락 예측 지점이 적재영역을 벗어난 상태가 deviation_hold_sec 이상이면 알람합니다."""
     gui_name = "YT HEAD CRUSH"
+    alarm_once_per_object = False   # 목숨과 연결: 같은 컨테이너라도 위험이 이어지면 쿨다운(50초)마다 다시 알람
 
     def process(self, tracks, track_map, frame, fid, **kwargs):
         snapshot = kwargs.get('yt_snapshot') or {}
@@ -4747,6 +4838,7 @@ class YTZonePersonDetector(_YTDetectorBase):
         super().__init__(config, roi_poly, roi_lines)
         self.inside_since = {}   # 추적 번호 -> 구역 안으로 처음 잡힌 시각
         self.missed = {}         # 추적 번호 -> 구역 안으로 안 잡힌 연속 프레임 수
+        self.last_inside = {}    # 추적 번호 -> 구역 안으로 마지막으로 잡힌 시각(기준 전에 나간 사람 로그용)
 
     def danger_zones(self, snapshot):
         """감시 중인 YT마다 (YT 상태, 위험구역 [x1, y1, x2, y2]). 화면(Camera.draw)도 이 구역을 그립니다."""
@@ -4759,7 +4851,8 @@ class YTZonePersonDetector(_YTDetectorBase):
         t = snapshot.get("timestamp")
         zones = self.danger_zones(snapshot)
         if t is None or not zones:
-            self.inside_since, self.missed = {}, {}
+            self._log_left(kwargs.get('camera_key'), list(self.inside_since), "감시가 끝남")
+            self.inside_since, self.missed, self.last_inside = {}, {}, {}
             return []
         persons = [obj for obj in _yt_parse_tracks(kwargs.get('topdown_tracks'))
                    if obj.name in self.config["person_classes"]]
@@ -4774,6 +4867,7 @@ class YTZonePersonDetector(_YTDetectorBase):
             unit, zone = min(hits, key=lambda hit: math.dist(_yt_center(person.box), _yt_center(hit[0]["chassis_box"])))
             inside.add(person.tid)
             since = self.inside_since.setdefault(person.tid, t)
+            self.last_inside[person.tid] = t
             if t - since < hold:
                 continue
             if frame_copy is None and frame is not None:
@@ -4801,8 +4895,20 @@ class YTZonePersonDetector(_YTDetectorBase):
         limit = int(self.config["person_miss_frames"])
         missed = {tid: 0 if tid in inside else self.missed.get(tid, 0) + 1 for tid in self.inside_since}
         self.missed = {tid: n for tid, n in missed.items() if n <= limit}
+        self._log_left(kwargs.get('camera_key'), [tid for tid in self.inside_since if tid not in self.missed], "나감")
         self.inside_since = {tid: since for tid, since in self.inside_since.items() if tid in self.missed}
+        self.last_inside = {tid: last for tid, last in self.last_inside.items() if tid in self.inside_since}
         return triggered
+
+    def _log_left(self, camera_key, tids, reason):
+        """위험구역에 알람 기준(person_hold_sec)의 절반 넘게 머물다 기준 전에 사라진 사람을 한 줄 남깁니다(정탐·오탐 분석용)."""
+        hold = float(self.config["person_hold_sec"])
+        for tid in tids:
+            since = self.inside_since[tid]
+            stayed = self.last_inside.get(tid, since) - since
+            if hold / 2 <= stayed < hold:
+                logger.info(f"[YT ZONE] cam={camera_key} 사람 tid={tid} 위험구역에 {stayed:.1f}초 머물다 {reason}"
+                            f"(기준 {hold:g}초)")
 
 
 def yt_draw_overlay(image, snapshot, scale=(1.0, 1.0), ui=1.0):
@@ -5279,6 +5385,11 @@ class SeaSidePersonDetector(BaseEventDetector):
                     'inside_sec': round(t - s["since"], 2), 'person_hold_sec': hold,
                 },
             })
+        for tid, s in self.inside.items():
+            # 위험 구역에 기준(person_hold_sec)의 절반 넘게 머물다 기준 전에 나간 사람을 한 줄 남깁니다(정탐·오탐 분석용).
+            stayed = s["last"] - s["since"]
+            if t - s["last"] > gap and hold / 2 <= stayed < hold:
+                logger.info(f"[SEASIDE] cam={cam_key} 사람 tid={tid} 위험 구역에 {stayed:.1f}초 머물다 나감(기준 {hold:g}초)")
         self.inside = {tid: s for tid, s in self.inside.items() if t - s["last"] <= gap}
         return triggered
 
@@ -7631,7 +7742,8 @@ class Camera:
         self._last_logic_seq = None
         self.radar_display = None
 
-        self.alerted = {}           # tid -> 이 객체로 이미 알람을 낸 이벤트(같은 객체에 같은 이벤트를 다시 내지 않음)
+        self.alerted = {}           # tid -> 이 객체로 이미 알람을 낸 이벤트(같은 객체에 같은 이벤트를 다시 내지 않음,
+                                    # alarm_once_per_object가 False인 이벤트는 쿨다운마다 다시 냄)
         self._alerted_seen = {}     # tid -> 마지막으로 이벤트 후보가 된 시각. ALERTED_KEEP_SEC 지나면 alerted에서 지웁니다.
         self._alerted_pruned_t = 0.0
         self.last_evt_t = {}
@@ -7663,7 +7775,8 @@ class Camera:
         # YT 두 이벤트는 카메라의 양하 감시 상태 하나를 같이 봅니다. 둘 중 하나만 켜도 감시 상태는 돌고,
         # 판단 설정은 헤드압착(yt_head_crush) 설정을 우선합니다(사람 진입만 켜면 그 설정).
         yt_handlers = [self.handlers[name] for name in YT_EVENTS if name in self.handlers]
-        self.yt_monitor = YTDischargeMonitor(yt_handlers[0].config) if yt_handlers else None
+        self.yt_monitor = YTDischargeMonitor(yt_handlers[0].config, f"CAM:{self.cam_id}({self.ip})") \
+            if yt_handlers else None
 
     def update_config(self, new_conf):
         with self.lock:
@@ -7721,7 +7834,6 @@ class Camera:
         self.roi_lines = denormalize_roi_points(self.roi_lines_norm, w, h) if self.roi_lines_norm else []
         self.roi_frame_shape = frame.shape[:2]
         self._inject_roi_to_handlers(self.roi_poly, self.roi_lines)
-        logger.info(f"[CAM:{self.cam_id}] ROI init | poly={len(self.roi_poly)} lines={len(self.roi_lines)} shape={frame.shape[:2]}")
 
     def _inject_roi_to_handlers(self, roi_poly, roi_lines):
         for handler in self.handlers.values():
@@ -7982,6 +8094,7 @@ class Camera:
     def build_inference_log(self, fid, frame, d_main_res, d_topdown, t_main, t_topdown, alarms, new_events):
         h, w = frame.shape[:2] if frame is not None else (0, 0)
         backreach_on, signal_generation = self._last_backreach_state or (None, None)
+        cone_overlay = getattr(self.handlers.get(CONE_NG_EVENT), "overlay", None)
         return {
             "ts": now_kst().isoformat(),
             "fid": int(fid),
@@ -8013,7 +8126,11 @@ class Camera:
                     "decision_trace": to_json_safe(ev.get("decision_trace", {}))
                 }
                 for ev in (new_events or [])
-            ]
+            ],
+            # YT 양하 감시 상태(정차 초·감시 여부·적재영역·하락 예측·이탈 시간)와 콘 카메라 관측(side·콘, 원본 좌표,
+            # t = 관측 시각)을 프레임마다 남겨 이벤트 앞뒤 1분을 숫자로 다시 볼 수 있게 합니다(그 이벤트가 없는 카메라는 없음).
+            **({"yt": to_json_safe(self.yt_monitor.snapshot)} if self.yt_monitor is not None else {}),
+            **({"cone": to_json_safe(cone_overlay)} if cone_overlay is not None else {}),
         }
 
     def _radar_judge_kwargs(self, fr, t_main, track_map_main):
@@ -8199,6 +8316,7 @@ class Camera:
                     'privacy_tracks': topdown_privacy_tracks(t_topdown),
                     'topdown_tracks': t_topdown,
                     'yt_snapshot': yt_snapshot,
+                    'camera_key': self.camera_key,
                 }
             elif ename == SEASIDE_PERSON_EVENT:
                 # 해측: 같은 topdown 추적 결과의 사람 발 위치를 끝선에 맞춰 옮긴 위험 구역으로 판정합니다. 블러도 Backreach와 같습니다.
@@ -8241,7 +8359,8 @@ class Camera:
 
                 if tid in self.alerted:
                     self._alerted_seen[tid] = now
-                if ename not in self.alerted.get(tid, ()) and (now - self.last_evt_t.get(ename, 0) >= cooldown):
+                already = handler.alarm_once_per_object and ename in self.alerted.get(tid, ())
+                if not already and (now - self.last_evt_t.get(ename, 0) >= cooldown):
                     if ename == BACKREACH_EVENT and self._read_backreach_state() != br_state:
                         # 추론 중 감시 구간(ON·OFF)이 바뀌었으면 이전 구간의 결과로 이벤트를 만들지 않습니다.
                         break
@@ -8401,7 +8520,7 @@ class Camera:
 
                 else:
                     cooldown_remaining = max(0.0, cooldown - (now - self.last_evt_t.get(ename, 0)))
-                    reason = "alerted" if ename in self.alerted.get(tid, ()) else "cooldown"
+                    reason = "alerted" if already else "cooldown"
                     # 같은 객체가 ROI에 머무는 동안 프레임마다 같은 줄이 반복되므로, 객체마다 이유가 바뀔 때만 남깁니다.
                     if self._suppress_logged.get((ename, tid)) != reason:
                         if len(self._suppress_logged) > 2000:
@@ -8601,7 +8720,8 @@ class Camera:
         cone_handler = self.handlers.get(CONE_NG_EVENT)
         cone_overlay = getattr(cone_handler, "overlay", None)
         if cone_overlay:
-            # 콘 판정 관측(원본 좌표): 컨테이너(판정 대상 초록, 그 외 회색)·모서리 크롭(노랑)·콘(강 빨강, 약 주황, 모서리 밖 회색)
+            # 콘 판정 관측(원본 좌표): 컨테이너·탱크(판정 대상 초록, 그 외 회색)·모서리 크롭(노랑)·콘(강 빨강, 약 주황,
+            # 모서리 밖 회색), side의 나머지 클래스(스프레더 파랑, 사람 분홍, YT_HEADER 하늘색)
             ow, oh = cone_overlay["wh"]
             sx, sy = w_frame / float(ow), h_frame / float(oh)
 
@@ -8614,8 +8734,15 @@ class Camera:
                 color = (0, 255, 0) if is_picked else (160, 160, 160)
                 p1, p2 = cone_pt(*c["xyxy"][:2]), cone_pt(*c["xyxy"][2:])
                 cv2.rectangle(fr, p1, p2, color, th(2) if is_picked else th(1))
-                cont_label = "CONT" if for_record else f"CONT {c['conf']:.2f}"
+                name = "TANK" if c.get("cls") == 1 else "CONT"
+                cont_label = name if for_record else f"{name} {c['conf']:.2f}"
                 cv2.putText(fr, cont_label, (p1[0] + px(4), p1[1] + px(16)), cv2.FONT_HERSHEY_SIMPLEX, fs(0.5), color, th(1))
+            for o in cone_overlay.get("others", ()):
+                name, color = SIDE_OTHER_DRAW.get(o["cls"], (str(o["cls"]), (200, 200, 200)))
+                p1, p2 = cone_pt(*o["xyxy"][:2]), cone_pt(*o["xyxy"][2:])
+                cv2.rectangle(fr, p1, p2, color, th(2))
+                label = name if for_record else f"{name} {o['conf']:.2f}"
+                cv2.putText(fr, label, (p1[0] + px(4), p1[1] + px(16)), cv2.FONT_HERSHEY_SIMPLEX, fs(0.5), color, th(1))
             for roi in cone_overlay["rois"]:
                 cv2.rectangle(fr, cone_pt(*roi[:2]), cone_pt(*roi[2:]), (0, 255, 255), th(1))
             for k in cone_overlay["cones"]:
@@ -8887,7 +9014,6 @@ class HealthCheckDaemon:
 
         roi_settings = data.get("roiSettings")
         if not roi_settings:
-            logger.debug("[Health Check] roiSettings empty; no ROI update")
             return []
         if not isinstance(roi_settings, list):
             logger.warning(f"[Health Check] roiSettings ignored because it is not a list: {type(roi_settings).__name__}")
@@ -9599,7 +9725,7 @@ def main():
                 current_fps_last_print.setdefault(c.ip, now_time)
                 if now_time - current_fps_last_print[c.ip] >= current_fps_log_interval_sec:
                     current_fps_last_print[c.ip] = now_time
-                    # 카메라마다 AI FPS(초당 추론·이벤트 판정 횟수)를 CURRENT_FPS_LOG_INTERVAL_SEC(기본 10초)마다 남깁니다.
+                    # 카메라마다 AI FPS(초당 추론·이벤트 판정 횟수)를 CURRENT_FPS_LOG_INTERVAL_SEC(기본 60초)마다 남깁니다.
                     logger.info(format_ai_fps_log(c))
 
                 # 녹화 영상은 GUI 화면과 같은 그림입니다(상자·이름, 알람 빨간 테두리, ROI·YT 구역, 상태 글자).
