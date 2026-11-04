@@ -313,6 +313,10 @@ def load_system_config():
                 "speed_limit_kmh": 30.0, "margin_kmh": 5.0, "margin_ratio": 0.0,
                 "window_sec": 1.5, "min_span_sec": 1.0, "min_samples": 5, "min_quality": 0.0,
                 "track_timeout_sec": 1.0, "same_vehicle_guard_sec": 3.0, "same_vehicle_guard_m": 8.0,
+                # 단속 방향: 센서로 다가오는 차만(앞번호판). "receding"은 멀어지는 차, "both"는 양쪽입니다.
+                "direction": "approaching",
+                # 판정 구역. 카메라에 ROI(단속 차로)와 보정값(호모그래피)이 있으면 ROI를 레이더 좌표로 바꾼 다각형을 씁니다
+                # (roi_radar_polygon). 그때 이 거리·좌우 범위는 함께 적용되고 polygon은 쓰지 않습니다.
                 "zone": {"min_range_m": 0.0, "max_range_m": 200.0, "max_abs_lateral_m": 50.0}
             },
             # 콘 미제거 출차: 양하 후 착지한 컨테이너에 콘이 달린 채 YT가 출발하면 NG.
@@ -2441,6 +2445,7 @@ class RadarSpeedJudge:
         self._seq = 0
         self._consumers = {}         # camera_key -> 이벤트 deque
         self._frame_hooks = []
+        self._camera_zones = {}      # camera_key -> 카메라 ROI를 레이더 좌표로 바꾼 다각형(set_camera_zone)
         # 레이더가 여러 대면 로그에 어느 레이더인지 붙입니다.
         hub = getattr(radar, 'hub', None)
         self.client_label = f"{radar.client_id}:" if hub is not None and len(hub.client_ids) > 1 else ""
@@ -2461,8 +2466,10 @@ class RadarSpeedJudge:
             "max_lat": float(zone.get("max_abs_lateral_m", 50.0)),
             # 레이더 좌표 다각형 [[x, y], ...](선택). 있으면 거리·좌우 범위와 함께 이 안의 객체만 판정합니다.
             "polygon": zone.get("polygon") or None,
-            # 단속 방향: "both"(기본) | "approaching"(센서로 다가오는 차, 앞번호판) | "receding"(멀어지는 차, 뒷번호판)
-            "direction": str(cfg.get("direction", "both") or "both").lower(),
+            # 카메라 ROI(단속 차로)를 레이더 좌표로 바꾼 다각형들. 있으면 위 polygon 대신 이것으로 판정합니다.
+            "camera_polygons": [poly for poly in self._camera_zones.values() if poly],
+            # 단속 방향: "approaching"(기본, 센서로 다가오는 차, 앞번호판) | "receding"(멀어지는 차, 뒷번호판) | "both"
+            "direction": str(cfg.get("direction", "approaching") or "approaching").lower(),
         }
 
     def register(self, camera_key):
@@ -2481,12 +2488,25 @@ class RadarSpeedJudge:
             if hook not in self._frame_hooks:
                 self._frame_hooks.append(hook)
 
+    def set_camera_zone(self, camera_key, polygon):
+        """카메라 ROI(단속 차로)를 레이더 좌표로 바꾼 다각형을 판정 구역으로 둡니다(None이면 그 카메라 구역을 뺍니다).
+        같은 레이더를 카메라 여러 대가 쓰면 그중 한 다각형에라도 들어간 객체를 판정합니다."""
+        zones = dict(self._camera_zones)        # 통째로 바꿔 끼웁니다(params()가 잠금 없이 읽음)
+        if polygon:
+            zones[camera_key] = polygon
+        else:
+            zones.pop(camera_key, None)
+        self._camera_zones = zones
+
     @staticmethod
     def _in_zone(obj, p):
         x, y = float(obj['x_m']), float(obj['y_m'])
         rng = math.hypot(x, y)
         if not (p["min_range"] <= rng <= p["max_range"] and abs(y) <= p["max_lat"]):
             return False
+        cams = p.get("camera_polygons")
+        if cams:
+            return any(point_in_polygon(poly, x, y) for poly in cams)
         poly = p.get("polygon")
         return point_in_polygon(poly, x, y) if poly else True
 
@@ -2576,12 +2596,15 @@ class RadarSpeedJudge:
             'window_sec': p["window"], 'direction': direction,
         }
 
-    def position_at(self, seq, t_arrival):
-        """seq 트랙에서 t_arrival(레이더 도착 시각 기준)에 가장 가까운 샘플 (x, y, speed_kmh)."""
+    def position_at(self, seq, t_arrival, max_dt=None):
+        """seq 트랙에서 t_arrival(레이더 도착 시각 기준)에 가장 가까운 샘플 (x, y, speed_kmh).
+        max_dt를 주면 그보다 시간이 먼 샘플뿐일 때(구역을 벗어났거나 트랙이 끊김) None."""
         with self._lock:
             for st in self._tracks.values():
                 if st['seq'] == seq and st['samples']:
                     best = min(st['samples'], key=lambda s: abs(s[0] - t_arrival))
+                    if max_dt is not None and abs(best[0] - t_arrival) > max_dt:
+                        return None
                     return best[3], best[4], best[2]
         return None
 
@@ -2612,6 +2635,24 @@ def point_in_polygon(poly, x, y):
         if (y1 > y) != (y2 > y) and x < (x2 - x1) * (y - y1) / ((y2 - y1) or 1e-12) + x1:
             inside = not inside
     return inside
+
+
+def roi_radar_polygon(roi_norm, rc):
+    """카메라 ROI(정규화 화면 좌표)를 레이더 지면 좌표 다각형 [[x, y], ...]으로 바꿉니다(호모그래피의 역변환).
+    호모그래피가 없거나 보정이 망가졌으면(거의 특이 행렬, 정상 보정은 조건수 1e4 안팎) None.
+    ROI 꼭짓점이 레이더 뒤쪽이나 수평선 너머로 가도(화면 전체 ROI 등) None입니다. rc: 그 레이더 보정값(radar_camera_cfg)."""
+    H, size = rc.get("homography"), rc.get("image_size")
+    if not H or not size or not roi_norm or len(roi_norm) < 3:
+        return None
+    H = np.asarray(H, dtype=np.float64).reshape(3, 3)
+    if not np.all(np.isfinite(H)) or np.linalg.cond(H) > 1e7:
+        return None
+    Hi = np.linalg.inv(H)
+    pts = [Hi @ np.array([float(px) * float(size[0]), float(py) * float(size[1]), 1.0]) for px, py in roi_norm]
+    if any(abs(p[2]) < 1e-12 for p in pts) or len({bool(p[2] > 0) for p in pts}) != 1:
+        return None
+    poly = [[round(float(p[0] / p[2]), 2), round(float(p[1] / p[2]), 2)] for p in pts]
+    return poly if all(x > 0 for x, _ in poly) else None
 
 
 def colocated_projector(col, shape, reflector_z=0.5):
@@ -6039,8 +6080,8 @@ def request_fullres_capture(cam, event_name, event_id, event_fid, bbox, inferenc
                             evidence=None):
     """원본 프레임 추출을 예약하고 결과 폴더 경로를 돌려줍니다.
     pts_window가 있으면(레이더 이벤트) [start_pts - pre, event_pts + post], 없으면 이벤트 프레임 PTS 기준 [pre, post].
-    follow_boxes([[pts, 박스], ...], 과속 차량을 판정 전후로 따라간 박스)가 있으면 그 구간까지 넓혀 추출하고,
-    번호판은 그 박스가 가장 클 때(가장 가까울 때)의 프레임에서 찾습니다."""
+    follow_boxes([[pts, 박스], ...], 과속 차량을 판정 전후로 따라간 박스)가 있으면 그 차가 가까이 왔을 때(박스 넓이가
+    가장 클 때의 절반 이상, 최소 1초)만 추출하고, 번호판은 그 박스가 가장 클 때(가장 가까울 때)의 프레임에서 찾습니다."""
     global FULLRES_EXTRACTOR
     if not fullres_enabled(event_name):
         return None
@@ -6074,9 +6115,12 @@ def request_fullres_capture(cam, event_name, event_id, event_fid, bbox, inferenc
     if evidence:
         job["evidence"] = evidence  # 증거 3장 묶음 글자(시각·레이더 속도·영상 재검증)
     if follow_boxes:
+        # 판정 순간(멀리 있을 때) 구간은 번호판이 작아 쓰지 않습니다. 뽑는 장수와 디스크도 그만큼 줄어듭니다.
         job["follow_boxes"] = follow_boxes
-        job["t0"] = min(job["t0"], follow_boxes[0][0] - 0.1)
-        job["t1"] = max(job["t1"], follow_boxes[-1][0] + 0.1)
+        areas = [max(0, b[1][2] - b[1][0]) * max(0, b[1][3] - b[1][1]) for b in follow_boxes]
+        near = [b[0] for b, a in zip(follow_boxes, areas) if a >= 0.5 * max(areas)]
+        job["t1"] = near[-1] + 0.1
+        job["t0"] = min(near[0] - 0.1, job["t1"] - 1.0)
     if FULLRES_EXTRACTOR is None:
         FULLRES_EXTRACTOR = FullResExtractor(cfg)
     if not FULLRES_EXTRACTOR.request(job):
@@ -7739,6 +7783,7 @@ class Camera:
         self.assoc_votes = deque(maxlen=4000)      # 과속: (카메라 시각, 레이더 id, 박스 tid) 프레임별 연결 → 이벤트 차량 다수결
         self.track_boxes = {}                      # 과속: tid -> deque[[pts, 박스]] 번호판 촬영 시점 고르기용
         self.plr_follow = {}                       # 과속: event_id -> 판정 후 차량 박스를 따라가며 원본 추출 대기
+        self._radar_zone_key = None                # 과속: 레이더 판정 구역으로 넘긴 (ROI, 보정값) — 바뀔 때만 다시 계산
         self._last_logic_seq = None
         self.radar_display = None
 
@@ -8155,11 +8200,15 @@ class Camera:
         # 추정 보정값(colocated.estimated)이면 박스 하단 띠 검사 대신 거의 모든 점을 후보로 둡니다(5000px).
         gate = 5000.0 if use_col and col.get("estimated") else float(rc.get("assoc_gate_px", 80))
         project = radar_camera_projector(fr.shape if fr is not None else None, rc)
+        self._update_radar_zone(judge, rc)
         meta = self.current_frame_meta or {}
         camera_time = self.reader.camera_time_of(meta.get("pts"))
         now_t = camera_time if camera_time is not None else time.monotonic()
         moving = moving_tracks(self.speed_track_hist, t_main, now_t)
-        self._update_plr_follow(t_main, meta)
+        self._update_plr_follow(t_main, meta, {
+            'judge': judge, 'project': project, 'offset': offset, 'camera_time': camera_time, 'moving': moving,
+            'track_map': track_map_main, 'gate': gate, 'frame_shape': fr.shape if fr is not None else None,
+            'focal_px': projection_focal_px(fr.shape if fr is not None else None, rc)})
 
         if project is not None and fr is not None:
             radar_t = camera_time - offset if camera_time is not None else None
@@ -8181,7 +8230,8 @@ class Camera:
         if rc.get("calibration_collect", False):
             recorder = RadarCameraCalibrationRecorder.get()
             judge.add_frame_hook(recorder.radar_hook)
-            vehicles = [t for t in t_main if track_map_main.get(int(t[4])) in TARGET_VEHICLES]
+            # 서 있는 차(주차 트럭 등)는 레이더에 잡히지 않아 엉뚱한 레이더 기록과 짝지어지므로, 움직이는 차량 박스만 기록합니다.
+            vehicles = [t for t in moving if track_map_main.get(int(t[4])) in TARGET_VEHICLES]
             if len(vehicles) == 1 and camera_time is not None and fr is not None:
                 recorder.camera_obs(self.camera_key, camera_time, meta.get("pts"), vehicles[0], fr.shape)
 
@@ -8197,9 +8247,40 @@ class Camera:
             'radar_votes': self.assoc_votes,
         }
 
-    def _update_plr_follow(self, t_main, meta):
+    def _update_radar_zone(self, judge, rc):
+        """카메라 ROI(단속 차로)를 레이더 판정 구역으로 넘깁니다. ROI나 보정값이 바뀔 때만 다시 계산합니다."""
+        key = json.dumps([self.roi_poly_norm, rc.get("homography"), rc.get("image_size")])
+        if key == self._radar_zone_key:
+            return
+        self._radar_zone_key = key
+        poly = roi_radar_polygon(self.roi_poly_norm, rc)
+        judge.set_camera_zone(self.camera_key, poly)
+        if poly:
+            logger.info(f"[RADAR ZONE] CAM:{self.cam_id}({self.camera_key}) ROI를 레이더 {self.radar_provider.client_id} "
+                        f"판정 구역으로 씁니다(레이더 좌표 x 앞 m, y 왼쪽+ m): {poly}")
+        elif self.roi_poly_norm:
+            logger.warning(f"[RADAR ZONE] CAM:{self.cam_id}({self.camera_key}) 보정값(호모그래피)이 없거나 망가졌거나 ROI가 "
+                           f"수평선 너머까지 있어 ROI를 레이더 구역으로 못 바꿉니다. 설정 구역(event_config.speeding.zone)으로 판정합니다.")
+
+    @staticmethod
+    def _radar_follow_tid(fl, radar):
+        """판정 순간 박스를 못 찾은 과속 차량: 지금 레이더 위치를 화면에 투영해 붙는 차량 박스를 찾습니다.
+        반환 (레이더가 아직 그 차를 보는지, 붙은 박스 tid 또는 None)."""
+        if not radar or radar.get('project') is None or radar.get('camera_time') is None or fl.get("radar_seq") is None:
+            return False, None
+        pos = radar['judge'].position_at(fl["radar_seq"], radar['camera_time'] - radar['offset'], max_dt=0.3)
+        if pos is None:
+            return False, None
+        row = {'radar_id': fl.get("radar_id"), 'x_m': pos[0], 'y_m': pos[1], 'speed_kmh': pos[2]}
+        matched, _ = associate_radar_tracks(radar['moving'], radar['track_map'], [row], radar['project'], radar['gate'],
+                                            frame_shape=radar['frame_shape'], focal_px=radar['focal_px'])
+        return True, next(iter(matched), None)
+
+    def _update_plr_follow(self, t_main, meta, radar=None):
         """차량 박스 이력을 남기고, 과속 차량이 화면에서 PLR_FOLLOW_LOST_SEC 넘게 사라지거나 PLR_FOLLOW_MAX_SEC가
-        지나면 원본 추출을 요청합니다. 판정 전후 그 차량 박스 중 가장 클 때(가장 가까울 때)의 원본 프레임으로 번호판을 읽게 됩니다."""
+        지나면 원본 추출을 요청합니다. 판정 전후 그 차량 박스 중 가장 클 때(가장 가까울 때)의 원본 프레임으로 번호판을 읽게 됩니다.
+        판정 순간 박스를 못 찾은 차량(tid None)은 레이더 트랙을 따라가다 투영점에 박스가 붙는 순간부터 그 박스를 따라갑니다
+        (멀리서 판정해 박스가 작거나 가려졌던 차). radar: _radar_judge_kwargs가 넘기는 판정기·투영·지연·움직이는 박스."""
         now_m, pts = time.monotonic(), meta.get("pts")
         by_tid = {int(t[4]): t for t in t_main}
         if pts is not None:
@@ -8209,7 +8290,14 @@ class Camera:
                 del self.track_boxes[tid]
         for event_id in list(self.plr_follow):
             fl = self.plr_follow[event_id]
-            t = by_tid.get(fl["tid"])
+            if fl["tid"] is None:
+                alive, tid = self._radar_follow_tid(fl, radar)
+                if alive:
+                    fl["last_seen"] = now_m
+                if tid is not None:
+                    fl["tid"] = int(tid)
+                    logger.info(f"[PLR FOLLOW] event_id={event_id} 레이더 위치에 차량 박스가 붙어 따라갑니다. tid={tid}")
+            t = by_tid.get(fl["tid"]) if fl["tid"] is not None else None
             if t is not None and pts is not None:
                 fl["boxes"].append([round(float(pts), 4), int_box(t[:4])])
                 fl["last_seen"] = now_m
@@ -8484,15 +8572,18 @@ class Camera:
                                     "threshold_kmh": decision_trace.get('threshold_kmh'),
                                     "radar_id": decision_trace.get('radar_id'), "radar_client_id": radar_client_id,
                                     "video_check": video_check}
-                    if follow_obj is not None and ev.get('fullres_window') and fullres_enabled(ename):
-                        # 과속 판정은 레이더가 멀리서 먼저 내리므로, 판정 전후 그 차량 박스를 모아 가장 가까울 때의
-                        # 원본으로 번호판을 읽습니다(_update_plr_follow가 차량이 사라지거나 시간이 지나면 추출 요청).
-                        ftid = int(follow_obj['tid'])
+                    if ename == SPEEDING_EVENT and ev.get('fullres_window') and fullres_enabled(ename):
+                        # 과속 판정은 레이더가 멀리서 먼저 내리므로, 그 차량을 따라가 가장 가까울 때의 원본으로 번호판을
+                        # 읽습니다(_update_plr_follow가 차량이 사라지거나 시간이 지나면 추출 요청). 판정 순간 박스를 못 찾았으면
+                        # (ftid None) 레이더 트랙을 따라가다 박스가 붙는 순간부터 그 박스를 따라갑니다.
+                        ftid = int(follow_obj['tid']) if follow_obj is not None else None
                         ev_pts = float(ev['fullres_window']['event_pts'])
-                        past = [b for b in self.track_boxes.get(ftid, []) if b[0] >= ev_pts - self.PLR_FOLLOW_MAX_SEC]
+                        past = [b for b in self.track_boxes.get(ftid, []) if b[0] >= ev_pts - self.PLR_FOLLOW_MAX_SEC] \
+                            if ftid is not None else []
                         now_m = time.monotonic()
                         self.plr_follow[event_id] = {
                             "tid": ftid, "boxes": past, "started": now_m, "last_seen": now_m,
+                            "radar_seq": decision_trace.get('radar_track_seq'), "radar_id": decision_trace.get('radar_id'),
                             "event_name": ename, "event_fid": event_fid, "bbox": bbox,
                             "inference_shape": ev_frame.shape, "pts_window": ev.get('fullres_window'), "evidence": evidence}
                         fullres_dir = fullres_out_dir(self, ename, event_id)
