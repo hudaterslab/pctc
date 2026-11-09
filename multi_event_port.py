@@ -283,12 +283,6 @@ def load_system_config():
         "crane_id": "",
         "cctv_server_id": "1",
         "receiver": {"enabled": False, "cctv_ids": [], "base_url": "https://dev.hjit.hudaters.net/hjit/receiver/api/v1/cctv"},
-        # 과속 단속 전송(eslip speedViolation/insert). 과속 이벤트의 번호판이 send_status 상태로 정해지면
-        # 차량번호(regoNo)와 단속일시(enfDt, 이벤트 시각)를 보냅니다.
-        # speed_violation_pass가 true면 보낼 내용을 이벤트 폴더(speed_violation_api.json)에만 저장하고 보내지 않습니다.
-        # 실제 단속 기록이 들어가므로 기본은 true이고, 운영 단말에서만 false로 바꿉니다.
-        "speed_violation_api": {"speed_violation_pass": True, "url": "https://eslip.hjit.co.kr/speedViolation/insert",
-                                "send_status": ["확정"], "timeout_sec": 10, "retries": 2, "verify_tls": True},
         "health_check": {"interval_sec": 60, "verify_tls": True},
         "event_api": {"verify_tls": True},
         "video_api": {"verify_tls": True, "timeout_sec": 60},
@@ -311,12 +305,36 @@ def load_system_config():
             "speeding": {
                 "enabled": True, "cooldown_sec": 0, "api_event_type": 13, "blur_plate": True,
                 "speed_limit_kmh": 30.0, "margin_kmh": 5.0, "margin_ratio": 0.0,
-                "window_sec": 1.5, "min_span_sec": 1.0, "min_samples": 5, "min_quality": 0.0,
+                "min_span_sec": 1.0, "min_samples": 5, "min_quality": 0.0,
+                # 레이더 가짜 물체(분리대 반사 등, 11/7): 판정 뒤 차 박스가 한 번도 안 붙고 레이더 트랙이 ghost_radar_post_sec
+                # 안에 사라졌고 번호판도 못 읽었으면 가짜로 보고 관제로 보내지 않으며, 사진·원본·영상을 events/<ip>/ghost/로
+                # 옮깁니다(radar_ghost_check). 레이더마다 radars.<id>.speeding.ghost_filter로 켭니다.
+                "ghost_filter": False, "ghost_radar_post_sec": 1.0,
                 "track_timeout_sec": 1.0, "same_vehicle_guard_sec": 3.0, "same_vehicle_guard_m": 8.0,
-                # 단속 방향: 센서로 다가오는 차만(앞번호판). "receding"은 멀어지는 차, "both"는 양쪽입니다.
-                "direction": "approaching",
-                # 판정 구역. 카메라에 ROI(단속 차로)와 보정값(호모그래피)이 있으면 ROI를 레이더 좌표로 바꾼 다각형을 씁니다
-                # (roi_radar_polygon). 그때 이 거리·좌우 범위는 함께 적용되고 polygon은 쓰지 않습니다.
+                # 레이더가 차 한 대를 둘로 잡을 때(운전석 좌우, 긴 트레일러 앞뒤) 두 번째 과속을 빼는 범위:
+                # same_vehicle_guard_sec 안에 과속을 낸 차의 진행 방향 뒤 trail_m(앞으로는 3m) 안, 옆 trail_lat_m 안,
+                # 속도 차 trail_kmh 안이면 같은 차로 봅니다.
+                # 옆 3m: 트럭 앞(운전석)과 트레일러·컨테이너 뒤를 따로 잡으면 옆으로 2.3~3.0m 벌어집니다(11/5 09:55).
+                "same_vehicle_trail_m": 20.0, "same_vehicle_trail_lat_m": 3.0, "same_vehicle_trail_kmh": 5.0,
+                # 단속 방향(카메라마다 cameras.json event_config.speeding에서 바꿈, 마법사가 물음):
+                # forward = 카메라(레이더)로 다가오는 차(앞번호판), backward = 멀어지는 차(뒷번호판). 둘 다 true면 양쪽 모두.
+                "forward": True, "backward": False,
+                # 속도를 재는 구간(레이더 거리 m, [가까운 끝, 먼 끝]): 이 구간 안 속도 중앙값으로 판정합니다(min_samples·
+                # min_span_sec 이상). 다가오는 차는 가까운 끝을, 멀어지는 차는 먼 끝을 지날 때 판정합니다.
+                "forward_measure_m": [30.0, 80.0], "backward_measure_m": [0.0, 40.0],
+                # 번호판 사진 구간(레이더 거리 m). 화면에 안 보이는 구간이면 화면 안에서 가장 가까운 1초로 당깁니다.
+                "forward_photo_m": [0.0, 5.0], "backward_photo_m": [0.0, 10.0],
+                # ROI(단속 차로)는 차로 고르기만 합니다: ROI를 레이더 좌표로 바꾼 다각형(roi_radar_polygon) 안에 이만큼 이상
+                # 찍힌 트랙만 그 카메라 판정 대상입니다. 카메라에 안 보이는 먼 곳에서 잰 속도도 ROI를 지나가면 씁니다.
+                "lane_min_samples": 3,
+                # 레이더 트랙 샘플을 들고 있는 시간(초): 먼 곳에서 잰 속도를 ROI에 들어온 뒤 판정할 때까지 둡니다.
+                "track_keep_sec": 20.0,
+                # 관제(receiver) 과속 사진: 번호판을 읽은 뒤 detectedObjects에 label "speedviolation"·regNo(차량번호, 여러 장
+                # 다수결)·speed(레이더 속도 km/h)를 넣어 보냅니다(관제 요청, 관제가 TOS로 넘김). 상태(확정·불확실 등)와
+                # 상관없이 다수결 번호를 보내고 상태는 plateStatus로 같이 보냅니다. 차량번호가 없으면(번호판을 못 찾음,
+                # api_wait_sec 안에 못 읽음) 관제로 보내지 않고 로그만 남깁니다(사진·영상).
+                "api_wait_sec": 60.0,
+                # 레이더가 보는 범위. ROI 다각형이 없는 카메라(보정값 없음)는 이 범위(와 polygon)로 차로를 정합니다.
                 "zone": {"min_range_m": 0.0, "max_range_m": 200.0, "max_abs_lateral_m": 50.0}
             },
             # 콘 미제거 출차: 양하 후 착지한 컨테이너에 콘이 달린 채 YT가 출발하면 NG.
@@ -502,7 +520,7 @@ def load_system_config():
         # 레이더 여러 대(카메라·레이더 한 쌍씩). 레이더는 SDK routing_table.json에 client로 적고, 카메라는 cameras.json의
         # radar_client_id로 자기 레이더를 고릅니다(없으면 routing_table의 첫 레이더).
         # 키는 client_id, 값은 그 레이더에만 덮어쓸 설정: radar_camera(보정값), speeding(event_config.speeding의
-        # zone·direction·speed_limit_kmh 등). 예: {"344114": {"radar_camera": {"colocated": {...}}, "speeding": {"zone": {...}}}}
+        # zone·forward·backward·speed_limit_kmh 등). 예: {"344114": {"radar_camera": {"colocated": {...}}, "speeding": {"zone": {...}}}}
         "radars": {},
         "BATCH_SIZE": 9,
         "CURRENT_FPS_LOG_INTERVAL_SEC": 60.0,
@@ -554,8 +572,6 @@ EVENT_SEND_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_na
 EVENT_SEND_MAX_PENDING = 1000
 # 녹화가 끝난 영상의 H.264 변환·meta 저장·전송 예약. 카메라 녹화 스레드가 변환(1~2초)을 기다리며 화면을 쌓지 않게 따로 둡니다.
 VIDEO_FINISH_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="video-finish")
-# 과속 단속(eslip) 전송 전용. 재시도로 수십 초 걸려도 사진·영상 업로드(EVENT_SEND_POOL)를 막지 않게 따로 둡니다.
-SPEED_API_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 def polygon_contour(points):
     """면적이 있는 다각형만 허용합니다. 빈 ROI는 전체 화면을 뜻하지 않습니다."""
@@ -604,12 +620,17 @@ def box_overlaps_polygon(box, contour):
     )
 
 
+# 과속 카메라 메인 검출에서 화면 넓이의 이 비율을 넘는 박스는 비·적외선 노이즈로 보고 버립니다.
+# 11/6 줌 뒤 가까이 온 트럭이 화면 절반을 넘어(번호판이 가장 커질 때 박스가 사라짐) 0.5에서 0.9로 올렸습니다.
+SPEEDING_MAX_BOX_AREA_FRAC = 0.9
+
+
 def filter_speed_main_detections(raw_dets, max_area_threshold):
     """과속 카메라 메인 모델 검출에서 사람·하반신과 승용차·트럭만 남깁니다. 점수 기준(model_confidences.MAIN_V2
     클래스별)은 infer가 이미 걸렀습니다."""
     rows = []
     for d in raw_dets:
-        # BBox 면적이 화면의 1/2을 초과하는 거대 객체(비/IR 노이즈 등) 차단
+        # BBox 면적이 max_area_threshold(화면의 SPEEDING_MAX_BOX_AREA_FRAC)를 넘는 거대 객체(비/IR 노이즈 등) 차단
         if (float(d[2]) - float(d[0])) * (float(d[3]) - float(d[1])) > max_area_threshold:
             continue
         if int(d[5]) in (ID_G_PERSON, ID_PERSON_LOW, *TARGET_VEHICLES):
@@ -1270,6 +1291,35 @@ def _save_and_send_task(img, img_path, api_img, api_img_path, api_params):
                                   extra={"saved_path" if ok else "failed_path": path})
         if not ok:
             return
+    plate_future = api_params.get('plate_future')
+    if api_params['event_name'] == SPEEDING_EVENT and plate_future is None:
+        # 번호판을 읽지 않는 과속 이벤트(원본 추출 꺼짐): 차량번호가 없어 관제로 보내지 않음
+        RECEIVER_SKIPPED_EVENTS.append(str(event_id))
+        logger.info(f"[SPEEDING API] 차량번호가 없어(번호판 읽기 안 함) 관제로 보내지 않습니다(사진·영상). event_id={event_id}")
+        append_event_audit_record(audit_base, stage="api_send", status="skipped", extra={"reason": "plate_not_read"})
+        return
+    if plate_future is not None:
+        # 과속: 번호판(원본 추출·PLR, 보통 이벤트 5~15초 뒤)을 읽은 뒤 보냅니다. 전송 일꾼을 붙잡지 않게 결과가 나오면
+        # 예약하고, 차량번호가 없으면(못 찾음, api_wait_sec 안에 못 읽음) 보내지 않습니다.
+        wait = float(SYS_CFG["event_config"][SPEEDING_EVENT].get("api_wait_sec", 60.0))
+        timer = threading.Timer(wait, resolve_plate_future, args=(event_id, None))
+        timer.daemon = True
+        timer.start()
+
+        def send(done):
+            timer.cancel()
+            final = done.result()
+            reason = plate_number_missing_reason(final)
+            if reason:
+                # 차량번호 없음(번호판 못 찾음·읽기 시간초과): 관제로 보내지 않고 로그만(영상도 _queue_video_upload에서 뺌)
+                RECEIVER_SKIPPED_EVENTS.append(str(event_id))
+                logger.info(f"[SPEEDING API] 차량번호가 없어({reason}) 관제로 보내지 않습니다(사진·영상). event_id={event_id}")
+                append_event_audit_record(audit_base, stage="api_send", status="skipped",
+                                          extra={"reason": "no_plate_number", "plate_status": reason})
+                return
+            submit_event_send(_send_event_image_task, api_img_path, dict(api_params, plate_final=final))
+        plate_future.add_done_callback(send)
+        return
     submit_event_send(_send_event_image_task, api_img_path, api_params)
 
 
@@ -1284,6 +1334,12 @@ def _send_event_image_task(api_img_path, api_params):
         bboxes = [dict(b, **fields) for b in bboxes]
         logger.info(f"[CONTAINER_OCR] 관제 사진에 번호 포함 event_id={event_id} containerNo='{fields['containerNo']}' "
                     f"sizeType='{fields['containerSizeType']}' status={fields['ocrStatus']}")
+    if api_params['event_name'] == SPEEDING_EVENT:
+        # 과속: 관제 요청 형식(label speedviolation, regNo 번호판)
+        bboxes = speeding_api_objects(bboxes, api_params.get('plate_final'))
+        logger.info(f"[SPEEDING API] 관제 사진에 번호판 포함 event_id={event_id} "
+                    f"regNo='{bboxes[0]['regNo'] if bboxes else ''}' status={bboxes[0]['plateStatus'] if bboxes else '-'} "
+                    f"speed={bboxes[0]['speed'] if bboxes else '-'}")
 
     try:
         send_event_image_to_receiver(
@@ -1312,9 +1368,10 @@ def _write_jsonl_records(path, records):
         logger.error(f"[InferLog] JSONL write failed: {path} | {e}")
 
 def save_event_image_with_mark(frame, ip, event_type, bbox, tid, crane_id, cctv_id, objects_meta, event_id, event_ts,
-                               api_event_type, ocr_future=None):
+                               api_event_type, ocr_future=None, plate_future=None):
     """원본 프레임 이미지를 로컬에 저장하고 탐지 메타데이터를 API 큐에 등록합니다.
-    ocr_future(콘 NG)가 있으면 컨테이너 번호를 읽은 뒤 detectedObjects에 넣어 보냅니다(container_ocr_api_fields)."""
+    ocr_future(콘 NG)가 있으면 컨테이너 번호를 읽은 뒤 detectedObjects에 넣어 보냅니다(container_ocr_api_fields).
+    plate_future(과속)가 있으면 번호판을 읽은 뒤 regNo를 넣어 보냅니다(speeding_api_objects)."""
     if IMAGE_SAVER_POOL._work_queue.qsize() > 50:
         logger.warning("이미지 저장 큐가 포화 상태입니다. 저장을 스킵합니다.")
         return
@@ -1348,6 +1405,8 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, crane_id, cctv_
             item = {"box": [int(b) for b in o['box']], "label": o['label'], "score": round(float(o['score']), 2)}
             if o.get('tid') is not None:
                 item["tid"] = int(o['tid'])
+            if o.get('speed_kmh') is not None:   # 과속: 레이더 판정 속도(관제 detectedObjects speed)
+                item["speed_kmh"] = round(float(o['speed_kmh']), 1)
             ai_detected_bboxes.append(item)
 
         api_params = {
@@ -1361,7 +1420,8 @@ def save_event_image_with_mark(frame, ip, event_type, bbox, tid, crane_id, cctv_
             'bboxes': ai_detected_bboxes,
             'img_width': w,
             'img_height': h,
-            'ocr_future': ocr_future
+            'ocr_future': ocr_future,
+            'plate_future': plate_future
         }
 
         IMAGE_SAVER_POOL.submit(_save_and_send_task, img, img_path, api_img, api_img_path, api_params)
@@ -1951,8 +2011,30 @@ class VideoRecorder:
         return "mp4v"
 
     def _queue_video_upload(self, fpath, frame_count, size, meta, codec, fps):
-        """새 receiver API: 녹화가 끝난 영상을 그 이벤트의 사진과 같은 collectedAt으로 보냅니다."""
+        """새 receiver API: 녹화가 끝난 영상을 그 이벤트의 사진과 같은 collectedAt으로 보냅니다.
+        과속: 아직 번호판을 읽는 중이면 결과를 기다렸다가 보내고, 차량번호가 없는 이벤트는 보내지 않습니다."""
         if not isinstance(meta, dict) or not meta.get("event_id"):
+            return
+        event_id = str(meta["event_id"])
+        with PLATE_FUTURES_LOCK:
+            pending = PLATE_FUTURES.get(event_id)
+        if pending is not None:
+            pending.add_done_callback(lambda _: self._queue_video_upload(fpath, frame_count, size, meta, codec, fps))
+            return
+        if event_id in GHOST_EVENTS:
+            gdir = ghost_event_dir(self.ip, event_id)
+            stem = fpath[:-4] if fpath.endswith(".mp4") else fpath
+            try:
+                os.makedirs(gdir, exist_ok=True)
+                for path in (fpath, stem + ".meta.json", stem + ".infer.jsonl"):
+                    if os.path.exists(path):
+                        shutil.move(path, os.path.join(gdir, os.path.basename(path)))
+            except Exception as e:
+                logger.error(f"[GHOST] 영상 옮기기 실패 event_id={event_id}: {e}")
+            logger.info(f"[GHOST] 레이더 가짜 물체 이벤트라 영상을 {gdir}로 옮기고 보내지 않습니다. event_id={event_id}")
+            return
+        if event_id in RECEIVER_SKIPPED_EVENTS:
+            logger.info(f"[VIDEO API] 차량번호가 없는 과속 이벤트라 영상도 보내지 않습니다. event_id={event_id}")
             return
         try:
             submit_event_send(send_event_video_to_receiver, fpath, copy.deepcopy(meta),
@@ -2418,11 +2500,28 @@ class MseRadarInput:
 RADAR_EVENT_TID_BASE = 1_000_000  # 레이더 트랙 이벤트 tid 공간(RGB 트랙 ID와 겹치지 않게)
 
 
-class RadarSpeedJudge:
-    """레이더 트랙 기준 과속 판정기.
+def speeding_lane_settings(cfg):
+    """과속 차로(카메라)별 판정 설정: 방향(forward 다가오는 차, backward 멀어지는 차)과 방향별 측정·사진 구간(레이더 거리 m)."""
+    def span(key, default):
+        lo, hi = (float(v) for v in (cfg.get(key) or default))
+        return min(lo, hi), max(lo, hi)
+    return {"forward": bool(cfg.get("forward", True)), "backward": bool(cfg.get("backward", False)),
+            "forward_measure": span("forward_measure_m", (30.0, 80.0)),
+            "backward_measure": span("backward_measure_m", (0.0, 40.0)),
+            "forward_photo": span("forward_photo_m", (0.0, 5.0)),
+            "backward_photo": span("backward_photo_m", (0.0, 10.0))}
 
-    레이더 프레임마다 트랙별 최근 window_sec 속도 중앙값이 (제한 + 여유)를 넘으면 트랙당 1회 이벤트를 냅니다.
-    판정은 레이더만으로 끝나고, 카메라 박스 연결은 증거 표시에만 씁니다. 레이더(client_id)마다 하나씩 둡니다.
+
+class RadarSpeedJudge:
+    """레이더 트랙 기준 과속 판정기. 레이더(client_id)마다 하나씩 둡니다.
+
+    - ROI(단속 차로)는 차로 고르기만: ROI를 레이더 좌표로 바꾼 다각형 안에 lane_min_samples 이상 찍힌 트랙만 그 카메라의
+      판정 대상입니다. 측정 거리는 ROI와 상관없어서, 카메라에 안 보이는 먼 곳에서 잰 속도도 그 차가 ROI를 지나가면 씁니다.
+    - 방향: 카메라마다 forward(센서로 다가오는 차, 앞번호판)·backward(멀어지는 차, 뒷번호판)를 켭니다(둘 다면 양쪽).
+    - 속도: 방향별 측정 구간(레이더 거리, forward_measure_m·backward_measure_m) 안 샘플의 중앙값.
+    - 판정 시점: 다가오는 차는 측정 구간 가까운 끝을, 멀어지는 차는 먼 끝을 지날 때입니다. 그때 아직 ROI를 안 지났으면
+      ROI에 들어올 때, 그 전에 레이더가 놓치면 놓쳤을 때 판정합니다. 측정 샘플이 모자라면 판정하지 않습니다.
+    - 트랙당 이벤트 1회. 카메라 박스 연결은 증거 표시에만 씁니다.
     """
     _by_client = {}
     _shared_lock = threading.Lock()
@@ -2445,31 +2544,37 @@ class RadarSpeedJudge:
         self._seq = 0
         self._consumers = {}         # camera_key -> 이벤트 deque
         self._frame_hooks = []
-        self._camera_zones = {}      # camera_key -> 카메라 ROI를 레이더 좌표로 바꾼 다각형(set_camera_zone)
+        self._camera_zones = {}      # camera_key -> 차로 {polygon, 방향·측정·사진 구간}(set_camera_zone)
         # 레이더가 여러 대면 로그에 어느 레이더인지 붙입니다.
         hub = getattr(radar, 'hub', None)
         self.client_label = f"{radar.client_id}:" if hub is not None and len(hub.client_ids) > 1 else ""
 
+    def _cfg(self):
+        return self._cfg_override if self._cfg_override is not None else radar_speeding_cfg(getattr(self.radar, 'client_id', None))
+
     def params(self):
-        cfg = self._cfg_override if self._cfg_override is not None else radar_speeding_cfg(getattr(self.radar, 'client_id', None))
+        cfg = self._cfg()
         zone = cfg.get("zone", {}) or {}
         limit = float(cfg.get("speed_limit_kmh", 30.0))
         margin = max(float(cfg.get("margin_kmh", 5.0)), limit * float(cfg.get("margin_ratio", 0.0)))
         return {
             "limit": limit, "margin": margin, "threshold": limit + margin,
-            "window": float(cfg.get("window_sec", 1.5)), "min_span": float(cfg.get("min_span_sec", 1.0)),
+            "min_span": float(cfg.get("min_span_sec", 1.0)),
             "min_samples": int(cfg.get("min_samples", 5)), "min_quality": float(cfg.get("min_quality", 0.0)),
             "timeout": float(cfg.get("track_timeout_sec", 1.0)),
             "guard_sec": float(cfg.get("same_vehicle_guard_sec", 3.0)),
             "guard_m": float(cfg.get("same_vehicle_guard_m", 8.0)),
+            "trail_m": float(cfg.get("same_vehicle_trail_m", 20.0)),
+            "trail_lat_m": float(cfg.get("same_vehicle_trail_lat_m", 3.0)),
+            "trail_kmh": float(cfg.get("same_vehicle_trail_kmh", 5.0)),
             "min_range": float(zone.get("min_range_m", 0.0)), "max_range": float(zone.get("max_range_m", 200.0)),
             "max_lat": float(zone.get("max_abs_lateral_m", 50.0)),
-            # 레이더 좌표 다각형 [[x, y], ...](선택). 있으면 거리·좌우 범위와 함께 이 안의 객체만 판정합니다.
+            # 레이더 좌표 다각형 [[x, y], ...](선택). ROI 다각형이 없는 차로(보정값 없음)는 이것으로 고릅니다.
             "polygon": zone.get("polygon") or None,
-            # 카메라 ROI(단속 차로)를 레이더 좌표로 바꾼 다각형들. 있으면 위 polygon 대신 이것으로 판정합니다.
-            "camera_polygons": [poly for poly in self._camera_zones.values() if poly],
-            # 단속 방향: "approaching"(기본, 센서로 다가오는 차, 앞번호판) | "receding"(멀어지는 차, 뒷번호판) | "both"
-            "direction": str(cfg.get("direction", "approaching") or "approaching").lower(),
+            "lane_min_samples": int(cfg.get("lane_min_samples", 3)),
+            "keep_sec": float(cfg.get("track_keep_sec", 20.0)),
+            # 판정 차로: 카메라마다 {polygon, forward, backward, *_measure, *_photo}. 카메라 차로가 없으면 설정만으로 하나(None).
+            "lanes": self._camera_zones or {None: dict(speeding_lane_settings(cfg), polygon=None)},
         }
 
     def register(self, camera_key):
@@ -2488,128 +2593,241 @@ class RadarSpeedJudge:
             if hook not in self._frame_hooks:
                 self._frame_hooks.append(hook)
 
-    def set_camera_zone(self, camera_key, polygon):
-        """카메라 ROI(단속 차로)를 레이더 좌표로 바꾼 다각형을 판정 구역으로 둡니다(None이면 그 카메라 구역을 뺍니다).
-        같은 레이더를 카메라 여러 대가 쓰면 그중 한 다각형에라도 들어간 객체를 판정합니다."""
+    def set_camera_zone(self, camera_key, polygon, settings=None):
+        """카메라 차로: ROI(단속 차로)를 레이더 좌표로 바꾼 다각형과 그 카메라의 방향·측정·사진 구간(speeding_lane_settings,
+        없으면 이 레이더 설정). polygon이 None이면(보정값 없음·망가짐) 설정 구역(zone)으로 차로를 고릅니다.
+        그 차로에서 난 이벤트는 그 카메라로만 갑니다."""
+        if settings is None:
+            settings = speeding_lane_settings(self._cfg())
         zones = dict(self._camera_zones)        # 통째로 바꿔 끼웁니다(params()가 잠금 없이 읽음)
-        if polygon:
-            zones[camera_key] = polygon
-        else:
-            zones.pop(camera_key, None)
+        zones[camera_key] = dict(settings, polygon=polygon or None)
         self._camera_zones = zones
 
     @staticmethod
-    def _in_zone(obj, p):
+    def _in_bounds(obj, p):
+        """설정 구역(zone)의 거리·좌우 범위 안인지(판정·보정 수집 공통)."""
         x, y = float(obj['x_m']), float(obj['y_m'])
-        rng = math.hypot(x, y)
-        if not (p["min_range"] <= rng <= p["max_range"] and abs(y) <= p["max_lat"]):
-            return False
-        cams = p.get("camera_polygons")
-        if cams:
-            return any(point_in_polygon(poly, x, y) for poly in cams)
-        poly = p.get("polygon")
+        return p["min_range"] <= math.hypot(x, y) <= p["max_range"] and abs(y) <= p["max_lat"]
+
+    @staticmethod
+    def _in_lane(lane, x, y, p):
+        """차로 다각형(없으면 설정 polygon, 그것도 없으면 범위 전체) 안인지."""
+        poly = lane.get("polygon") or p.get("polygon")
         return point_in_polygon(poly, x, y) if poly else True
 
     def on_frame(self, frame):
         p = self.params()
         arrival = float(frame['arrival'])
-        events, in_zone = [], []
+        events, same_vehicle, near = [], [], []
         with self._lock:
             for obj in frame.get('objects', []):
-                if float(obj.get('quality', 0.0)) < p["min_quality"] or not self._in_zone(obj, p):
+                if float(obj.get('quality', 0.0)) < p["min_quality"] or not self._in_bounds(obj, p):
                     continue
-                in_zone.append(obj)
+                x, y = float(obj['x_m']), float(obj['y_m'])
                 st = self._track_for(obj, arrival, p)
                 st['last_arrival'] = arrival
-                st['samples'].append((arrival, frame.get('timestamp_us'), float(obj['speed_kmh']),
-                                      float(obj['x_m']), float(obj['y_m'])))
-                keep_after = arrival - max(p["window"], 5.0)
-                while st['samples'] and st['samples'][0][0] < keep_after:
+                st['samples'].append((arrival, frame.get('timestamp_us'), float(obj['speed_kmh']), x, y))
+                while st['samples'] and st['samples'][0][0] < arrival - p["keep_sec"]:
                     st['samples'].popleft()
-                if not st['fired']:
-                    ev = self._evaluate(st, p, arrival)
-                    if ev is not None:
-                        events.append(ev)
+                for key, lane in p["lanes"].items():
+                    if self._in_lane(lane, x, y, p):
+                        st['lane_hits'][key] = st['lane_hits'].get(key, 0) + 1
+                self._judge(st, p, events, same_vehicle, lost=False, near=near)
             for oid in [k for k, st in self._tracks.items() if arrival - st['last_arrival'] > p["timeout"]]:
                 st = self._tracks.pop(oid)
+                self._judge(st, p, events, same_vehicle, lost=True, near=near)
                 if st['fired'] and st['samples']:
                     last = st['samples'][-1]
-                    self._fired_lost.append((st['last_arrival'], last[3], last[4]))
+                    self._fired_lost.append((st['last_arrival'], last[3], last[4], st.get('continues') or st['seq']))
             for ev in events:
-                for q in self._consumers.values():
-                    q.append(ev)
+                # 그 차로(카메라)로만 보냅니다. 카메라 차로가 없으면(설정 구역) 모든 카메라로.
+                keys = [ev['camera_key']] if ev.get('camera_key') is not None else list(self._consumers)
+                for key in keys:
+                    self._consumers.setdefault(key, deque(maxlen=64)).append(ev)
             hooks = list(self._frame_hooks)
         for ev in events:
             logger.warning(
-                f"[RADAR SPEEDING] {self.client_label}R{ev['radar_id']} seq={ev['seq']} median={ev['median_kmh']:.1f}km/h "
-                f"(min {ev['min_kmh']:.1f} / max {ev['max_kmh']:.1f}, n={ev['samples']}) > "
+                f"[RADAR SPEEDING] {self.client_label}R{ev['radar_id']} seq={ev['seq']} {ev['direction']} "
+                f"median={ev['median_kmh']:.1f}km/h (min {ev['min_kmh']:.1f} / max {ev['max_kmh']:.1f}, n={ev['samples']}, "
+                f"{ev['window_range_m'][0]:.0f}->{ev['window_range_m'][1]:.0f}m) > "
                 f"{ev['threshold_kmh']:.1f} (limit {ev['limit_kmh']:.1f} + margin {ev['margin_kmh']:.1f}) "
-                f"at x={ev['x_m']:.1f} y={ev['y_m']:.1f}"
+                f"at x={ev['x_m']:.1f} y={ev['y_m']:.1f} {ev['decided_by']} first={ev['track_first_range_m']:.0f}m"
             )
+        for ev in near:
+            # 분석용: 측정은 끝났고 기준(제한+여유) 아래지만 제한속도는 넘은 차(기준값이 맞는지 볼 때)
+            logger.info(
+                f"[RADAR SPEEDING] {self.client_label}R{ev['radar_id']} seq={ev['seq']} {ev['direction']} 과속 아님"
+                f"(제한 {ev['limit_kmh']:.0f} 넘음, 기준 {ev['threshold_kmh']:.0f} 이하) median={ev['median_kmh']:.1f}km/h "
+                f"(min {ev['min_kmh']:.1f} / max {ev['max_kmh']:.1f}, n={ev['samples']}, "
+                f"{ev['window_range_m'][0]:.0f}->{ev['window_range_m'][1]:.0f}m) cam={ev['camera_key']} "
+                f"at x={ev['x_m']:.1f} y={ev['y_m']:.1f} {ev['decided_by']} first={ev['track_first_range_m']:.0f}m"
+            )
+        for ev, ahead in same_vehicle:
+            logger.info(
+                f"[RADAR SPEEDING] {self.client_label}R{ev['radar_id']} seq={ev['seq']} {ev['median_kmh']:.1f}km/h는 방금 과속을 낸 "
+                f"R{ahead['radar_id']} seq={ahead['seq']}와 같은 차(뒤 {ahead['behind_m']:.1f}m, 옆 {ahead['lateral_m']:.1f}m, "
+                f"속도 차 {ahead['dkmh']:.1f}km/h)로 보고 이벤트를 내지 않습니다.")
+        if hooks:
+            # 보정 기록용: ROI 차로는 지금 보정값으로 만든 것이라 빼고, 설정 구역·품질 기준만 씁니다.
+            calib_objs = [obj for obj in frame.get('objects', [])
+                          if float(obj.get('quality', 0.0)) >= p["min_quality"] and self._in_bounds(obj, p)
+                          and self._in_lane({}, float(obj['x_m']), float(obj['y_m']), p)]
         for hook in hooks:
             try:
-                hook(frame, in_zone)
+                hook(frame, calib_objs)
             except Exception as e:
                 logger.error(f"[RADAR] frame hook failed: {e}")
 
     def _track_for(self, obj, arrival, p):
-        """ID 재사용(timeout 초과 후 재등장)은 새 트랙. 이벤트를 낸 차량 근처에서 새로 잡힌 트랙은 이벤트 표시를 물려받습니다."""
+        """ID 재사용(timeout 초과 후 재등장)은 새 트랙. 이벤트를 낸 차량 근처에서 새로 잡힌 트랙은 이벤트 표시를 물려받고
+        (같은 차 재검출), 따라가기(position_at)가 이 트랙으로 이어집니다(continues = 처음 이벤트를 낸 트랙 seq)."""
         oid = int(obj['id'])
         st = self._tracks.get(oid)
         if st is not None and arrival - st['last_arrival'] <= p["timeout"]:
             return st
         self._seq += 1
         st = {'seq': self._seq, 'radar_id': oid, 'first_arrival': arrival, 'last_arrival': arrival,
-              'samples': deque(maxlen=1024), 'fired': False}
+              'samples': deque(maxlen=1024), 'fired': False, 'lane_hits': {}, 'done': set()}
         x, y = float(obj['x_m']), float(obj['y_m'])
         candidates = list(self._fired_lost) + [
-            (other['last_arrival'], other['samples'][-1][3], other['samples'][-1][4])
+            (other['last_arrival'], other['samples'][-1][3], other['samples'][-1][4], other.get('continues') or other['seq'])
             for other in self._tracks.values() if other['fired'] and other['samples'] and other['last_arrival'] < arrival]
-        for lost_at, lx, ly in candidates:
+        for lost_at, lx, ly, root in candidates:
             if arrival - lost_at <= p["guard_sec"] and math.hypot(x - lx, y - ly) <= p["guard_m"]:
-                st['fired'] = True
+                st['fired'], st['continues'] = True, root
                 logger.info(f"[RADAR SPEEDING] {self.client_label}R{oid} seq={self._seq}는 직전 이벤트 차량의 재검출로 보고 이벤트 대상에서 뺍니다.")
                 break
         self._tracks[oid] = st
         return st
 
-    def _evaluate(self, st, p, now):
-        win = [s for s in st['samples'] if s[0] >= now - p["window"]]
+    @staticmethod
+    def _direction(st):
+        """트랙 처음과 지금 레이더 거리로 방향: 2m 넘게 가까워졌으면 forward(다가옴), 멀어졌으면 backward, 아니면 None."""
+        first, last = st['samples'][0], st['samples'][-1]
+        d = math.hypot(last[3], last[4]) - math.hypot(first[3], first[4])
+        return "forward" if d < -2.0 else ("backward" if d > 2.0 else None)
+
+    def _judge(self, st, p, events, same_vehicle, lost, near=None):
+        """트랙 하나를 차로(카메라)마다 판정합니다(판정 시점은 클래스 설명). lost: 레이더가 이 트랙을 놓침.
+        판정한 차로는 측정이 모자라거나 과속이 아니어도 다시 보지 않습니다(done).
+        near: 과속은 아니지만 제한속도를 넘은 차를 모을 목록(분석 로그)."""
+        if st['fired'] or len(st['samples']) < 2:
+            return
+        direction = self._direction(st)
+        if direction is None:
+            return
+        last = st['samples'][-1]
+        rng = math.hypot(last[3], last[4])
+        for key, lane in p["lanes"].items():
+            hits = st['lane_hits'].get(key, 0)
+            if key in st['done'] or not lane.get(direction) or hits < p["lane_min_samples"]:
+                continue
+            lo, hi = lane[direction + "_measure"]
+            if not (lost or (rng < lo if direction == "forward" else rng > hi)):
+                continue
+            st['done'].add(key)
+            ev = self._evaluate(st, p, direction, lo, hi)
+            if ev is None:
+                continue
+            # 판정한 까닭: 레이더가 놓침 / 측정 구간 끝을 지나서 / (이미 지났는데) 이제 ROI 차로에 들어와서
+            ev.update(camera_key=key, photo_m=list(lane[direction + "_photo"]), lane_hits=hits,
+                      decided_by="radar_lost" if lost else "lane_entered" if hits == p["lane_min_samples"]
+                      else "passed_near_end" if direction == "forward" else "passed_far_end")
+            if ev['median_kmh'] <= p["threshold"]:
+                if near is not None and ev['median_kmh'] > p["limit"]:
+                    near.append(ev)
+                continue
+            self._fire(st, ev, last[0], p, events, same_vehicle)
+            return
+
+    def _fire(self, st, ev, now, p, events, same_vehicle):
+        """과속 판정: 같은 차(레이더가 둘로 잡은 차)가 아니면 이벤트로 냅니다. 어느 쪽이든 이 트랙은 더 판정하지 않습니다."""
+        st['fired'], st['fired_at'], st['fired_kmh'] = True, now, float(ev['median_kmh'])
+        ahead = self._same_vehicle_as_fired(st, ev, now, p)
+        if ahead is None:
+            events.append(ev)
+        else:
+            same_vehicle.append((ev, ahead))
+
+    def _same_vehicle_as_fired(self, st, ev, now, p):
+        """레이더가 차 한 대를 둘로 잡는 경우(운전석 좌우, 긴 트레일러 앞뒤): 과속을 내려는 트랙이 guard_sec 안에 과속을 낸
+        다른 트랙의 진행 방향 뒤 trail_m(앞으로는 3m까지) 안, 옆 trail_lat_m 안이고 속도 차가 trail_kmh 안이면 같은 차입니다.
+        반환: 그 차 정보(dict) 또는 None."""
+        x, y = float(ev['x_m']), float(ev['y_m'])
+        t_ev = float(ev.get('decision_arrival', now))
+        for other in self._tracks.values():
+            if other is st or other.get('fired_at') is None or now - other['fired_at'] > p["guard_sec"] or not other['samples']:
+                continue
+            # 같은 순간 위치끼리 비교: 이 트랙 판정 위치(레이더가 놓친 뒤 판정하면 1초 전 위치)와 그때의 그 차 위치
+            last = min(other['samples'], key=lambda q: abs(q[0] - t_ev))
+            ref = next((q for q in other['samples'] if q[0] >= last[0] - 1.0), other['samples'][0])
+            dx, dy = last[3] - ref[3], last[4] - ref[4]
+            norm = math.hypot(dx, dy)
+            if norm < 0.3:                      # 거의 안 움직였으면 진행 방향을 모름
+                continue
+            ux, uy = dx / norm, dy / norm
+            rx, ry = x - last[3], y - last[4]
+            behind, lateral = -(rx * ux + ry * uy), abs(rx * uy - ry * ux)
+            dkmh = abs(float(ev['median_kmh']) - float(other['fired_kmh']))
+            if -3.0 <= behind <= p["trail_m"] and lateral <= p["trail_lat_m"] and dkmh <= p["trail_kmh"]:
+                return {'radar_id': other['radar_id'], 'seq': other['seq'], 'behind_m': behind, 'lateral_m': lateral,
+                        'dkmh': dkmh}
+        return None
+
+    def _evaluate(self, st, p, direction, lo, hi):
+        """측정 구간(레이더 거리 lo~hi m) 안 샘플로 잰 결과(이벤트 dict 모양, 속도 중앙값 median_kmh).
+        과속인지는 부르는 쪽이 정합니다. 샘플이 모자라면(min_samples개·min_span초 미만) None."""
+        win = [q for q in st['samples'] if lo <= math.hypot(q[3], q[4]) <= hi]
         if len(win) < p["min_samples"] or win[-1][0] - win[0][0] < p["min_span"]:
             return None
-        speeds = [s[2] for s in win]
+        speeds = [q[2] for q in win]
         median = float(np.median(speeds))
-        if median <= p["threshold"]:
-            return None
-        # 거리(레이더 기준)가 줄면 다가오는 차, 늘면 멀어지는 차
-        direction = "approaching" if math.hypot(win[-1][3], win[-1][4]) < math.hypot(win[0][3], win[0][4]) else "receding"
-        if p["direction"] in ("approaching", "receding") and direction != p["direction"]:
-            return None
-        st['fired'] = True
-        last = win[-1]
+        last, first = st['samples'][-1], st['samples'][0]
         return {
             'seq': st['seq'], 'radar_id': st['radar_id'], 'tid': RADAR_EVENT_TID_BASE + st['seq'],
             'median_kmh': median, 'min_kmh': float(min(speeds)), 'max_kmh': float(max(speeds)),
-            'samples': len(win), 'window_arrival': [win[0][0], win[-1][0]], 'decision_arrival': now,
+            'samples': len(win), 'window_arrival': [win[0][0], win[-1][0]], 'decision_arrival': last[0],
+            'measure_m': [lo, hi],
+            'window_range_m': [round(math.hypot(win[0][3], win[0][4]), 1), round(math.hypot(win[-1][3], win[-1][4]), 1)],
             'sensor_ts': last[1], 'x_m': last[3], 'y_m': last[4],
             'limit_kmh': p["limit"], 'margin_kmh': p["margin"], 'threshold_kmh': p["threshold"],
-            'window_sec': p["window"], 'direction': direction,
+            'direction': direction,
+            # 이 차가 지나온 레이더 경로 (도착 시각, x, y, 속도): 번호판 사진 구간 고르기(멀어지는 차는 판정 전에 지나감)
+            'path': [(q[0], q[3], q[4], q[2]) for q in st['samples']],
+            # 분석용: 측정 구간 레이더 값 하나하나 [판정 시각 기준 초, 거리 m, x, y, 속도 km/h]와 이 트랙을 처음 본 거리·시각
+            'window_samples': [[round(q[0] - last[0], 3), round(math.hypot(q[3], q[4]), 2), round(q[3], 2), round(q[4], 2),
+                                round(q[2], 2)] for q in win],
+            'track_first_range_m': round(math.hypot(first[3], first[4]), 1),
+            'track_first_sec': round(first[0] - last[0], 2),
         }
 
-    def position_at(self, seq, t_arrival, max_dt=None):
+    def position_at(self, seq, t_arrival, max_dt=None, max_ahead=1.0):
         """seq 트랙에서 t_arrival(레이더 도착 시각 기준)에 가장 가까운 샘플 (x, y, speed_kmh).
-        max_dt를 주면 그보다 시간이 먼 샘플뿐일 때(구역을 벗어났거나 트랙이 끊김) None."""
+        max_dt를 주면 그보다 시간이 먼 샘플뿐일 때(구역을 벗어났거나 트랙이 끊김) None.
+        t_arrival이 최신 샘플보다 미래면(지연값이 음수라 이 영상 시각의 레이더 값이 아직 안 옴) max_ahead초까지는
+        최근 0.5초 이동으로 앞으로 밀어 계산합니다."""
         with self._lock:
-            for st in self._tracks.values():
-                if st['seq'] == seq and st['samples']:
-                    best = min(st['samples'], key=lambda s: abs(s[0] - t_arrival))
-                    if max_dt is not None and abs(best[0] - t_arrival) > max_dt:
-                        return None
-                    return best[3], best[4], best[2]
-        return None
+            # 그 트랙, 없으면 그 트랙을 이어받은 트랙(레이더 번호가 바뀐 같은 차, continues) 중 가장 최근 것
+            cands = [st for st in self._tracks.values() if st['samples'] and (st['seq'] == seq or st.get('continues') == seq)]
+            if not cands:
+                return None
+            st = max(cands, key=lambda c: c['last_arrival'])
+            last = st['samples'][-1]
+            ahead = t_arrival - last[0]
+            if 0.0 < ahead <= max_ahead:
+                ref = next((q for q in st['samples'] if q[0] >= last[0] - 0.5), st['samples'][0])
+                span = last[0] - ref[0]
+                if span < 0.05:
+                    return last[3], last[4], last[2]
+                return (last[3] + (last[3] - ref[3]) / span * ahead, last[4] + (last[4] - ref[4]) / span * ahead,
+                        last[2])
+            best = min(st['samples'], key=lambda q: abs(q[0] - t_arrival))
+            if max_dt is not None and abs(best[0] - t_arrival) > max_dt:
+                return None
+            return best[3], best[4], best[2]
 
     def rows_for_frame(self, frame):
-        """레이더 프레임 한 장의 모든 객체를 화면 표시 행으로(구역 밖 객체는 in_zone=False).
+        """레이더 프레임 한 장의 모든 객체를 화면 표시 행으로(어느 카메라 차로에도 없는 객체는 in_zone=False).
         속도는 그 프레임 도착 시각 ±0.25초 트랙 속도 중앙값(구역 밖은 측정값 그대로)."""
         if frame is None:
             return []
@@ -2618,7 +2836,9 @@ class RadarSpeedJudge:
         rows = []
         with self._lock:
             for obj in frame.get('objects', []):
-                in_zone = float(obj.get('quality', 0.0)) >= p["min_quality"] and self._in_zone(obj, p)
+                x, y = float(obj['x_m']), float(obj['y_m'])
+                in_zone = (float(obj.get('quality', 0.0)) >= p["min_quality"] and self._in_bounds(obj, p)
+                           and any(self._in_lane(lane, x, y, p) for lane in p["lanes"].values()))
                 st = self._tracks.get(int(obj['id'])) if in_zone else None
                 around = [s[2] for s in st['samples'] if abs(s[0] - arrival) <= 0.25] if st else []
                 speed = float(np.median(around)) if around else float(obj['speed_kmh'])
@@ -2731,13 +2951,26 @@ def size_consistent(t, row, focal_px):
     return 0.4 <= ratio <= 4.0
 
 
+def box_band_in_roi(t, roi_poly):
+    """차량 박스 하단 띠(박스 높이 아래 35%)가 ROI(단속 차로, 추론 프레임 px 다각형)에 조금이라도 걸치는지.
+    ROI가 없으면(점 3개 미만) True. 가까이 와서 박스 아래가 ROI 밖으로 나간 차도 띠 위쪽이 걸치면 인정합니다."""
+    if roi_poly is None or len(roi_poly) < 3:
+        return True
+    poly = [(float(q[0]), float(q[1])) for q in roi_poly]
+    x1, y1, x2, y2 = (float(c) for c in t[:4])
+    h = max(1.0, y2 - y1)
+    return any(point_in_polygon(poly, x1 + fx * (x2 - x1), y2 - fy * h)
+               for fy in (0.0, 0.175, 0.35) for fx in (0.0, 0.25, 0.5, 0.75, 1.0))
+
+
 def associate_radar_tracks(tracks, track_map, radar_rows, project, gate_px, extra_tracks=None, frame_shape=None,
-                           focal_px=None):
+                           focal_px=None, roi_poly=None):
     """투영한 레이더 점과 차량 박스(하단 띠, box_point_distance)의 거리가 gate_px 이내인 쌍을 가까운 순으로 1:1 매칭합니다.
     extra_tracks: tracks(움직이는 차량)와 짝이 안 된 점은, 정지로 보였던 박스라도 점이 하단 띠 안에 있으면 연결
     (멀리서 천천히 다가오는 큰 차는 박스가 거의 안 움직여 정지로 오판되기 때문).
     frame_shape: 주면 화면 밖으로 투영된 점(센서 옆을 지나가는 차 등)은 연결하지 않습니다.
     focal_px: 주면 박스 크기가 레이더 거리와 맞지 않는 쌍은 연결하지 않습니다(size_consistent).
+    roi_poly: 주면(추론 프레임 px 다각형, 단속 차로) 하단 띠가 ROI에 걸친 박스만 연결합니다(box_band_in_roi).
     반환: {rgb tid: (row, (u, v))}, 그리고 모든 행의 투영점 [(row, (u, v))]."""
     projected = []
     for row in radar_rows:
@@ -2755,6 +2988,8 @@ def associate_radar_tracks(tracks, track_map, radar_rows, project, gate_px, extr
         for t in cands:
             tid = int(t[4])
             if track_map.get(tid) not in TARGET_VEHICLES:
+                continue
+            if roi_poly is not None and not box_band_in_roi(t, roi_poly):
                 continue
             bx, by = (float(t[0]) + float(t[2])) / 2.0, float(t[3])
             for i in usable:
@@ -2781,7 +3016,8 @@ def associate_radar_tracks(tracks, track_map, radar_rows, project, gate_px, extr
 
 
 class RadarCameraCalibrationRecorder:
-    """보정용 쌍 수집: 차량 박스가 1개인 카메라 프레임과, 구역 안 객체가 1개인 레이더 프레임을 각각 jsonl로 남깁니다.
+    """보정용 쌍 수집: 움직이는 차량 박스가 1개인 카메라 프레임과, 설정 구역 안 객체가 1개인 레이더 프레임을 각각 jsonl로
+    남깁니다(ROI 판정 구역은 지금 보정값으로 만든 것이라 레이더 쪽에 적용하지 않음).
     시간 맞추기와 호모그래피 계산은 오프라인 보정 도구가 합니다."""
     _instance = None
     _lock = threading.Lock()
@@ -2807,9 +3043,10 @@ class RadarCameraCalibrationRecorder:
         with self._write_lock:
             self._file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-    def radar_hook(self, frame, in_zone):
-        if len(in_zone) == 1:
-            obj = in_zone[0]
+    def radar_hook(self, frame, objs):
+        """objs: 설정 구역 안 레이더 객체(ROI 판정 구역 제한 없음). 한 개뿐인 프레임만 기록합니다."""
+        if len(objs) == 1:
+            obj = objs[0]
             self._write({"type": "radar", "client_id": frame.get('client_id'), "t": frame['arrival'], "id": int(obj['id']),
                          "x": float(obj['x_m']),
                          "y": float(obj['y_m']), "speed_kmh": float(obj['speed_kmh'])})
@@ -2818,6 +3055,23 @@ class RadarCameraCalibrationRecorder:
         x1, y1, x2, y2 = (float(v) for v in track[:4])
         self._write({"type": "camera", "cam": str(camera_key), "t": t_cam, "pts": pts, "tid": int(track[4]),
                      "box": [x1, y1, x2, y2], "uv": [(x1 + x2) / 2.0, y2], "shape": [int(shape[0]), int(shape[1])]})
+
+
+def radar_log_points(rows, project, matched):
+    """분석용(.infer.jsonl "radar") 레이더 점: 차로 안이거나 움직이는(3km/h 이상) 점만
+    [레이더 id, 거리 m, x, y, 속도 km/h, 차로 안, 화면 u, v, 붙은 박스 tid]. matched: associate_radar_tracks 결과."""
+    tid_of = {int(row['radar_id']): int(tid) for tid, (row, _) in matched.items()}
+    points = []
+    for r in rows:
+        if not r['in_zone'] and abs(float(r['speed_kmh'])) < 3.0:
+            continue
+        x, y = float(r['x_m']), float(r['y_m'])
+        uv = project(x, y) if project is not None else None
+        points.append([int(r['radar_id']), round(math.hypot(x, y), 1), round(x, 2), round(y, 2),
+                       round(float(r['speed_kmh']), 1), bool(r['in_zone'])]
+                      + ([round(float(uv[0]), 1), round(float(uv[1]), 1)] if uv is not None else [None, None])
+                      + [tid_of.get(int(r['radar_id']))])
+    return points
 
 
 def vote_event_track(ev, votes, offset):
@@ -2852,7 +3106,8 @@ class SpeedingDetector(BaseEventDetector):
         return self._process_radar_judge(tracks, track_map, frame, fid, **kwargs)
 
     def _process_radar_judge(self, tracks, track_map, frame, fid, **kwargs):
-        """레이더 판정기가 낸 이벤트를 기존 dispatch 형식으로 바꿉니다. 카메라 ROI는 쓰지 않습니다(레이더 구역 사용)."""
+        """레이더 판정기가 낸 이벤트를 기존 dispatch 형식으로 바꿉니다. 판정 구역은 레이더 쪽(ROI를 바꾼 다각형)이고,
+        차량 박스 연결은 ROI(단속 차로)에 걸친 박스만 씁니다."""
         judge = kwargs['radar_judge']
         camera_key = kwargs.get('camera_key')
         project = kwargs.get('radar_projector')
@@ -2878,7 +3133,8 @@ class SpeedingDetector(BaseEventDetector):
                     matched, _ = associate_radar_tracks(moving, track_map, [row], project, gate, frame_shape=frame.shape
                                                         if frame is not None else None,
                                                         focal_px=projection_focal_px(frame.shape if frame is not None else None,
-                                                                                     kwargs.get('radar_camera_cfg')))
+                                                                                     kwargs.get('radar_camera_cfg')),
+                                                        roi_poly=self.roi_poly if len(self.roi_poly) >= 3 else None)
                     if matched:
                         single = next(iter(matched))
             voted, counts = vote_event_track(ev, votes, offset)
@@ -2891,6 +3147,18 @@ class SpeedingDetector(BaseEventDetector):
             elif single is not None:
                 method = "conflict"
             if assoc_tid is not None:
+                # 같은 차 박스: same_vehicle_guard_sec 안에 이 카메라에서 같은 차 박스에 붙어 과속을 낸 레이더 점이 있으면
+                # 속도·간격이 달라도 같은 차(레이더가 트럭 앞쪽·컨테이너를 둘로 잡음). 차 검출 박스 하나가 차 한 대라는 전제.
+                now_m = time.monotonic()
+                guard = float(self.config.get("same_vehicle_guard_sec", 3.0))
+                recent = self.__dict__.setdefault("_recent_box_events", deque(maxlen=32))
+                dup = next((r for r in recent if r[1] == assoc_tid and now_m - r[0] <= guard), None)
+                if dup is not None:
+                    logger.info(f"[RADAR SPEEDING] R{ev['radar_id']} seq={ev['seq']} {ev['median_kmh']:.1f}km/h는 "
+                                f"{now_m - dup[0]:.1f}초 전 과속을 낸 R{dup[2]}({dup[3]:.1f}km/h)와 같은 차 박스(tid {assoc_tid})에 "
+                                f"붙어 같은 차로 보고 이벤트를 내지 않습니다.")
+                    continue
+                recent.append((now_m, assoc_tid, ev['radar_id'], float(ev['median_kmh'])))
                 assoc_track = live[assoc_tid]
             if assoc_track is not None:
                 bbox = assoc_track[:4]
@@ -2903,12 +3171,22 @@ class SpeedingDetector(BaseEventDetector):
                 objects = [{'label': 'radar_vehicle', 'box': [int(x) for x in bbox], 'score': 1.0,
                             'tid': ev['tid'], 'class_id': -1,
                             'speed_kmh': round(ev['median_kmh'], 1), 'radar_id': ev['radar_id']}]
-            fullres_window = None
+            fullres_window, radar_path = None, []
             if callable(pts_at):
                 event_pts, ring_dir = pts_at(ev['decision_arrival'] + offset)
-                start_pts, start_ring = pts_at(ev['window_arrival'][0] + offset)
+                # 측정 구간이 길어(먼 곳 수십 m) 기본 원본 구간은 판정 순간 앞 1.5초까지만(따라가며 고른 구간이 없을 때)
+                start_pts, start_ring = pts_at(max(ev['window_arrival'][0], ev['decision_arrival'] - 1.5) + offset)
                 if event_pts is not None and ring_dir and start_ring == ring_dir:
                     fullres_window = {'event_pts': event_pts, 'start_pts': start_pts, 'ring_dir': ring_dir}
+                # 이 차가 판정 전에 지나온 레이더 경로 [pts, 거리, 속도, (화면 u, v)]. 멀어지는 차는 번호판 사진 구간(카메라 앞)을
+                # 판정보다 먼저 지나가므로, 원본 링버퍼에서 그때를 꺼냅니다(radar_path_window).
+                for t_arr, x, y, kmh in ev.get('path') or []:
+                    q_pts, _ = pts_at(t_arr + offset)
+                    if q_pts is None:
+                        continue
+                    uv = project(x, y) if project is not None else None
+                    radar_path.append([round(float(q_pts), 4), round(math.hypot(x, y), 2), round(float(kmh), 1)]
+                                      + ([round(float(uv[0]), 1), round(float(uv[1]), 1)] if uv is not None else []))
             triggered.append({
                 'tid': ev['tid'],
                 'bbox': bbox,
@@ -2918,6 +3196,9 @@ class SpeedingDetector(BaseEventDetector):
                 'privacy_fid': fid,
                 'objects': objects,
                 'fullres_window': fullres_window,
+                'radar_path': radar_path,
+                'photo_m': ev.get('photo_m'),
+                'direction': ev.get('direction'),
                 'decision_trace': {
                     'detector': 'SpeedingDetector',
                     'reason': 'radar_track_median_speed_exceeded',
@@ -2925,7 +3206,14 @@ class SpeedingDetector(BaseEventDetector):
                     'radar_id': ev['radar_id'], 'radar_track_seq': ev['seq'],
                     'speed_kmh': round(ev['median_kmh'], 2),
                     'speed_min_kmh': round(ev['min_kmh'], 2), 'speed_max_kmh': round(ev['max_kmh'], 2),
-                    'samples': ev['samples'], 'window_sec': ev['window_sec'],
+                    'samples': ev['samples'],
+                    'window_sec': round(ev['window_arrival'][1] - ev['window_arrival'][0], 2),
+                    'measure_m': ev.get('measure_m'), 'window_range_m': ev.get('window_range_m'),
+                    # 분석용: 판정한 까닭, ROI 차로 안 샘플 수, 이 트랙을 처음 본 거리·시각(판정 기준 초),
+                    # 측정 구간 레이더 값 하나하나 [판정 기준 초, 거리 m, x, y, 속도 km/h]
+                    'decided_by': ev.get('decided_by'), 'lane_hits': ev.get('lane_hits'),
+                    'track_first_range_m': ev.get('track_first_range_m'), 'track_first_sec': ev.get('track_first_sec'),
+                    'window_samples': ev.get('window_samples'),
                     'speed_limit_kmh': ev['limit_kmh'], 'margin_kmh': ev['margin_kmh'],
                     'threshold_kmh': ev['threshold_kmh'],
                     'radar_sensor_ts': ev['sensor_ts'], 'radar_x_m': round(ev['x_m'], 2), 'radar_y_m': round(ev['y_m'], 2),
@@ -5657,6 +5945,25 @@ def run_wizard_seaside_setup(frame, ip, old_cfg=None):
             "exclude_polys_norm": excludes}
 
 
+def run_wizard_speeding_directions(ip, old_cfg=None):
+    """과속 단속 방향을 묻습니다: forward(카메라로 다가오는 차, 앞번호판), backward(멀어지는 차, 뒷번호판). 둘 다 켜면 양쪽.
+    엔터는 예전 값(없으면 기본 설정). 반환 cameras.json event_config.speeding(측정·사진 구간 등 다른 키는 예전 값 그대로)."""
+    cfg = dict(old_cfg or {})
+    base = SYS_CFG["event_config"][SPEEDING_EVENT]
+
+    def ask(key, text):
+        default = bool(cfg.get(key, base.get(key, key == "forward")))
+        ans = guarded_input(f"[{ip}] {text} [{'Y/n' if default else 'y/N'}]: ").strip().lower()
+        return default if not ans else ans == 'y'
+    forward = ask("forward", "카메라로 다가오는 차 과속 단속(forward, 앞번호판)?")
+    backward = ask("backward", "카메라에서 멀어지는 차 과속 단속(backward, 뒷번호판)?")
+    if not (forward or backward):
+        print("   둘 다 끄면 과속 판정을 하지 않아 다가오는 차(forward)를 켭니다.")
+        forward = True
+    cfg.update(forward=forward, backward=backward)
+    return cfg
+
+
 def run_wizard_batch_mode(rtsp_list, existing_configs=None):
     logger.info("=== 설정 마법사 시작 ===")
     # 기존 설정을 복사해 둡니다. 마법사에서 고르지 않은 카메라는 그대로 두고, 다시 정한 카메라만 새로 씁니다.
@@ -5739,6 +6046,12 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                         roi_p = get_roi_points_scaled(frames[local_idx], f"Polygon - CAM: {ip}")
                     # 콘 미제거 출차는 ROI 없이 화면 전체에서 컨테이너·콘을 찾습니다.
                     # YT 위험구역(5번, 노랑)은 그리지 않습니다. 감시가 시작되면 빈 샤시로 자동으로 만듭니다.
+                    old_conf = configs.get(ip) or {}
+                    speeding_cfg = None
+                    if SPEEDING_EVENT in events:
+                        # 과속: ROI(단속 차로)는 위에서 그렸고, 여기서 단속 방향(다가오는 차·멀어지는 차)을 묻습니다.
+                        speeding_cfg = run_wizard_speeding_directions(
+                            ip, (old_conf.get("event_config") or {}).get(SPEEDING_EVENT))
                     seaside_cfg = None
                     if SEASIDE_PERSON_EVENT in events:
                         # 해측: 안벽 끝선·바다 쪽 점·위험 구역을 그립니다(거리 측정 없음). 취소하면 기존 설정 유지.
@@ -5757,8 +6070,16 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                         "roi_poly_norm": roi_p,
                         "roi_lines_norm": []
                     }
+                    event_cfg = {}
                     if seaside_cfg is not None:
-                        configs[ip]["event_config"] = {SEASIDE_PERSON_EVENT: seaside_cfg}
+                        event_cfg[SEASIDE_PERSON_EVENT] = seaside_cfg
+                    if speeding_cfg is not None:
+                        event_cfg[SPEEDING_EVENT] = speeding_cfg
+                    if event_cfg:
+                        configs[ip]["event_config"] = event_cfg
+                    if SPEEDING_EVENT in events and old_conf.get("radar_client_id") is not None:
+                        # 과속 카메라의 레이더 번호(사람이 적은 값)는 다시 정해도 그대로 둡니다.
+                        configs[ip]["radar_client_id"] = old_conf["radar_client_id"]
                     if isinstance(old_status, dict):
                         kept_status = {name: on for name, on in old_status.items() if name in events}
                         if kept_status:
@@ -5964,6 +6285,9 @@ class FullResExtractor:
             meta["follow_boxes"] = job["follow_boxes"]
         if job.get("evidence"):
             meta["evidence"] = job["evidence"]
+        for key in ("radar_path", "search_box", "photo_m", "photo_source"):
+            if job.get(key):
+                meta[key] = job[key]
         meta.update({"ring_dir": str(gen_dir), "created_at": now_kst().isoformat(), "frames": []})
 
         segs, complete = self._wait_segments(gen_dir, t0, t1, job["event_pts"])
@@ -6076,12 +6400,83 @@ def fullres_enabled(event_name):
     return bool(cfg["enabled"]) and event_name in cfg["events"]
 
 
+def box_cut_by_frame(box, frame_shape, pad=3):
+    """박스가 화면 가장자리(왼쪽·오른쪽·아래)에 닿아 잘렸는지(추론 프레임 px). 잘린 박스는 번호판도 잘렸을 수 있습니다."""
+    if frame_shape is None:
+        return False
+    h, w = float(frame_shape[0]), float(frame_shape[1])
+    x1, _, x2, y2 = (float(v) for v in box[:4])
+    return x1 <= pad - 1 or x2 >= w - pad or y2 >= h - pad
+
+
+def box_cut_side(box, frame_shape, pad=3):
+    """박스가 화면 왼쪽·오른쪽 끝에 닿았는지(차가 옆으로 빠져나가는 중, 번호판도 잘리기 쉬움). 위·아래는 보지 않습니다."""
+    if frame_shape is None:
+        return False
+    w = float(frame_shape[1])
+    return float(box[0]) <= pad - 1 or float(box[2]) >= w - pad
+
+
+def radar_seen_points(radar_path, frame_shape):
+    """레이더 경로 중 화면 안(가로 8~92%, 세로 95% 위)에 투영된 점. 화면 끝에 걸린 차는 번호판이 잘리기 쉬워 뺍니다."""
+    if frame_shape is None:
+        return []
+    h, w = float(frame_shape[0]), float(frame_shape[1])
+    return [q for q in radar_path or [] if len(q) >= 5 and q[3] is not None and q[4] is not None
+            and 0.08 * w <= float(q[3]) <= 0.92 * w and float(q[4]) <= 0.95 * h]
+
+
+def radar_nearer_than_box(radar_path, box_pts, frame_shape, margin_m=3.0):
+    """박스로 고른 장면(box_pts)보다 레이더 경로가 화면 안에서 margin_m 넘게 더 가까이 간 적이 있는지.
+    차 검출이 가까이 온 큰 트럭을 놓쳐 박스 따라가기가 일찍 끝난 경우입니다(레이더는 계속 따라감)."""
+    seen = radar_seen_points(radar_path, frame_shape)
+    if not seen:
+        return False
+    at = min(radar_path, key=lambda q: abs(float(q[0]) - box_pts))
+    if abs(float(at[0]) - box_pts) > 0.5:
+        return False
+    return min(float(q[1]) for q in seen) + margin_m < float(at[1])
+
+
+def radar_path_window(radar_path, photo_m=(0.0, 5.0), frame_shape=None, seen_sec=1.0, min_sec=1.0, max_sec=3.0):
+    """레이더 경로로 고르는 번호판 원본 추출 구간 (t0, t1)(pts).
+    radar_path: [[pts, 거리 m, 속도 km/h, (화면 투영 u, v)], ...]. photo_m: 사진 구간(레이더 거리 m, [가까운, 먼]).
+    화면 안(radar_seen_points: 가로 8~92%, 세로 95% 위)에 보인 점이 있으면: 그중 사진 구간 안 점들(0.5초 이상일 때), 아니면 화면 안에서 가장
+    가까운 점 앞뒤 seen_sec 안의 화면 안 점들 → 다가오는 차는 화면 아래로 나가기 직전, 멀어지는 차는 막 나타난 직후 1초.
+    투영이 없으면 거리가 사진 구간 안인 때, 그것도 없으면 마지막 거리·속도로 사진 구간에 닿는 때를 계산합니다(다가오는 차).
+    길이는 min_sec~max_sec. 경로가 없으면 None."""
+    if not radar_path:
+        return None
+    lo, hi = sorted(float(v) for v in photo_m)
+    if frame_shape is not None:
+        seen = radar_seen_points(radar_path, frame_shape)
+        if seen:
+            ts = [float(q[0]) for q in seen if lo <= float(q[1]) <= hi]
+            if not ts or max(ts) - min(ts) < 0.5:
+                near = float(min(seen, key=lambda q: float(q[1]))[0])
+                ts = [float(q[0]) for q in seen if abs(float(q[0]) - near) <= seen_sec]
+            t0, t1 = min(ts), max(ts)
+            return t0 - 0.1, min(t1, t0 + max_sec) + 0.1
+    inside = [q for q in radar_path if lo <= float(q[1]) <= hi]
+    if inside:
+        t0, t1 = float(inside[0][0]), float(inside[-1][0])
+    else:
+        pts, rng, kmh = (float(v) for v in radar_path[-1][:3])
+        v = max(kmh / 3.6, 2.0)
+        t0, t1 = pts + max(0.0, (rng - hi) / v), pts + max(0.0, (rng - lo) / v)
+    t1 = min(max(t1, t0 + min_sec), t0 + max_sec)
+    return t0 - 0.1, t1 + 0.1
+
+
 def request_fullres_capture(cam, event_name, event_id, event_fid, bbox, inference_shape, pts_window=None, follow_boxes=None,
-                            evidence=None):
+                            evidence=None, radar_path=None, photo_m=None):
     """원본 프레임 추출을 예약하고 결과 폴더 경로를 돌려줍니다.
     pts_window가 있으면(레이더 이벤트) [start_pts - pre, event_pts + post], 없으면 이벤트 프레임 PTS 기준 [pre, post].
-    follow_boxes([[pts, 박스], ...], 과속 차량을 판정 전후로 따라간 박스)가 있으면 그 차가 가까이 왔을 때(박스 넓이가
-    가장 클 때의 절반 이상, 최소 1초)만 추출하고, 번호판은 그 박스가 가장 클 때(가장 가까울 때)의 프레임에서 찾습니다."""
+    follow_boxes([[pts, 박스], ...], 과속 차량을 판정 전후로 따라간 박스)가 있으면 그 차가 꽤 가까워졌을 때(박스 넓이가
+    가장 클 때의 25% 이상)부터 박스가 화면 바닥에 닿기 전 마지막 박스 + PLR_TAIL_SEC까지(최대 PLR_WINDOW_MAX_SEC, 최소 1초)
+    추출하고, 어느 장을 읽을지는 PLR이 번호판 크기·잘림·선명도로 고릅니다(pick_plates_for_ocr).
+    박스가 끝내 안 붙은 차는 radar_path(레이더 경로)로 사진 구간(photo_m) 또는 화면 안 가장 가까운 1초만 뽑고
+    (radar_path_window), 번호판은 ROI(단속 차로) 영역(search_box)에서 찾습니다."""
     global FULLRES_EXTRACTOR
     if not fullres_enabled(event_name):
         return None
@@ -6114,13 +6509,50 @@ def request_fullres_capture(cam, event_name, event_id, event_fid, bbox, inferenc
     }
     if evidence:
         job["evidence"] = evidence  # 증거 3장 묶음 글자(시각·레이더 속도·영상 재검증)
+    # 분석용: 레이더 경로·사진 구간과, 원본 구간을 어떻게 골랐는지(박스 따라가기 / 레이더 경로 / 판정 순간 기본 구간)
+    if radar_path:
+        job["radar_path"] = radar_path
+    if photo_m:
+        job["photo_m"] = list(photo_m)
+    job["photo_source"] = "event_window"
+    use_radar = bool(radar_path) and not follow_boxes
     if follow_boxes:
         # 판정 순간(멀리 있을 때) 구간은 번호판이 작아 쓰지 않습니다. 뽑는 장수와 디스크도 그만큼 줄어듭니다.
+        # 화면 가장자리에 닿아 잘린 박스는 번호판도 잘렸을 수 있어 빼고 고릅니다(모두 잘렸으면 그대로).
         job["follow_boxes"] = follow_boxes
-        areas = [max(0, b[1][2] - b[1][0]) * max(0, b[1][3] - b[1][1]) for b in follow_boxes]
-        near = [b[0] for b, a in zip(follow_boxes, areas) if a >= 0.5 * max(areas)]
-        job["t1"] = near[-1] + 0.1
-        job["t0"] = min(near[0] - 0.1, job["t1"] - 1.0)
+        whole = [b for b in follow_boxes if not box_cut_by_frame(b[1], inference_shape)] or follow_boxes
+        areas = [max(0, b[1][2] - b[1][0]) * max(0, b[1][3] - b[1][1]) for b in whole]
+        best_pts = whole[areas.index(max(areas))][0]
+        # 차 검출이 가까이 온 트럭을 놓쳐 박스가 일찍 끊겼고 레이더는 화면 안에서 더 가까이 갔으면 레이더 경로로 고릅니다.
+        # 단, 따라가던 박스가 화면 옆 끝에 닿으며 끝났으면(차가 옆으로 빠져나감, 11/7 17:09:51) 레이더가 더 가까이 간
+        # 때는 차가 화면 밖이라 레이더 경로를 쓰지 않고 박스로 고릅니다.
+        side_exit = box_cut_side(follow_boxes[-1][1], inference_shape)
+        use_radar = bool(radar_path) and not side_exit and radar_nearer_than_box(radar_path, best_pts, inference_shape)
+        if not use_radar:
+            # 번호판은 차가 다가올수록 커집니다. 박스를 놓친 직후(PLR_TAIL_SEC)가 차가 가장 가까울 때라 그때까지 뽑고,
+            # 박스 아래가 화면 바닥에 닿은 뒤는 번호판도 잘리므로 그 전 마지막 박스를 끝으로 봅니다.
+            job["photo_source"] = "follow_boxes"
+            all_areas = [box_area(b[1]) for b in follow_boxes]
+            floor = float(inference_shape[0]) - 3 if inference_shape else None
+            above = [b for b in follow_boxes if floor is None or b[1][3] < floor] or follow_boxes
+            # 끝은 박스가 가장 컸던 때(가장 가까울 때). 그게 따라가기 마지막이면(다가오다 놓침) PLR_TAIL_SEC를 더 보고,
+            # 그 뒤 박스가 작아졌으면(멀어지거나 다른 차로 옮겨 붙음) 그 뒤 장면은 쓰지 않습니다(11/6 15:32:55).
+            above_areas = [box_area(b[1]) for b in above]
+            k = above_areas.index(max(above_areas))
+            peak = above[k][0]
+            job["t1"] = peak + (PLR_TAIL_SEC if k == len(above) - 1 else 0.1)
+            near = [b[0] for b, a in zip(follow_boxes, all_areas) if a >= 0.25 * max(all_areas) and b[0] <= peak] or [peak]
+            job["t0"] = min(max(near[0] - 0.1, job["t1"] - PLR_WINDOW_MAX_SEC), job["t1"] - 1.0)
+    if use_radar:
+        # 차량 검출이 놓친 차(가까이 온 큰 트럭 등): 판정 시점(멀리 있을 때) 대신 번호판 사진 구간을 뽑습니다.
+        window = radar_path_window(radar_path, photo_m=photo_m or (0.0, 5.0), frame_shape=inference_shape)
+        if window is not None:
+            job["t0"], job["t1"] = window
+            job["photo_source"] = "radar_path_box_lost" if follow_boxes else "radar_path"
+            roi = getattr(cam, "roi_poly", None)
+            if roi is not None and len(roi) >= 3 and inference_shape:
+                xs, ys = [float(q[0]) for q in roi], [float(q[1]) for q in roi]
+                job["search_box"] = [int(min(xs)), int(min(ys)), int(max(xs)), int(inference_shape[0]) - 1]
     if FULLRES_EXTRACTOR is None:
         FULLRES_EXTRACTOR = FullResExtractor(cfg)
     if not FULLRES_EXTRACTOR.request(job):
@@ -6164,15 +6596,15 @@ def plate_shape(text):
 
 
 def finalize_plate(rows):
-    """여러 프레임의 OCR 결과를 번호판 형식 규칙으로 걸러 하나로 확정합니다.
+    """여러 프레임의 OCR 결과를 통째 다수결로 하나로 정합니다(가장 많이 읽힌 번호를 보냄).
 
-    1) 숫자·한글만 남기고 형식(신형/구형 지역)과 용도 글자를 검사. 맞지 않으면 형식 제한 디코딩 결과(rule)로 대체,
-       그것도 없거나 신뢰도가 낮으면 버림
-    2) 남은 결과 중 가장 많은 자리 모양(예: 3자리+글자+4자리)끼리 자리별로 신뢰도 가중 다수결
-    3) 형식에 맞는 결과 중 60% 이상이 같은 문자열(2개 이상)이면 '확정', 결과가 1개뿐이면 신뢰도 0.9 이상일 때만 '확정',
-       아니면 '불확실'(후보는 plr_meta.json final.candidates에 남김)"""
+    1) 숫자·한글만 남깁니다. 형식(신형/구형 지역, 용도 글자)이 깨졌으면 형식 제한 디코딩 결과(rule, 신뢰도 0.5 이상)로 바꿔 봅니다.
+    2) 형식에 맞는 결과가 있으면 그중에서, 없으면 읽은 결과 전체에서 가장 많이 나온 번호를 고릅니다(같으면 신뢰도 합이 큰 쪽).
+       예: 5장 중 A 3장, B 2장 → A.
+    3) 상태(관제 plateStatus, 참고용): 형식에 맞는 결과의 60% 이상(2장 이상)이 같거나 1장뿐인데 신뢰도 0.9 이상이면 '확정',
+       형식은 맞는데 표가 갈리면 '불확실', 형식에 맞는 결과가 없으면 '형식 불일치', 번호판을 못 찾았으면 '미인식'.
+       상태와 상관없이 고른 번호를 보냅니다. 후보별 표는 plr_meta.json final.candidates에 남깁니다."""
     rule_min = 0.5   # 형식 제한 디코딩 결과를 쓸 최소 신뢰도
-    rule_w = 0.7     # 그 결과의 다수결 가중치(원래 결과보다 낮게)
     reads = []
     for r in rows:
         for backend, o in ((r.get("plate") or {}).get("ocr") or {}).items():
@@ -6183,40 +6615,25 @@ def finalize_plate(rows):
                 # 가장 확률 높은 글자만 이으면 형식이 깨졌지만, 2·3등 후보로 형식을 채운 결과가 충분히 그럴듯할 때
                 text, conf, source = rule["text"], float(rule["conf"]), "rule"
             if text:
-                reads.append({"text": text, "conf": conf, "backend": backend, "source": source, "shape": plate_shape(text),
-                              "w": conf * (rule_w if source == "rule" else 1.0)})
+                reads.append({"text": text, "conf": conf, "backend": backend, "source": source, "shape": plate_shape(text)})
+    if not reads:
+        return {"text": "", "status": "미인식", "support": 0, "valid_reads": 0, "reads": 0}
     valid = [r for r in reads if r["shape"]]
+    votes = {}
+    for r in valid or reads:
+        n, conf_sum = votes.get(r["text"], (0, 0.0))
+        votes[r["text"]] = (n + 1, conf_sum + r["conf"])
+    text = max(votes, key=lambda t: votes[t])           # 표 수, 같으면 신뢰도 합
+    support = votes[text][0]
     if not valid:
-        best = max(reads, key=lambda r: r["conf"], default=None)
-        return {"text": "", "status": "형식 불일치" if reads else "미인식", "raw_best": best and best["text"],
-                "support": 0, "valid_reads": 0, "reads": len(reads)}
-    shapes = {}
-    for r in valid:
-        shapes[r["shape"]] = shapes.get(r["shape"], 0.0) + r["w"]
-    shape = max(shapes, key=shapes.get)
-    same = [r for r in valid if r["shape"] == shape]
-    # 구형 지역명은 두 글자를 한 자리로 묶어 자리별 다수결
-    def units(text):
-        return ([text[:2]] + list(text[2:])) if not shape.startswith("D") else list(text)
-    cols = list(zip(*[units(r["text"]) for r in same]))
-    voted = ""
-    for i, col in enumerate(cols):
-        score = {}
-        for ch, r in zip(col, same):
-            score[ch] = score.get(ch, 0.0) + r["w"]
-        voted += max(score, key=score.get)
-    if not plate_shape(voted):
-        voted = max(same, key=lambda r: r["w"])["text"]
-    support = sum(1 for r in valid if r["text"] == voted)
-    best_conf = max((r["conf"] for r in valid if r["text"] == voted), default=0.0)
-    share = support / float(len(valid))
-    status = "확정" if (support >= 2 and share >= 0.6) or (len(valid) == 1 and best_conf >= 0.9) else "불확실"
-    cands = {}
-    for r in valid:
-        cands[r["text"]] = cands.get(r["text"], 0) + 1
-    return {"text": voted, "status": status, "support": support, "valid_reads": len(valid), "reads": len(reads),
-            "rule_reads": sum(1 for r in valid if r["source"] == "rule"),
-            "candidates": sorted(cands.items(), key=lambda kv: -kv[1])[:5]}
+        status = "형식 불일치"
+    else:
+        best_conf = max(r["conf"] for r in valid if r["text"] == text)
+        status = "확정" if ((support >= 2 and support / float(len(valid)) >= 0.6)
+                          or (len(valid) == 1 and best_conf >= 0.9)) else "불확실"
+    return {"text": text, "status": status, "support": support, "valid_reads": len(valid), "reads": len(reads),
+            "rule_reads": sum(1 for r in reads if r["source"] == "rule"),
+            "candidates": sorted(((t, v[0]) for t, v in votes.items()), key=lambda kv: -kv[1])[:5]}
 
 
 class PlateRecognizer:
@@ -6375,31 +6792,116 @@ def video_speed_check(boxes, shape, event_pts, radar_kmh, rc=None):
     return res
 
 
-def plate_zone_frames(frames, follow_box, inference_shape, n_pick, rc=None):
-    """번호판 읽을 원본 프레임 고르기: 따라간 차량 박스의 지면 거리가 번호판 촬영 구간(8~15m) 안인
-    프레임을 우선하고, 그중 박스가 큰 순으로 n_pick장. 구간 안 프레임이 없으면 박스가 큰 순(가장 가까울 때).
-    현장(줌 0.5)에서 번호판 가로 120px 이상은 레이더 거리 약 15m 안에서만 나왔습니다.
-    반환 (고른 프레임, 구간 안 프레임을 썼는지)."""
-    lo, hi = 8.0, 15.0
-    inf_h = float(inference_shape[0]) if inference_shape else 0.0
+# 번호판 읽을 장 고르기(번호판 기준): 따라간 구간의 원본 프레임마다 번호판을 찾고, 화면 끝에 닿지 않은 번호판 중
+# 흐린 장(가장 또렷한 것의 PLR_SHARP_MIN_FRAC 미만: 흔들림·번짐)을 빼고 가로가 큰 순으로 PLR_OCR_TOP_K장만 OCR합니다.
+PLR_WINDOW_MAX_SEC = 3.0   # 원본 추출 구간 최대 길이(초, 따라가기 끝쪽)
+PLR_TAIL_SEC = 0.6         # 박스가 화면 바닥에 닿기 전 마지막 박스 뒤로 더 뽑는 시간(초)
+PLR_MAX_FRAMES = 20        # 번호판을 찾아볼 원본 프레임 수 상한
+PLR_OCR_TOP_K = 5          # OCR할 장수(번호판 가로가 큰 순)
+PLR_SHARP_MIN_FRAC = 0.35  # 가장 또렷한 번호판 선명도의 이 비율보다 흐린 장은 뺌
+PLR_EDGE_FRAC = 0.005      # 번호판이 원본 화면 끝에서 가로의 이 비율 안에 닿으면 잘린 것으로 봄
+PLR_REATTACH_MIN_AREA_FRAC = 0.5  # 놓친 뒤 다시 붙을 박스는 이미 따라가던 가장 큰 박스의 이 비율 이상이어야 함
+PLR_RADAR_NEAR_PLATES = 12.0  # 차 박스 없는 프레임: 레이더 점에서 번호판 크기(max(폭, 높이×3))의 이 배수 안 번호판만 그 차로 봄
+PLR_RADAR_MAX_DT = 0.25    # 그 프레임 시각과 이 안(초)의 레이더 점만 씀
 
-    def area(f):  # 화면 아래 끝에 잘린 박스는 번호판이 잘렸을 수 있어 뒤로
-        x1, y1, x2, y2 = follow_box[f["file"]]
-        return (x2 - x1) * (y2 - y1) * (0.5 if inf_h and y2 >= inf_h - 3 else 1.0)
 
-    def in_zone(f):
-        g = ground_from_box(follow_box[f["file"]], inference_shape, rc)
-        return g is not None and lo <= math.hypot(g[0], g[1]) <= hi
-    cand = [f for f in frames if f["file"] in follow_box]
-    zone = [f for f in cand if in_zone(f)]
-    return sorted(zone or cand, key=area, reverse=True)[:n_pick], bool(zone)
+def box_area(box):
+    """박스 [x1, y1, x2, y2, ...] 넓이(px²)."""
+    return max(0.0, float(box[2]) - float(box[0])) * max(0.0, float(box[3]) - float(box[1]))
+
+
+PLR_TILE_PX = 800          # 번호판 찾기 조각 크기(px). 640 입력에서 번호판이 잘 찾히는 크기(100px 이상)가 되게
+PLR_TILE_STRIDE = 600      # 조각 간격(겹침 200px: 폭 200px 이하 번호판은 한 조각에 온전히 들어감)
+
+
+def _box_iou(a, b):
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0])); iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
+
+
+def tile_origins(length, tile=PLR_TILE_PX, stride=PLR_TILE_STRIDE):
+    """길이 length를 덮는 조각 시작점들(마지막 조각은 끝에 맞춤)."""
+    if length <= tile:
+        return [0]
+    starts = list(range(0, length - tile, stride))
+    return starts + [length - tile]
+
+
+def detect_plate_tiled(detect, crop, tile=PLR_TILE_PX, stride=PLR_TILE_STRIDE, edge=4, iou=0.5):
+    """crop 전체와 tile px 조각들에서 번호판을 찾아 합칩니다(crop 좌표). detect(img) -> (dets [x1,y1,x2,y2,score,...], ms).
+    조각 안쪽 경계(crop 끝이 아닌 곳)에서 edge px 안에 닿은 상자는 조각에 잘린 번호판이라 버립니다.
+    반환 (dets 배열, 걸린 ms 합)."""
+    h, w = crop.shape[:2]
+    found, total_ms = [], 0.0
+    dets, ms = detect(crop)
+    total_ms += ms
+    found += [list(map(float, d[:5])) for d in dets]
+    if max(w, h) > tile * 1.15:
+        for y0 in tile_origins(h, tile, stride):
+            for x0 in tile_origins(w, tile, stride):
+                x1e, y1e = min(w, x0 + tile), min(h, y0 + tile)
+                dets, ms = detect(crop[y0:y1e, x0:x1e])
+                total_ms += ms
+                for d in dets:
+                    bx1, by1, bx2, by2, sc = (float(v) for v in d[:5])
+                    if ((x0 > 0 and bx1 <= edge) or (y0 > 0 and by1 <= edge)
+                            or (x1e < w and bx2 >= (x1e - x0) - edge) or (y1e < h and by2 >= (y1e - y0) - edge)):
+                        continue
+                    found.append([bx1 + x0, by1 + y0, bx2 + x0, by2 + y0, sc])
+    found.sort(key=lambda d: -d[4])
+    keep = []
+    for d in found:
+        if all(_box_iou(d, k) < iou for k in keep):
+            keep.append(d)
+    return np.array(keep, dtype=float).reshape(-1, 5), total_ms
+
+
+def plate_sharpness(plate):
+    """번호판 크롭 선명도: 가로 160px로 맞춘 회색조의 라플라시안 분산(클수록 또렷)."""
+    if plate is None or not plate.size:
+        return 0.0
+    gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY) if plate.ndim == 3 else plate
+    gray = cv2.resize(gray, (160, max(1, int(round(160.0 * gray.shape[0] / max(1, gray.shape[1]))))))
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def plate_touches_edge(box_full, full_shape, frac=PLR_EDGE_FRAC):
+    """번호판 상자(원본 px)가 원본 화면 끝에 닿았는지(잘렸을 수 있음)."""
+    h, w = float(full_shape[0]), float(full_shape[1])
+    e = frac * w
+    x1, y1, x2, y2 = (float(v) for v in box_full[:4])
+    return x1 <= e or y1 <= e or x2 >= w - e or y2 >= h - e
+
+
+def pick_plates_for_ocr(cands, k=PLR_OCR_TOP_K):
+    """cands: [{"key", "width", "edge", "sharp"}] → OCR할 key 목록(번호판 가로가 큰 순).
+    화면 끝에 닿지 않은 번호판만(모두 닿았으면 전부), 그중 가장 또렷한 것의 PLR_SHARP_MIN_FRAC보다 흐린 것은 빼고 k장."""
+    pool = [c for c in cands if not c["edge"]] or list(cands)
+    if not pool:
+        return []
+    top = max(c["sharp"] for c in pool)
+    pool = [c for c in pool if c["sharp"] >= PLR_SHARP_MIN_FRAC * top] or pool
+    return [c["key"] for c in sorted(pool, key=lambda c: -c["width"])[:k]]
+
+
+def tail_search_box(box, inference_shape, grow=0.25):
+    """따라가기가 끝난 뒤(차가 더 다가와 박스가 커지고 내려옴) 번호판을 찾을 영역(추론 프레임 px):
+    마지막 박스를 양옆으로 grow만큼 넓히고 아래는 화면 바닥까지."""
+    x1, y1, x2, y2 = (float(v) for v in box[:4])
+    h, w = float(inference_shape[0]), float(inference_shape[1])
+    bw = x2 - x1
+    return [max(0.0, x1 - grow * bw), y1, min(w - 1, x2 + grow * bw), h - 1]
 
 
 def make_evidence_image(out_dir, meta, rows, final):
     """증거 3장 묶음(evidence.jpg): ① 전체 장면(차량·번호판 표시) ② 차량 ③ 번호판 확대 + 시각·레이더 속도·영상 재검증·확정 번호.
     번호판이 가장 크게 찍힌 원본 프레임 하나로 만듭니다(카메라 1대로 영국식 3장 촬영을 대신). 만들면 파일 이름, 못 만들면 None."""
     out_dir = Path(out_dir)
-    best = max((r for r in rows if r.get("plate")), key=lambda r: r["plate"]["size"][0], default=None)
+    # OCR한 장 중 번호판이 가장 큰 장
+    best = max((r for r in rows if r.get("plate") and r["plate"].get("ocr")), key=lambda r: r["plate"]["size"][0],
+               default=None)
     if best is None:
         return None
     full = cv2.imread(str(out_dir / best["frame"]))
@@ -6414,7 +6916,8 @@ def make_evidence_image(out_dir, meta, rows, final):
         near = min((b for b in meta.get("follow_boxes") or []), key=lambda b: abs(b[0] - best["pts"]), default=None)
         fb = near[1] if near is not None and abs(near[0] - best["pts"]) <= 0.15 else None
     # 따라간 박스가 없으면 이벤트 시점 박스는 그 프레임이 이벤트 시점 근처(0.3초 이내)일 때만 씀(그 뒤엔 차가 이동함)
-    vb = fb or (meta.get("event_bbox") if abs(float(best.get("dt") or 0.0)) <= 0.3 else None)
+    # 차 박스 없이 레이더로 고른 장(mode radar)은 이벤트 박스가 화면 전체일 수 있어 번호판 둘레로 차량 칸을 만듭니다.
+    vb = fb or (meta.get("event_bbox") if abs(float(best.get("dt") or 0.0)) <= 0.3 and best.get("mode") != "radar" else None)
     if vb:
         vx1, vy1, vx2, vy2 = int(vb[0] * sx), int(vb[1] * sy), int(vb[2] * sx), int(vb[3] * sy)
     else:
@@ -6474,91 +6977,137 @@ def make_evidence_image(out_dir, meta, rows, final):
     return name
 
 
-def speed_violation_enf_dt(meta):
-    """단속일시 YYYYMMDDHH24MISS(KST). 이벤트 시각(증거의 ts, 없으면 event_id 앞 'YYYYMMDDTHHMMSS')."""
-    ts = (meta.get("evidence") or {}).get("ts")
-    if ts:
-        value = datetime.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-        if value.tzinfo is not None:
-            value = value.astimezone(pytz.timezone("Asia/Seoul"))
-        return value.strftime("%Y%m%d%H%M%S")
-    m = re.match(r"^(\d{8})T(\d{6})", str(meta.get("event_id") or ""))
-    return m.group(1) + m.group(2) if m else None
+# 과속 관제 사진: 이벤트 → 번호판 결과(run_plr_on_fullres)를 이어 주는 Future. 사진 저장 일꾼이 결과를 받은 뒤 보냅니다.
+PLATE_FUTURES = {}
+PLATE_FUTURES_LOCK = threading.Lock()
+# 관제로 보내지 않기로 한 과속 이벤트(차량번호 없음). 녹화가 끝난 영상도 보내지 않습니다.
+# 과속 로직은 모델이 완벽하다는 전제라, 번호판을 못 찾은 차는 번호판이 안 보이는 차로 보고 로그만 남깁니다.
+RECEIVER_SKIPPED_EVENTS = deque(maxlen=2000)
 
 
-def send_speed_violation(out_dir, meta, final):
-    """과속 번호판이 정해지면 eslip 과속단속 API(speedViolation/insert)로 차량번호·단속일시를 보냅니다.
-    보낼 내용과 결과는 이벤트 폴더 speed_violation_api.json과 이벤트 감사 로그(stage=speed_violation_send)에 남깁니다.
-    - 번호판이 send_status(기본 확정)가 아니면 보내지 않고 이유(plate_불확실 등)만 저장
-    - speed_violation_pass가 true면 보낼 내용(request)만 단말에 저장하고 보내지 않음
-    - false면 보냄. 응답 S000(정상)·S001(정상, 처리 대상 없음)이 성공이고, 연결 실패·E999(시스템 오류)만 다시 시도"""
-    cfg = SYS_CFG["speed_violation_api"]
-    event_id = meta.get("event_id", "-")
-    audit = {"event_id": event_id, "event_name": meta.get("event_name"), "cam_id": meta.get("cam_id"), "ip": meta.get("ip")}
-    text, status = (final or {}).get("text") or "", (final or {}).get("status")
-    body = {"regoNo": text, "enfDt": speed_violation_enf_dt(meta)}
-    result = {"request": body, "url": cfg["url"], "plate_status": status,
-              "speed_violation_pass": cfg["speed_violation_pass"] is not False, "sent": False, "attempts": []}
+def plate_number_missing_reason(final):
+    """관제로 보낼 차량번호가 없으면 그 까닭(미인식: 번호판 모델이 못 찾음, 시간초과: 번호판 읽기가 api_wait_sec 안에
+    안 끝남), 있으면 None."""
+    if (final or {}).get("text"):
+        return None
+    return (final or {}).get("status") or "시간초과"
 
-    def save():
+
+def plate_future_for(event_id):
+    """과속 이벤트의 번호판 결과를 받을 Future(이미 있으면 그것)."""
+    with PLATE_FUTURES_LOCK:
+        return PLATE_FUTURES.setdefault(str(event_id), concurrent.futures.Future())
+
+
+def resolve_plate_future(event_id, final):
+    """번호판 결과(finalize_plate의 final, 못 읽었거나 기다리다 시간이 지나면 None)를 넘기고 목록에서 뺍니다."""
+    with PLATE_FUTURES_LOCK:
+        fut = PLATE_FUTURES.pop(str(event_id), None)
+    if fut is not None and not fut.done():
         try:
-            (Path(out_dir) / "speed_violation_api.json").write_text(
-                json.dumps(to_json_safe(result), ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as e:
-            logger.warning(f"[SPEED API] 결과 저장 실패 event_id={event_id}: {e}")
+            fut.set_result(final)
+        except concurrent.futures.InvalidStateError:
+            pass
 
-    reason = None
-    if not text or status not in cfg["send_status"]:
-        reason = f"plate_{status or 'none'}"
-    elif not body["enfDt"]:
-        reason = "no_event_time"
-    if reason:
-        result["skip_reason"] = reason
-        save()
-        logger.info(f"[SPEED API] 전송 안 함 event_id={event_id} reason={reason} plate='{text}'({status})")
-        append_event_audit_record(audit, stage="speed_violation_send", status="skipped",
-                                  extra={"reason": reason, "plate": text, "plate_status": status})
+
+def speeding_api_objects(objects, final):
+    """과속 관제 사진의 detectedObjects(관제 요청 형식):
+    [{"box", "label": "speedviolation", "score", "regNo", "plateStatus", "speed"}] (관제가 TOS로 넘김).
+    regNo: 차량번호. 여러 장 다수결 번호를 상태와 상관없이 넣습니다(못 읽었으면 "").
+    plateStatus: 확정 / 불확실 / 형식 불일치 / 미인식(finalize_plate), 번호판 없음(기다리다 시간이 지났거나 못 읽음).
+    speed: 레이더 판정 속도(측정 구간 중앙값, km/h)."""
+    text, status = str((final or {}).get("text") or ""), str((final or {}).get("status") or "번호판 없음")
+    return [{"box": o["box"], "label": "speedviolation", "score": o["score"], "regNo": text,
+             "plateStatus": status, "speed": o.get("speed_kmh")} for o in objects]
+
+
+GHOST_EVENTS = deque(maxlen=2000)   # 레이더 가짜 물체로 본 과속 event_id(영상도 ghost 폴더로 옮기고 보내지 않음)
+GHOST_STATUS = "레이더 가짜"
+
+
+def radar_ghost_check(meta, final):
+    """레이더 가짜 물체인지(11/7: 96번 ROI 맨 위 왼쪽 분리대 옆 55m에 차 없이 시속 11~13km 트랙이 생겼다 사라짐).
+    판정 뒤 차 박스가 한 번도 안 붙었고(photo_source radar_path), 레이더 트랙이 판정 뒤 ghost_radar_post_sec 안에
+    사라졌고, 번호판도 못 읽었으면(확정·불확실 아님) True. 그 레이더의 speeding.ghost_filter가 켜진 때만 봅니다."""
+    if meta.get("event_name") != SPEEDING_EVENT or meta.get("photo_source") != "radar_path":
         return False
-    if result["speed_violation_pass"]:
-        save()
-        logger.info(f"[SPEED API PASS] 단말 저장만 event_id={event_id} regoNo={body['regoNo']} enfDt={body['enfDt']}")
-        append_event_audit_record(audit, stage="speed_violation_send", status="speed_violation_pass", extra={"request": body})
+    cfg = radar_speeding_cfg((meta.get("evidence") or {}).get("radar_client_id"))
+    if not cfg.get("ghost_filter"):
         return False
-    result["sent"] = True
-    success = False
-    for attempt in range(1 + max(0, int(cfg["retries"]))):
-        if attempt:
-            time.sleep(2.0 * attempt)
-        started = time.monotonic()
-        try:
-            response = requests.post(result["url"], json=body, timeout=float(cfg["timeout_sec"]),
-                                     verify=cfg["verify_tls"],
-                                     headers={"Content-Type": "application/json; charset=UTF-8"})
-            try:
-                payload = response.json()
-            except ValueError:
-                payload = {"raw": response.text[:1000]}
-            code = payload.get("resultCode") if isinstance(payload, dict) else None
-            result["attempts"].append({"http": response.status_code, "response": payload,
-                                       "elapsed_ms": round((time.monotonic() - started) * 1000)})
-            success = isinstance(payload, dict) and payload.get("success") is True and code in ("S000", "S001")
-            if success or (200 <= response.status_code < 500 and code != "E999"):
-                break  # 성공, 또는 다시 보내도 같을 입력 오류(E001~E003)
-        except Exception as e:
-            result["attempts"].append({"error": str(e), "elapsed_ms": round((time.monotonic() - started) * 1000)})
-    result["success"] = success
-    save()
-    last = result["attempts"][-1]
-    append_event_audit_record(audit, stage="speed_violation_send", status="ok" if success else "failed",
-                              extra={"request": body, "attempts": len(result["attempts"]), "last": last})
-    (logger.info if success else logger.error)(
-        f"[SPEED API {'OK' if success else 'FAIL'}] event_id={event_id} regoNo={body['regoNo']} enfDt={body['enfDt']} "
-        f"attempts={len(result['attempts'])} last={str(last)[:300]}")
-    return success
+    if (final or {}).get("status") in ("확정", "불확실"):
+        return False
+    path, ev_pts = meta.get("radar_path") or [], meta.get("event_pts")
+    if not path or ev_pts is None:
+        return False
+    return max(float(q[0]) for q in path) - float(ev_pts) < float(cfg.get("ghost_radar_post_sec", 1.0))
+
+
+def ghost_event_dir(ip, event_id):
+    return os.path.join(EVENT_ROOT_DIR, "events", str(ip), "ghost", str(event_id))
+
+
+def move_ghost_event(meta, out_dir):
+    """가짜로 본 과속 이벤트의 사진(images·images_api)과 원본 추출 폴더를 events/<ip>/ghost/<event_id>/로 옮깁니다."""
+    gdir = ghost_event_dir(meta.get("ip"), meta.get("event_id"))
+    os.makedirs(gdir, exist_ok=True)
+    for sub in ("images", "images_api"):
+        src = os.path.join(EVENT_ROOT_DIR, "events", str(meta.get("ip")), sub, SPEEDING_EVENT, f"{meta.get('event_id')}.jpg")
+        if os.path.exists(src):
+            shutil.move(src, os.path.join(gdir, f"{sub}.jpg"))
+    if out_dir and os.path.isdir(str(out_dir)):
+        shutil.move(str(out_dir), os.path.join(gdir, "fullres"))
+    return gdir
 
 
 def run_plr_on_fullres(out_dir, meta):
-    """원본 프레임 중 이벤트 시점에 가까운 프레임에서 이벤트 차량 영역의 번호판을 찾아 OCR 결과를 남깁니다."""
+    """원본 프레임에서 번호판을 읽습니다(_plr_on_fullres). 과속이면 관제 사진이 기다리는 번호판 결과를 넘깁니다
+    (못 읽었으면 None). 레이더 가짜 물체(radar_ghost_check)면 결과를 GHOST_STATUS로 넘겨 관제로 보내지 않습니다."""
+    result = None
+    try:
+        result = _plr_on_fullres(out_dir, meta)
+        return result
+    finally:
+        if meta.get("event_name") == SPEEDING_EVENT:
+            final = (result or {}).get("final")
+            try:
+                if radar_ghost_check(meta, final):
+                    GHOST_EVENTS.append(str(meta.get("event_id")))
+                    final = {"text": "", "status": GHOST_STATUS}
+                    gdir = move_ghost_event(meta, out_dir)
+                    logger.warning(f"[GHOST] 레이더 가짜 물체로 봅니다(차 박스 없음·레이더 트랙 바로 사라짐·번호판 없음). "
+                                   f"관제로 보내지 않고 사진·원본을 옮겼습니다. event_id={meta.get('event_id')} dir={gdir}")
+            except Exception as e:
+                logger.error(f"[GHOST] 가짜 물체 처리 실패 event_id={meta.get('event_id')}: {e}")
+            resolve_plate_future(meta.get("event_id"), dict(final) if final else None)
+
+
+def radar_point_at(radar_path, pts, frame_shape, max_dt=PLR_RADAR_MAX_DT):
+    """그 프레임 시각(max_dt 안) 레이더 점의 화면 투영 (u, v)(추론 프레임 px).
+    그 시각 점이 없거나 점이 화면에서 많이 벗어나면(가로 -15~115%, 세로 0~130% 밖) False(이 프레임은 찾지 않음),
+    경로에 투영이 아예 없으면 None(거르지 않음)."""
+    seen = [q for q in radar_path or [] if len(q) >= 5 and q[3] is not None and q[4] is not None]
+    if pts is None or not seen or frame_shape is None:
+        return None
+    q = min(seen, key=lambda r: abs(float(r[0]) - float(pts)))
+    if abs(float(q[0]) - float(pts)) > max_dt:
+        return False
+    u, v = float(q[3]), float(q[4])
+    h, w = float(frame_shape[0]), float(frame_shape[1])
+    if not (-0.15 * w <= u <= 1.15 * w and 0.0 <= v <= 1.3 * h):
+        return False
+    return u, v
+
+
+def plate_near_radar(box, point, k=PLR_RADAR_NEAR_PLATES):
+    """번호판 상자(추론 프레임 px) 가운데가 레이더 점(point)에서 번호판 크기 max(폭, 높이×3)의 k배 안인지.
+    큰 트럭은 레이더 점이 컨테이너 쪽에 찍혀 번호판과 꽤 떨어지지만, 다른 차 번호판은 그보다 훨씬 멀리 있습니다."""
+    x1, y1, x2, y2 = (float(c) for c in box[:4])
+    size = max(x2 - x1, 3.0 * (y2 - y1), 1.0)
+    return math.hypot((x1 + x2) / 2.0 - point[0], (y1 + y2) / 2.0 - point[1]) <= k * size
+
+
+def _plr_on_fullres(out_dir, meta):
+    """원본 프레임에서 그 차의 번호판을 찾고, 크기·잘림·선명도로 고른 장(pick_plates_for_ocr)만 OCR해 결과를 남깁니다."""
     cfg = SYS_CFG["plr"]
     if not cfg["enabled"]:
         return None
@@ -6586,36 +7135,73 @@ def run_plr_on_fullres(out_dir, meta):
     pad = float(cfg["plate_padding"])
     max_dt = float(cfg["max_dt_sec"])
 
-    # 과속 차량을 따라간 박스(follow_boxes)가 있으면, 번호판 촬영 구간에서 박스가 가장 큰(가장 가까운) 프레임 5장에서
-    # 그 박스 영역을 봅니다. 없으면 이벤트 시점 ±max_dt 프레임에서 이벤트 박스 영역을 봅니다.
+    # 번호판 찾을 영역: 따라간 박스(follow_boxes)가 있으면 그 프레임 시각의 박스(0.15초 안), 따라가기가 끝난 뒤 프레임은
+    # 마지막 박스를 넓힌 영역(tail_search_box). 박스가 끝내 안 붙은 차는 ROI(search_box), 둘 다 없으면 이벤트 박스
+    # (이벤트 시점 ±max_dt). 프레임(최대 PLR_MAX_FRAMES)마다 번호판을 찾고, OCR은 pick_plates_for_ocr로 고른 장만 합니다.
     frames = [f for f in meta.get("frames", []) if f.get("dt_from_event") is not None]
-    follow_box = {}
-    for f in frames:
-        near = min((b for b in meta.get("follow_boxes") or [] if f.get("pts") is not None and abs(b[0] - f["pts"]) <= 0.15),
-                   key=lambda b: abs(b[0] - f["pts"]), default=None)
-        if near is not None:
-            follow_box[f["file"]] = near[1]
-    zone_used = None
-    if follow_box:
-        rc = radar_camera_cfg((meta.get("evidence") or {}).get("radar_client_id"))
-        frames, zone_used = plate_zone_frames(frames, follow_box, inference_shape, 5, rc)
+    follow = sorted(meta.get("follow_boxes") or [], key=lambda b: b[0])
+    region, mode = {}, {}
+    radar_point = {}
+
+    def use_radar_region(f):
+        # 차 박스가 없는 프레임: ROI(search_box)에서 찾되, 그 시각 레이더 점 근처 번호판만 씁니다(plate_near_radar).
+        # ROI에서 가장 확실한 번호판을 그냥 고르면 레이더가 잡은 차가 아닌 다른 차 번호판을 읽습니다
+        # (11/8 16:07:24 107: 레이더는 야드 트랙터, 사진은 멀리 서 있던 승합차). 그 시각 레이더 점이 없거나
+        # 화면에서 많이 벗어나 있으면 이 프레임은 찾지 않습니다.
+        point = radar_point_at(meta.get("radar_path"), f.get("pts"), inference_shape)
+        if point is False:
+            return
+        region[f["file"]], mode[f["file"]] = meta["search_box"], "radar"
+        if point is not None:
+            radar_point[f["file"]] = point
+    if follow:
+        for f in frames:
+            if f.get("pts") is None:
+                continue
+            near = min(follow, key=lambda b: abs(b[0] - f["pts"]))
+            if abs(near[0] - f["pts"]) <= 0.15:
+                region[f["file"]], mode[f["file"]] = near[1], "follow"
+            elif meta.get("search_box"):
+                # 박스를 일찍 놓쳐 레이더 경로로 고른 구간(radar_path_box_lost): ROI에서 찾되 레이더 점 근처 번호판만.
+                use_radar_region(f)
+            elif f["pts"] > follow[-1][0]:
+                region[f["file"]], mode[f["file"]] = tail_search_box(follow[-1][1], inference_shape), "follow_tail"
+        frames = [f for f in frames if f["file"] in region]
+        if meta.get("search_box"):
+            event_crop = crop_of(meta["search_box"])
+    elif meta.get("search_box"):
+        event_crop = crop_of(meta["search_box"])
+        for f in frames:
+            use_radar_region(f)
+        frames = [f for f in frames if f["file"] in region]
     else:
         frames = [f for f in frames if abs(f["dt_from_event"]) <= max_dt]
+        for f in frames:
+            region[f["file"]], mode[f["file"]] = bbox, "event"
+    frames = frames[::max(1, int(math.ceil(len(frames) / float(PLR_MAX_FRAMES))))]
 
     started = time.monotonic()
-    rows = []
+    rows, plates = [], {}
     for frame in frames:
-        dt = frame.get("dt_from_event")
-        cx1, cy1, cx2, cy2 = crop_of(follow_box[frame["file"]]) if frame["file"] in follow_box else event_crop
+        cx1, cy1, cx2, cy2 = crop_of(region[frame["file"]])
         image = cv2.imread(str(out_dir / frame["file"]))
         if image is None or cx2 <= cx1 or cy2 <= cy1:
             continue
-        crop = image[cy1:cy2, cx1:cx2]
-        dets, det_ms = recognizer.detect(crop)
-        row = {"frame": frame["file"], "pts": frame.get("pts"), "dt": dt, "det_ms": round(det_ms, 2), "plate": None,
-               "mode": "follow" if frame["file"] in follow_box else "event", "vehicle_crop_full": [cx1, cy1, cx2, cy2]}
+        # 크롭 전체 + 800px 조각에서 찾음(번호판 모델이 중간 크기를 놓치는 문제, detect_plate_tiled)
+        dets, det_ms = detect_plate_tiled(recognizer.detect, image[cy1:cy2, cx1:cx2])
+        row = {"frame": frame["file"], "pts": frame.get("pts"), "dt": frame.get("dt_from_event"),
+               "det_ms": round(det_ms, 2), "plate": None, "mode": mode[frame["file"]],
+               "vehicle_crop_full": [cx1, cy1, cx2, cy2]}
+        point = radar_point.get(frame["file"])
+        if point is not None and len(dets):
+            # 레이더 점 근처 번호판만(plate_near_radar). 거른 개수는 분석용으로 남깁니다.
+            near = [d for d in dets if plate_near_radar([(cx1 + d[0]) / sx, (cy1 + d[1]) / sy,
+                                                         (cx1 + d[2]) / sx, (cy1 + d[3]) / sy], point)]
+            row["radar_uv"] = [round(float(point[0]), 1), round(float(point[1]), 1)]
+            row["plates_off_radar"] = len(dets) - len(near)
+            dets = near
         if len(dets):
-            # 차량 영역 안에서 가장 확실한 번호판 1개를 씁니다.
+            # 영역 안에서 가장 확실한 번호판 1개를 씁니다.
             px1, py1, px2, py2, score = [float(v) for v in max(dets, key=lambda d: d[4])[:5]]
             pw, ph = px2 - px1, py2 - py1
             gx1, gy1 = max(0, int(cx1 + px1 - pw * pad)), max(0, int(cy1 + py1 - ph * pad))
@@ -6624,13 +7210,19 @@ def run_plr_on_fullres(out_dir, meta):
             if plate.size:
                 name = f"plate_{Path(frame['file']).stem}.jpg"
                 cv2.imwrite(str(plate_dir / name), plate, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                row["plate"] = {"file": f"plr/{name}", "det_conf": round(score, 4),
-                                "box_full": [int(cx1 + px1), int(cy1 + py1), int(cx1 + px2), int(cy1 + py2)],
-                                "size": [int(pw), int(ph)], "ocr": recognizer.read_plate(plate)}
+                box_full = [int(cx1 + px1), int(cy1 + py1), int(cx1 + px2), int(cy1 + py2)]
+                row["plate"] = {"file": f"plr/{name}", "det_conf": round(score, 4), "box_full": box_full,
+                                "size": [int(pw), int(ph)], "sharp": round(plate_sharpness(plate), 1),
+                                "edge": plate_touches_edge(box_full, full_shape)}
+                plates[len(rows)] = plate
         rows.append(row)
+    picked = pick_plates_for_ocr([{"key": i, "width": rows[i]["plate"]["size"][0], "edge": rows[i]["plate"]["edge"],
+                                   "sharp": rows[i]["plate"]["sharp"]} for i in plates])
+    for i in picked:
+        rows[i]["plate"]["ocr"] = recognizer.read_plate(plates[i])
 
     summary = {}
-    reads = [r["plate"]["ocr"]["cpu"] for r in rows if r["plate"] and "cpu" in r["plate"]["ocr"]]
+    reads = [r["plate"]["ocr"]["cpu"] for r in rows if r["plate"] and "cpu" in (r["plate"].get("ocr") or {})]
     if reads:
         best = max(reads, key=lambda r: r["conf"])
         texts = [r["text"] for r in reads if r["text"]]
@@ -6643,7 +7235,7 @@ def run_plr_on_fullres(out_dir, meta):
         "event_name": meta.get("event_name"), "created_at": now_kst().isoformat(),
         "models": {"det_model": os.path.basename(recognizer.det.engine_path), "ocr_cpu_model": cfg["ocr_cpu_model"]},
         "vehicle_crop_full": list(event_crop), "frames_used": len(rows),
-        "final": finalize_plate(rows), "plate_zone_used": zone_used, "follow_boxes": meta.get("follow_boxes"),
+        "final": finalize_plate(rows), "ocr_frames": len(picked), "follow_boxes": meta.get("follow_boxes"),
         "plates_found": sum(1 for r in rows if r["plate"]),
         "det_ms_avg": round(float(np.mean(det_ms)), 2) if det_ms else None,
         "summary": summary, "frames": rows,
@@ -6675,13 +7267,11 @@ def run_plr_on_fullres(out_dir, meta):
                          final["text"], final["status"], final["support"], str(out_dir)])
     logger.info(
         f"[PLR] event_id={result['event_id']} frames={result['frames_used']} plates={result['plates_found']} "
+        f"ocr={result['ocr_frames']} "
         f"OCR='{cpu.get('text', '')}'({cpu.get('conf', '-')}, {cpu.get('ms_avg', '-')}ms) "
         f"det_avg={result['det_ms_avg']}ms elapsed={result['elapsed_sec']}s "
         f"FINAL='{final['text']}'({final['status']}, {final['support']}/{final['valid_reads']}개 일치)"
     )
-    if result["event_name"] == SPEEDING_EVENT:
-        # 원본 추출 스레드를 막지 않게 전용 스레드에서 보냅니다(재시도 포함 최대 수십 초).
-        SPEED_API_POOL.submit(send_speed_violation, str(out_dir), dict(meta), dict(final))
     return result
 
 
@@ -7719,7 +8309,10 @@ class FramePacer:
 class Camera:
     # 과속 차량을 판정 뒤 따라가는 시간: 이만큼 안 보이면 끝(초), 최대 이만큼(초, 판정 전 박스도 이만큼 앞까지 씀)
     PLR_FOLLOW_LOST_SEC = 0.7
+    PLR_FOLLOW_REATTACH_SEC = 0.3     # 따라가던 박스가 이만큼 안 보이면 레이더 위치로 다시 붙을 박스를 찾음
     PLR_FOLLOW_MAX_SEC = 8.0
+    # 멀어지는 차는 가장 가까울 때(번호판 사진)가 판정보다 먼저라, 판정 전 박스를 이만큼(초) 앞까지 씁니다(track_boxes 160장).
+    PLR_FOLLOW_BACK_SEC = 16.0
     # 알람 낸 객체 기록(alerted)은 이 시간(초) 동안 이벤트 후보가 되지 않은 객체만 지웁니다. 추적기 ID는 새 번호로만 주므로
     # 지운 ID가 다시 오지 않고, 화면에 남아 계속 후보인 객체는 지우지 않아 같은 객체에 알람이 두 번 나지 않습니다.
     ALERTED_KEEP_SEC = 600.0
@@ -7786,6 +8379,7 @@ class Camera:
         self._radar_zone_key = None                # 과속: 레이더 판정 구역으로 넘긴 (ROI, 보정값) — 바뀔 때만 다시 계산
         self._last_logic_seq = None
         self.radar_display = None
+        self.radar_log = None                      # 과속: 이 프레임 레이더 점(분석용 .infer.jsonl "radar")
 
         self.alerted = {}           # tid -> 이 객체로 이미 알람을 낸 이벤트(같은 객체에 같은 이벤트를 다시 내지 않음,
                                     # alarm_once_per_object가 False인 이벤트는 쿨다운마다 다시 냄)
@@ -8176,6 +8770,8 @@ class Camera:
             # t = 관측 시각)을 프레임마다 남겨 이벤트 앞뒤 1분을 숫자로 다시 볼 수 있게 합니다(그 이벤트가 없는 카메라는 없음).
             **({"yt": to_json_safe(self.yt_monitor.snapshot)} if self.yt_monitor is not None else {}),
             **({"cone": to_json_safe(cone_overlay)} if cone_overlay is not None else {}),
+            # 과속: 이 프레임에 맞춘 레이더 점 [id, 거리, x, y, 속도, 차로 안, 화면 u, v, 붙은 박스 tid](radar_log_points)
+            **({"radar": to_json_safe(self.radar_log)} if self.radar_log is not None else {}),
         }
 
     def _radar_judge_kwargs(self, fr, t_main, track_map_main):
@@ -8184,9 +8780,11 @@ class Camera:
         규칙:
         - 투영: 호모그래피가 있으면 그것, 없으면 radar_camera.colocated(같은 정면 기하 모델)와 그 지연값
         - 레이더 프레임: 카메라 시각 - 지연값에 맞는 프레임(MseRadarInput.frame_at), 표시·연결이 같은 프레임 사용
-        - 연결 후보: 움직이는 차량 박스만(moving_tracks), 박스 하단 띠 + 레이더 거리-박스 크기 검사, 화면 밖 점 제외
+        - 연결 후보: 움직이는 차량 박스 중 하단 띠가 ROI(단속 차로)에 걸친 것만(moving_tracks, box_band_in_roi),
+          박스 하단 띠 + 레이더 거리-박스 크기 검사, 화면 밖 점 제외
         - 프레임마다 연결을 assoc_votes에 기록 → 과속 이벤트 차량은 판정 구간 다수결(SpeedingDetector)"""
         self.radar_display = None
+        self.radar_log = None
         if not isinstance(self.radar_provider, MseRadarInput):
             return {}
         # 레이더 프로세스가 죽었거나 시작에 실패했으면 다시 띄웁니다(실패 후 5초 간격).
@@ -8205,17 +8803,22 @@ class Camera:
         camera_time = self.reader.camera_time_of(meta.get("pts"))
         now_t = camera_time if camera_time is not None else time.monotonic()
         moving = moving_tracks(self.speed_track_hist, t_main, now_t)
+        # 박스 연결은 ROI(단속 차로)에 걸친 차량만(옆 차로·방벽 너머 차에 붙지 않게)
+        roi = self.roi_poly if self.roi_poly is not None and len(self.roi_poly) >= 3 else None
         self._update_plr_follow(t_main, meta, {
             'judge': judge, 'project': project, 'offset': offset, 'camera_time': camera_time, 'moving': moving,
             'track_map': track_map_main, 'gate': gate, 'frame_shape': fr.shape if fr is not None else None,
-            'focal_px': projection_focal_px(fr.shape if fr is not None else None, rc)})
+            'focal_px': projection_focal_px(fr.shape if fr is not None else None, rc), 'roi_poly': roi})
 
         if project is not None and fr is not None:
             radar_t = camera_time - offset if camera_time is not None else None
             radar_frame = self.radar_provider.frame_at(radar_t)
-            rows = [r for r in judge.rows_for_frame(radar_frame) if r['in_zone']] if radar_frame is not None else []
+            all_rows = judge.rows_for_frame(radar_frame) if radar_frame is not None else []
+            rows = [r for r in all_rows if r['in_zone']]
             matched, projected = associate_radar_tracks(moving, track_map_main, rows, project, gate, frame_shape=fr.shape,
-                                                        focal_px=projection_focal_px(fr.shape, rc))
+                                                        focal_px=projection_focal_px(fr.shape, rc), roi_poly=roi)
+            self.radar_log = {"radar_arrival": round(float(radar_frame['arrival']), 3) if radar_frame is not None else None,
+                              "points": radar_log_points(all_rows, project, matched)}
             if camera_time is not None:
                 for tid, (row, _) in matched.items():
                     self.assoc_votes.append((camera_time, int(row['radar_id']), int(tid)))
@@ -8248,16 +8851,23 @@ class Camera:
         }
 
     def _update_radar_zone(self, judge, rc):
-        """카메라 ROI(단속 차로)를 레이더 판정 구역으로 넘깁니다. ROI나 보정값이 바뀔 때만 다시 계산합니다."""
-        key = json.dumps([self.roi_poly_norm, rc.get("homography"), rc.get("image_size")])
+        """카메라 ROI(단속 차로)와 이 카메라의 과속 방향·측정·사진 구간(cameras.json event_config.speeding)을 레이더 판정기
+        차로로 넘깁니다. ROI·보정값·설정이 바뀔 때만 다시 계산합니다."""
+        settings = speeding_lane_settings(deep_merge_dict(radar_speeding_cfg(self.radar_provider.client_id),
+                                                          (self.conf.get("event_config") or {}).get(SPEEDING_EVENT) or {}))
+        key = json.dumps([self.roi_poly_norm, rc.get("homography"), rc.get("image_size"), settings])
         if key == self._radar_zone_key:
             return
         self._radar_zone_key = key
         poly = roi_radar_polygon(self.roi_poly_norm, rc)
-        judge.set_camera_zone(self.camera_key, poly)
+        judge.set_camera_zone(self.camera_key, poly, settings)
+        dirs = ", ".join(f"{d} 측정 {settings[d + '_measure'][0]:g}~{settings[d + '_measure'][1]:g}m "
+                         f"사진 {settings[d + '_photo'][0]:g}~{settings[d + '_photo'][1]:g}m"
+                         for d in ("forward", "backward") if settings[d]) or "방향 없음(판정 안 함)"
+        logger.info(f"[RADAR ZONE] CAM:{self.cam_id}({self.camera_key}) 레이더 {self.radar_provider.client_id} 과속: {dirs}")
         if poly:
-            logger.info(f"[RADAR ZONE] CAM:{self.cam_id}({self.camera_key}) ROI를 레이더 {self.radar_provider.client_id} "
-                        f"판정 구역으로 씁니다(레이더 좌표 x 앞 m, y 왼쪽+ m): {poly}")
+            logger.info(f"[RADAR ZONE] CAM:{self.cam_id}({self.camera_key}) ROI를 지나간 차만 판정합니다"
+                        f"(ROI 레이더 좌표, x 앞 m, y 왼쪽+ m): {poly}")
         elif self.roi_poly_norm:
             logger.warning(f"[RADAR ZONE] CAM:{self.cam_id}({self.camera_key}) 보정값(호모그래피)이 없거나 망가졌거나 ROI가 "
                            f"수평선 너머까지 있어 ROI를 레이더 구역으로 못 바꿉니다. 설정 구역(event_config.speeding.zone)으로 판정합니다.")
@@ -8265,22 +8875,25 @@ class Camera:
     @staticmethod
     def _radar_follow_tid(fl, radar):
         """판정 순간 박스를 못 찾은 과속 차량: 지금 레이더 위치를 화면에 투영해 붙는 차량 박스를 찾습니다.
-        반환 (레이더가 아직 그 차를 보는지, 붙은 박스 tid 또는 None)."""
+        반환 (지금 레이더 위치 (x, y, speed_kmh), 붙은 박스 tid 또는 None). 레이더가 그 차를 더 못 보면 (None, None)."""
         if not radar or radar.get('project') is None or radar.get('camera_time') is None or fl.get("radar_seq") is None:
-            return False, None
+            return None, None
         pos = radar['judge'].position_at(fl["radar_seq"], radar['camera_time'] - radar['offset'], max_dt=0.3)
         if pos is None:
-            return False, None
+            return None, None
         row = {'radar_id': fl.get("radar_id"), 'x_m': pos[0], 'y_m': pos[1], 'speed_kmh': pos[2]}
         matched, _ = associate_radar_tracks(radar['moving'], radar['track_map'], [row], radar['project'], radar['gate'],
-                                            frame_shape=radar['frame_shape'], focal_px=radar['focal_px'])
-        return True, next(iter(matched), None)
+                                            frame_shape=radar['frame_shape'], focal_px=radar['focal_px'],
+                                            roi_poly=radar.get('roi_poly'))
+        return pos, next(iter(matched), None)
 
     def _update_plr_follow(self, t_main, meta, radar=None):
         """차량 박스 이력을 남기고, 과속 차량이 화면에서 PLR_FOLLOW_LOST_SEC 넘게 사라지거나 PLR_FOLLOW_MAX_SEC가
         지나면 원본 추출을 요청합니다. 판정 전후 그 차량 박스 중 가장 클 때(가장 가까울 때)의 원본 프레임으로 번호판을 읽게 됩니다.
         판정 순간 박스를 못 찾은 차량(tid None)은 레이더 트랙을 따라가다 투영점에 박스가 붙는 순간부터 그 박스를 따라갑니다
-        (멀리서 판정해 박스가 작거나 가려졌던 차). radar: _radar_judge_kwargs가 넘기는 판정기·투영·지연·움직이는 박스."""
+        (멀리서 판정해 박스가 작거나 가려졌던 차). 끝내 박스가 안 붙으면 따라가며 남긴 레이더 거리(radar_path)로
+        차가 번호판 촬영 구간에 올 때를 계산해 원본을 뽑습니다(radar_path_window).
+        radar: _radar_judge_kwargs가 넘기는 판정기·투영·지연·움직이는 박스·ROI."""
         now_m, pts = time.monotonic(), meta.get("pts")
         by_tid = {int(t[4]): t for t in t_main}
         if pts is not None:
@@ -8291,9 +8904,20 @@ class Camera:
         for event_id in list(self.plr_follow):
             fl = self.plr_follow[event_id]
             if fl["tid"] is None:
-                alive, tid = self._radar_follow_tid(fl, radar)
-                if alive:
+                pos, tid = self._radar_follow_tid(fl, radar)
+                if pos is not None:
                     fl["last_seen"] = now_m
+                    if pts is not None:
+                        # [pts, 거리 m, 속도 km/h, (화면 투영 u, v)]: 원본 구간을 그 차가 화면에 보인 마지막 순간으로 고릅니다.
+                        uv = radar['project'](pos[0], pos[1]) if radar.get('project') is not None else None
+                        fl.setdefault("radar_path", []).append(
+                            [round(float(pts), 4), round(math.hypot(pos[0], pos[1]), 2), round(float(pos[2]), 1)]
+                            + ([round(float(uv[0]), 1), round(float(uv[1]), 1)] if uv is not None else []))
+                if (tid is not None and fl["boxes"] and int(tid) in by_tid and box_area(by_tid[int(tid)])
+                        < PLR_REATTACH_MIN_AREA_FRAC * max(box_area(b) for _, b in fl["boxes"])):
+                    # 따라가던 차보다 훨씬 작은 박스는 멀리 있거나 멀어지는 다른 차입니다(레이더가 차를 놓친 뒤 옮겨 붙는 것 방지).
+                    logger.info(f"[PLR FOLLOW] event_id={event_id} 레이더 위치의 박스 tid={tid}가 따라가던 차보다 훨씬 작아 붙지 않습니다.")
+                    tid = None
                 if tid is not None:
                     fl["tid"] = int(tid)
                     logger.info(f"[PLR FOLLOW] event_id={event_id} 레이더 위치에 차량 박스가 붙어 따라갑니다. tid={tid}")
@@ -8301,11 +8925,21 @@ class Camera:
             if t is not None and pts is not None:
                 fl["boxes"].append([round(float(pts), 4), int_box(t[:4])])
                 fl["last_seen"] = now_m
+            if t is not None:
+                fl["box_seen"] = now_m
+            elif (fl["tid"] is not None and fl.get("radar_seq") is not None
+                  and now_m - fl.get("box_seen", fl["started"]) > self.PLR_FOLLOW_REATTACH_SEC):
+                # 따라가던 차 박스를 놓침(추적기가 차를 잃거나 번호가 바뀜): 끝내지 않고 레이더 위치로 다시 붙을 박스를 찾습니다.
+                # 끝내 버리면 차가 아직 멀 때 장면으로 번호판을 읽게 됩니다(작게 찍혀 형식 불일치).
+                logger.info(f"[PLR FOLLOW] event_id={event_id} 따라가던 박스 tid={fl['tid']}를 놓쳐 레이더 위치로 다시 찾습니다.")
+                fl["tid"] = None
+                fl["last_seen"] = now_m
             lost = now_m - fl["last_seen"] > self.PLR_FOLLOW_LOST_SEC
             if lost or now_m - fl["started"] > self.PLR_FOLLOW_MAX_SEC:
                 fl = self.plr_follow.pop(event_id)
                 request_fullres_capture(self, fl["event_name"], event_id, fl["event_fid"], fl["bbox"], fl["inference_shape"],
-                                        pts_window=fl["pts_window"], follow_boxes=fl["boxes"], evidence=fl.get("evidence"))
+                                        pts_window=fl["pts_window"], follow_boxes=fl["boxes"], evidence=fl.get("evidence"),
+                                        radar_path=fl.get("radar_path"), photo_m=fl.get("photo_m"))
 
     def _frame_meta_for_logic(self, fid):
         """과속 측정용 수신 PTS와 직전 처리 프레임 이후 건너뛴 프레임 수를 돌려줍니다."""
@@ -8543,6 +9177,8 @@ class Camera:
                         objects_meta=objects_meta,
                         event_id=event_id, event_ts=event_ts, api_event_type=api_event_type,
                         ocr_future=ocr_future,
+                        # 과속: 관제 사진은 번호판(원본 추출 뒤 PLR)을 읽은 뒤 regNo를 넣어 보냅니다.
+                        plate_future=plate_future_for(event_id) if ename == SPEEDING_EVENT and fullres_enabled(ename) else None,
                     )
                     if evidence_paths:
                         event_meta.update(evidence_paths)
@@ -8578,14 +9214,18 @@ class Camera:
                         # (ftid None) 레이더 트랙을 따라가다 박스가 붙는 순간부터 그 박스를 따라갑니다.
                         ftid = int(follow_obj['tid']) if follow_obj is not None else None
                         ev_pts = float(ev['fullres_window']['event_pts'])
-                        past = [b for b in self.track_boxes.get(ftid, []) if b[0] >= ev_pts - self.PLR_FOLLOW_MAX_SEC] \
+                        # 멀어지는 차는 가장 가까울 때가 판정보다 먼저라 판정 전 박스를 더 길게 씁니다.
+                        past_sec = self.PLR_FOLLOW_BACK_SEC if ev.get('direction') == 'backward' else self.PLR_FOLLOW_MAX_SEC
+                        past = [b for b in self.track_boxes.get(ftid, []) if b[0] >= ev_pts - past_sec] \
                             if ftid is not None else []
                         now_m = time.monotonic()
                         self.plr_follow[event_id] = {
                             "tid": ftid, "boxes": past, "started": now_m, "last_seen": now_m,
                             "radar_seq": decision_trace.get('radar_track_seq'), "radar_id": decision_trace.get('radar_id'),
                             "event_name": ename, "event_fid": event_fid, "bbox": bbox,
-                            "inference_shape": ev_frame.shape, "pts_window": ev.get('fullres_window'), "evidence": evidence}
+                            "inference_shape": ev_frame.shape, "pts_window": ev.get('fullres_window'), "evidence": evidence,
+                            # 판정 전 레이더 경로(박스가 끝내 안 붙은 차의 사진 구간용)와 방향별 사진 구간
+                            "radar_path": list(ev.get('radar_path') or []), "photo_m": ev.get('photo_m')}
                         fullres_dir = fullres_out_dir(self, ename, event_id)
                     else:
                         fullres_dir = request_fullres_capture(
@@ -9560,7 +10200,7 @@ def main():
             # 과속은 메인 V2 하나에서 사람·하반신·승용차·트럭(6번)을 모두 가져옵니다.
             # 점수 기준은 model_confidences.MAIN_V2(클래스별)이고 infer가 클래스마다 거릅니다.
             d_main_res = filter_speed_main_detections(event_models["MAIN_V2"].infer(fr),
-                                                      max_area_threshold=(h * w) * 0.5)
+                                                      max_area_threshold=(h * w) * SPEEDING_MAX_BOX_AREA_FRAC)
         if any(name in cam.events for name in PERSON_TOPDOWN_EVENTS):
             # Backreach 감시 OFF이고 YT 양하 감시 중도 아닌 동안은 초당 idle_infer_fps장만 추론하고,
             # 그 사이 프레임은 직전 검출을 다시 씁니다(Camera.backreach_inference_due).
