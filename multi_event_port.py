@@ -6286,6 +6286,9 @@ class PacketRing:
         return [e for e in PacketRing.read_list(gen_dir) if e[2] > t0 and e[1] <= t1]
 
 
+MPEGTS_PTS_WRAP_SEC = 2 ** 33 / 90000.0  # mpegts 시각(33비트, 90kHz)이 한 바퀴 도는 시간: 약 95443.7초(26.5시간)
+
+
 class FullResExtractor:
     """이벤트 구간 [t0, t1]의 원본 프레임을 링버퍼 세그먼트에서 디코딩해 이벤트 폴더에 저장합니다.
     카메라마다 워커 1개로 직렬 처리합니다(카메라끼리는 동시에). 한 건에 약 10~13초라, 워커 하나를 모든 카메라가
@@ -6421,11 +6424,30 @@ class FullResExtractor:
         meta["frames"] = [f for f in meta["frames"] if f["file"] in used]
         self._write_meta(out_dir, meta)
 
+    @staticmethod
+    def _clip_wrap_offset(clip, t0):
+        """clip.ts의 첫 영상 시각과 t0를 견줘, 파일 시각이 몇 바퀴(26.5시간 단위) 돌았는지를 초로 돌려줍니다.
+        돌지 않았거나 첫 시각을 못 읽으면 0.0."""
+        try:
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time",
+                 "-read_intervals", "%+#1", "-of", "csv=p=0", str(clip)],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=10).stdout
+            first = float(out.strip().splitlines()[0].split(",")[0])
+        except Exception:
+            return 0.0
+        return round((float(t0) - first) / MPEGTS_PTS_WRAP_SEC) * MPEGTS_PTS_WRAP_SEC
+
     def _decode(self, clip, job, frames_dir, use_hw):
         full_w, full_h = job["full_shape"][1], job["full_shape"][0]
         frame_size = full_w * full_h * 3 // 2
+        # clip.ts(mpegts) 안의 시각은 33비트라 약 26.5시간(MPEGTS_PTS_WRAP_SEC)마다 0으로 돌아갑니다. job의 t0·t1은
+        # 계속 늘어나는 시각이라, 카메라 연결이 26.5시간을 넘기면 둘이 한 바퀴(또는 여러 바퀴)만큼 어긋납니다.
+        # 파일 첫 시각으로 몇 바퀴 어긋났는지 구해, 고를 구간은 파일 시각으로 낮추고 결과 pts는 다시 올립니다.
+        wrap_offset = self._clip_wrap_offset(clip, job["t0"])
         # 두 번째 select의 n은 첫 select를 통과한 프레임만 셉니다 → 구간 안에서 every_n장마다 1장.
-        vf = f"select='between(t,{job['t0']:.6f},{job['t1']:.6f})',select='not(mod(n,{int(job['every_n'])}))'"
+        vf = (f"select='between(t,{job['t0'] - wrap_offset:.6f},{job['t1'] - wrap_offset:.6f})',"
+              f"select='not(mod(n,{int(job['every_n'])}))'")
         cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "info", "-copyts"]
         if use_hw:
             hw_device = str(SYS_CFG["video_decode"]["hw_device"]).strip()
@@ -6439,7 +6461,7 @@ class FullResExtractor:
             for raw_line in iter(pipe.readline, b""):
                 m = self._SHOWINFO_PTS_RE.search(raw_line.decode("utf-8", "replace"))
                 if m:
-                    pts_list.append(float(m.group(1)))
+                    pts_list.append(float(m.group(1)) + wrap_offset)
         quality = int(self.cfg["jpeg_quality"])
         written = []
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
