@@ -1,0 +1,27 @@
+
+# Exclude all JSON files
+*.json
+
+# Exclude all CSV files
+*.csv
+
+# Exclude all DXNN models
+*.dxnn
+
+# Exclude event outputs (photos, videos, logs)
+CCTV_EVENT_ALERT/
+
+# Exclude Codex backups
+.codex-backups/
+
+# Exclude all ONNX models
+*.onnx
+
+# Model comparison test script (not used by the integrated program)
+run_all.sh
+
+# Exclude Python cache
+__pycache__/
+
+# Exclude backup files (e.g. system_config.json.bak.<time> from install.sh)
+*.bak.*
