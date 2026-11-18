@@ -309,8 +309,9 @@ def load_system_config():
         },
         "event_config": {
             # 과속: 레이더 트랙 기준 판정. 트랙당 1회라 카메라 cooldown은 0입니다.
+            # 번호판은 모자이크하지 않습니다(blur_plate false: 판정 순간 사진·관제 사진 모두). 얼굴은 모자이크합니다.
             "speeding": {
-                "enabled": True, "cooldown_sec": 0, "api_event_type": 13, "blur_plate": True,
+                "enabled": True, "cooldown_sec": 0, "api_event_type": 13, "blur_face": True, "blur_plate": False,
                 "speed_limit_kmh": 30.0, "margin_kmh": 5.0, "margin_ratio": 0.0,
                 "min_span_sec": 1.0, "min_samples": 5, "min_quality": 0.0,
                 "track_timeout_sec": 1.0, "same_vehicle_guard_sec": 3.0, "same_vehicle_guard_m": 8.0,
@@ -7324,11 +7325,13 @@ def tail_search_box(box, inference_shape, grow=0.25):
 
 def write_api_scene(out_dir, full, inference_shape, plate_boxes, vehicle_box):
     """관제로 보낼 과속 사진(api_scene.jpg): 증거 사진과 같은 원본 프레임을 관제 사진 크기(추론 프레임)로 줄인 것.
-    번호판(plate_boxes, 원본 좌표)은 모자이크(apply_plate_blur와 같은 방식), 차량(vehicle_box, 원본 좌표)은 빨간 상자와
-    이벤트 이름(_draw_event_api_image). 반환 {"path", "box": 차량 상자(관제 사진 좌표), "size": [가로, 세로]}."""
+    번호판(plate_boxes, 원본 좌표)은 event_config.speeding.blur_plate가 true일 때만 모자이크(apply_plate_blur와 같은
+    방식, 기본 false라 안 함), 차량(vehicle_box, 원본 좌표)은 빨간 상자와 이벤트 이름(_draw_event_api_image).
+    반환 {"path", "box": 차량 상자(관제 사진 좌표), "size": [가로, 세로]}."""
     H, W = full.shape[:2]
     img = full.copy()
-    for x1, y1, x2, y2 in plate_boxes:
+    blur_plate = bool(SYS_CFG["event_config"][SPEEDING_EVENT].get("blur_plate", False))
+    for x1, y1, x2, y2 in (plate_boxes if blur_plate else ()):
         pw, ph = x2 - x1, y2 - y1
         x1, y1 = max(0, int(x1 - pw * 0.1)), max(0, int(y1 - ph * 0.1))
         x2, y2 = min(W, int(x2 + pw * 0.1)), min(H, int(y2 + ph * 0.1))
@@ -7759,7 +7762,7 @@ def _plr_on_fullres(out_dir, meta):
         row = {"frame": frame["file"], "pts": frame.get("pts"), "dt": frame.get("dt_from_event"),
                "det_ms": round(det_ms, 2), "plate": None, "mode": mode[frame["file"]],
                "vehicle_crop_full": [cx1, cy1, cx2, cy2],
-               # 이 프레임에서 찾은 번호판 전부(원본 좌표): 관제 사진(api_scene)에서 다른 차 번호판도 모자이크합니다.
+               # 이 프레임에서 찾은 번호판 전부(원본 좌표): blur_plate가 true면 관제 사진(api_scene)에서 다른 차 번호판도 모자이크합니다.
                "plates_all": [[int(cx1 + d[0]), int(cy1 + d[1]), int(cx1 + d[2]), int(cy1 + d[3])] for d in dets]}
         def in_view(d):
             return [(cx1 + d[0]) / sx, (cy1 + d[1]) / sy, (cx1 + d[2]) / sx, (cy1 + d[3]) / sy]
