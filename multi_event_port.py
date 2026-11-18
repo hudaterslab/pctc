@@ -272,6 +272,12 @@ def apply_class_confidences(model, model_key):
 RECEIVER_EVENT_NAMES = {10: "QC_APRON_HDS", 11: "YT_HEAD_CRUSH", 12: "BACKREACH_OBSTACLE", 13: "SPEED_VIOLATION",
                         14: "SEASIDE_DETECT", 15: "CONTAINER_CONE_DETECT"}
 
+# 관제 사이트(마법사 첫 단계에서 고름, receiver.site): {사이트: (표시 이름, 처음 고를 때 주소)}.
+# 두 관제의 API는 루트(/hjit/receiver, /pctc/receiver)만 다르고 같습니다(문서: <루트>/docs). 주소 뒤에 /img·/video·/roi/img·/health를 붙입니다.
+# PCTC면 PLC·CPS 정보도 받습니다(PlcCpsPoller). 주소는 마법사에서 고칠 수 있습니다.
+RECEIVER_SITES = {"hjit": ("HJIT(인천)", "http://100.105.106.40/hjit/receiver/api/v1/cctv"),
+                  "pctc": ("PCTC(평택)", "http://210.182.112.138/pctc/receiver/api/v1/cctv")}
+
 
 def deep_merge_dict(base, override):
     """딕셔너리를 깊은 병합(Deep Merge)하는 유틸리티 함수"""
@@ -289,11 +295,13 @@ def load_system_config():
         # 새 관제 receiver API. receiver.enabled를 켜고 crane_id, cctv_ids를 넣어야 전송합니다.
         "crane_id": "",
         "cctv_server_id": "1",
-        "receiver": {"enabled": False, "cctv_ids": [], "base_url": "https://dev.hjit.hudaters.net/hjit/receiver/api/v1/cctv"},
+        "receiver": {"enabled": False, "cctv_ids": [], "base_url": RECEIVER_SITES["hjit"][1]},
         "health_check": {"interval_sec": 60, "verify_tls": True},
         "event_api": {"verify_tls": True},
         "video_api": {"verify_tls": True, "timeout_sec": 60},
         "roi_snapshot": {"interval_sec": 3600, "verify_tls": True},
+        # PCTC 인터페이스 서버의 크레인 PLC·CPS 최신 값(문서: http://100.72.112.32:24000/docs). receiver.site가 pctc일 때만 받습니다.
+        "plc_cps": {"url": "http://100.72.112.32:24000/api/v1/edge/cpsPlc", "interval_sec": 1.0, "timeout_sec": 3.0},
         "system_performance": {
             "target_fps": 10.0,
             "dynamic_cpu_adjust_enabled": False,
@@ -1087,6 +1095,14 @@ def create_mosaic_image(images, screen_w=SCREEN_WIDTH, screen_h=SCREEN_HEIGHT):
 # ==========================================
 # [5] API 통신 및 이미지 저장
 # ==========================================
+def receiver_site():
+    """관제 사이트(hjit·pctc). 마법사가 receiver.site에 적고, 아직 없으면(예전 설정) 주소로 짐작합니다."""
+    site = str(SYS_CFG["receiver"].get("site") or "").strip().lower()
+    if site in RECEIVER_SITES:
+        return site
+    return "pctc" if "/pctc" in str(SYS_CFG["receiver"]["base_url"] or "") else "hjit"
+
+
 def receiver_url(config_key):
     suffixes = {"event_api": "/img", "video_api": "/video", "roi_snapshot": "/roi/img", "health_check": "/health"}
     base = str(SYS_CFG["receiver"]["base_url"] or "").strip().rstrip("/")
@@ -6533,6 +6549,36 @@ def save_event_groups(event_name, groups):
         logger.error(f"system_config.json에 묶음 저장 실패({event_name}): {e}")
 
 
+def wizard_receiver_site():
+    """마법사 첫 단계: 관제 사이트(HJIT·PCTC)와 receiver 주소를 정해 실행 중 설정(SYS_CFG)과 system_config.json에 씁니다.
+    주소 기본값은 사이트가 그대로면 지금 주소(현장에서 바꾼 주소를 지키려고), 바뀌면 RECEIVER_SITES의 주소입니다."""
+    current, sites = receiver_site(), list(RECEIVER_SITES)
+    print("\n[관제 사이트] " + "  ".join(f"{n}) {RECEIVER_SITES[s][0]}" for n, s in enumerate(sites, 1)))
+    while True:
+        ans = guarded_input(f">> 관제 사이트 번호 [엔터={RECEIVER_SITES[current][0]}]: ").strip()
+        if not ans or (ans.isdigit() and 1 <= int(ans) <= len(sites)):
+            site = sites[int(ans) - 1] if ans else current
+            break
+        print(f"   1~{len(sites)} 중에서 고르세요.")
+    base = str(SYS_CFG["receiver"]["base_url"] or "").strip()
+    default_url = base if site == current and base else RECEIVER_SITES[site][1]
+    while True:
+        url = guarded_input(f">> {RECEIVER_SITES[site][0]} 관제 주소 [엔터={default_url}]: ").strip() or default_url
+        if url.startswith(("http://", "https://")):
+            break
+        print("   http:// 또는 https://로 시작하는 주소를 넣으세요.")
+    SYS_CFG["receiver"].update(site=site, base_url=url)
+    try:
+        with open(CONFIG_COMMON_FILE, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+        cfg.setdefault("receiver", {}).update(site=site, base_url=url)
+        with open(CONFIG_COMMON_FILE, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, indent=4, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"system_config.json에 관제 사이트 저장 실패: {e}")
+    logger.info(f"[RECEIVER] site={site} base_url={url}" + (" (PLC·CPS 정보도 받음)" if site == "pctc" else ""))
+
+
 def run_wizard_groups(rtsp_list, configs):
     """마법사 마지막 단계: 묶음 이벤트(GROUP_EVENTS)를 고른 카메라가 2대 이상이면 묶음을 정합니다.
     번호는 마법사·관제(cctvId)와 같은 cameras.csv 순서 번호입니다. 기본값은 지금 묶음, 없으면 전부를 크레인 하나로."""
@@ -10311,6 +10357,57 @@ def get_npu_usage():
     used_gib = float(used) * {"KiB": 1 / 1048576, "MiB": 1 / 1024, "GiB": 1.0}[unit]
     return util, (used_gib, float(total), float(pct))
 
+# PCTC 크레인 PLC·CPS 최신 값(인터페이스 서버 GET plc_cps.url). 아직 이 값을 쓰는 이벤트가 없어, 값이 바뀔 때마다
+# 로그(파일·터미널)에 남기고 마지막 값만 여기에 둡니다. {"data": 응답 dict, "received_at": time.time()}
+PLC_CPS_LATEST = {"data": None, "received_at": None}
+
+
+class PlcCpsPoller:
+    def __init__(self, cfg):
+        self.url = str(cfg["url"]).strip()
+        self.interval = max(0.2, float(cfg["interval_sec"]))
+        self.timeout = max(0.5, float(cfg["timeout_sec"]))
+        self.running = True
+        self._failures = 0
+        self._last = None
+        self.thread = threading.Thread(target=self._run, name="plc-cps", daemon=True)
+        self.thread.start()
+
+    def _fetch(self):
+        response = requests.get(self.url, timeout=self.timeout)
+        response.raise_for_status()
+        data = response.json()  # 문서의 StandardResponse가 아니라 값들만 담긴 dict가 옵니다(lane, hoist_pos, ...)
+        if not isinstance(data, dict):
+            raise ValueError(f"JSON 객체가 아닙니다: {str(data)[:200]}")
+        return data
+
+    def _run(self):
+        logger.info(f"[PLC_CPS] 수신 시작 url={self.url} interval={self.interval:g}s")
+        while self.running:
+            started = time.monotonic()
+            try:
+                data = self._fetch()
+            except Exception as e:
+                self._failures += 1
+                if self._failures == 1:
+                    logger.warning(f"[PLC_CPS] 수신 실패(다시 될 때까지 남기지 않음): {e}")
+            else:
+                if self._failures:
+                    logger.info(f"[PLC_CPS] 수신 다시 됨 (연속 실패 {self._failures}회 뒤)")
+                    self._failures = 0
+                PLC_CPS_LATEST.update(data=data, received_at=time.time())
+                if data != self._last:
+                    self._last = data
+                    if all(v is None for v in data.values()):
+                        logger.info("[PLC_CPS] 데이터 없음 (모든 값 null: CPS·PLC가 아직 보내지 않음)")
+                    else:
+                        logger.info("[PLC_CPS] " + " ".join(f"{k}={v}" for k, v in data.items()))
+            time.sleep(max(0.0, self.interval - (time.monotonic() - started)))
+
+    def stop(self):
+        self.running = False
+
+
 class HealthCheckDaemon:
     def __init__(self, crane_id, version, interval_sec, cams, config_file=CONFIG_CAMERAS_FILE):
         self.crane_id = crane_id
@@ -10708,6 +10805,7 @@ def main():
             logger.info("기존 설정을 무시하고 터미널 마법사를 실행합니다.")
             run_wizard = True
     if run_wizard:
+        wizard_receiver_site()
         camera_configs = run_wizard_batch_mode(rtsp_list, camera_configs)
         try:
             with open(config_file, 'w', encoding='utf-8') as f:
@@ -10811,8 +10909,9 @@ def main():
     software_version = "v1.1.0"
 
     log_disk_health([("event_root", EVENT_ROOT_DIR), ("log_dir", LOG_DIR)])
-    logger.info(f"[RECEIVER] enabled={receiver_send_enabled()} craneId={crane_id} "
+    logger.info(f"[RECEIVER] site={receiver_site()} enabled={receiver_send_enabled()} craneId={crane_id} "
                 f"cctvIds={SYS_CFG['receiver']['cctv_ids']}")
+    plc_cps = PlcCpsPoller(SYS_CFG["plc_cps"]) if receiver_site() == "pctc" else None
     health_daemon = HealthCheckDaemon(
         crane_id,
         version=software_version,
@@ -11155,6 +11254,8 @@ def main():
         logger.error(f"[치명적 오류] {e}\n{traceback.format_exc()}")
     finally:
         health_daemon.stop()
+        if plc_cps is not None:
+            plc_cps.stop()
 
         for c in cams:
             c.reader.running = False
