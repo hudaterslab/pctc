@@ -300,8 +300,9 @@ def load_system_config():
         "event_api": {"verify_tls": True},
         "video_api": {"verify_tls": True, "timeout_sec": 60},
         "roi_snapshot": {"interval_sec": 3600, "verify_tls": True},
-        # PCTC 인터페이스 서버의 크레인 PLC·CPS 최신 값(문서: http://100.72.112.32:24000/docs). receiver.site가 pctc일 때만 받습니다.
-        "plc_cps": {"url": "http://100.72.112.32:24000/api/v1/edge/cpsPlc", "interval_sec": 1.0, "timeout_sec": 3.0},
+        # PCTC 인터페이스 서버의 크레인 PLC·CPS 최신 값(문서: http://<단말>:24000/docs). PCTC 단말마다 이 서버가 docker로
+        # 같이 떠 있어(포트 24000) 자기 자신에게 묻습니다. receiver.site가 pctc일 때만 받습니다.
+        "plc_cps": {"url": "http://localhost:24000/api/v1/edge/cpsPlc", "interval_sec": 1.0, "timeout_sec": 3.0},
         "system_performance": {
             "target_fps": 10.0,
             "dynamic_cpu_adjust_enabled": False,
