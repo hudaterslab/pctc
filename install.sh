@@ -4,8 +4,10 @@
 #   bash install.sh --config-only   : 관제 설정만 다시 합니다(크레인 ID, cameras.csv → cctv 번호). 카메라를 바꾼 뒤에 씁니다.
 #   CRANE_ID=1 bash install.sh      : 크레인 ID를 묻지 않고 이 값으로 넣습니다.
 # cctv 번호는 묻지 않습니다. 프로그램이 cameras.csv 줄 순서대로 1, 2, 3...을 붙이므로, 그 번호를 모두 관제 전송 대상으로 넣습니다.
-# 모델은 bash download.sh로 허깅페이스(HudatersU/port)에서 받습니다. 이 스크립트는 모델을 받지 않고 있는지만 확인합니다.
-# 실험 단계라 아직 넣지 않은 것(완성되면 추가): AI 프로그램 자동 실행 서비스(cctv_ai.service). 지금은 프로그램을 직접 실행합니다.
+# 모델은 download.sh로 허깅페이스(HudatersU/port)에서 받습니다(8단계에서 실행, 같은 파일은 건너뜀).
+# 설치가 끝나면 AI 프로그램이 부팅 때마다 백그라운드(화면 없이)로 자동 실행됩니다(port_cctv_ai.service, 10단계).
+#   상태: systemctl status port_cctv_ai     출력 보기: journalctl -u port_cctv_ai -f
+#   화면(--gui)으로 직접 실행하려면 먼저 멈추세요: sudo systemctl stop port_cctv_ai (같이 돌면 NPU 메모리가 넘칩니다)
 
 # 1. 사용자 및 경로 설정
 ACTUAL_USER=${SUDO_USER:-$USER}
@@ -14,7 +16,9 @@ USER_HOME=$(getent passwd "$ACTUAL_USER" | cut -d: -f6)
 # [수정] 스크립트가 실제 위치한 절대 경로를 동적으로 가져옵니다. (어느 위치에서 실행해도 무방함)
 PROJECT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
-AI_SERVICE_NAME="cctv_ai.service"
+AI_SERVICE_NAME="port_cctv_ai.service"
+AI_SERVICE_PATH="/etc/systemd/system/$AI_SERVICE_NAME"
+OLD_AI_SERVICE_NAME="cctv_ai.service"   # 예전 HAI 설치의 자동 실행 서비스(~/hai/multi_event.py), 10단계에서 지움
 NIC_STABILITY_SERVICE_NAME="hai-nic-stability.service"
 NIC_STABILITY_SERVICE_PATH="/etc/systemd/system/$NIC_STABILITY_SERVICE_NAME"
 NIC_STABILITY_SCRIPT_PATH="/usr/local/sbin/hai-nic-stability.sh"
@@ -385,10 +389,15 @@ if ensure_system_config; then
 fi
 
 echo "-----------------------------------------------------"
-echo " 8. 모델 파일 확인"
+echo " 8. 모델 받기·확인"
 echo "-----------------------------------------------------"
-# 모델은 bash download.sh로 허깅페이스(HudatersU/port)에서 받습니다. 여기서는 받지 않고,
-# system_config.json의 models가 이 폴더에 다 있는지만 봅니다.
+# 허깅페이스(HudatersU/port)에서 모델을 받습니다(download.sh). 같은 파일(sha256)은 건너뛰고, 내용이 다르면 허깅페이스
+# 것으로 바꿉니다. 받은 뒤 system_config.json의 models가 이 폴더에 다 있는지 봅니다.
+if [ -f "$PROJECT_DIR/download.sh" ]; then
+    as_user bash "$PROJECT_DIR/download.sh" || echo "⚠️ 모델 받기가 끝나지 않았습니다. 인터넷 연결을 확인하고 $PROJECT_DIR 에서 bash download.sh 를 다시 실행하세요."
+else
+    echo "⚠️ download.sh가 없어 모델을 받지 않았습니다: $PROJECT_DIR/download.sh"
+fi
 if ! python3 - "$SYS_CONFIG_FILE" "$PROJECT_DIR" << 'PY'
 import json
 import os
@@ -539,17 +548,65 @@ if [ -r /sys/class/powercap/intel-rapl-mmio:0/constraint_1_power_limit_uw ]; the
 fi
 
 echo "-----------------------------------------------------"
-echo " 10. AI 프로그램 자동 실행 서비스"
+echo " 10. AI 프로그램 자동 실행 서비스 ($AI_SERVICE_NAME)"
 echo "-----------------------------------------------------"
-# 부팅 때 프로그램을 백그라운드로 자동 실행하는 서비스(cctv_ai.service)는 실험 단계라 등록하지 않습니다(완성되면 추가).
-# 예전 설치로 이미 켜져 있는 서비스가 있으면 알려만 줍니다(직접 실행과 같이 돌면 NPU 메모리가 넘칩니다).
-if systemctl is-enabled --quiet "$AI_SERVICE_NAME" 2>/dev/null || systemctl is-active --quiet "$AI_SERVICE_NAME" 2>/dev/null; then
-    echo "⚠️ 예전 설치의 $AI_SERVICE_NAME 가 켜져 있습니다(부팅 때 자동 실행)."
-    echo "   끄려면: sudo systemctl disable --now $AI_SERVICE_NAME"
-else
-    echo "-> 자동 실행 서비스는 등록하지 않습니다. 프로그램은 직접 실행합니다:"
-    echo "   cd $PROJECT_DIR && python3 multi_event_port.py --gui"
+# 부팅 때마다 multi_event_port.py를 백그라운드(화면 없이, --gui 없음)로 실행하고, 꺼지면 15초 뒤 다시 켭니다.
+# 시작할 때 묻는 질문(CLI 디버그 출력, 설정 다시 하기)에는 엔터(기본값 = 아니오)를 넣습니다. 카메라 설정 마법사는 화면이
+# 필요하므로, cameras.json이 없으면 서비스가 시작하지 않습니다(먼저 --gui로 직접 실행해 마법사로 cameras.json을 만드세요).
+# 프로그램 로그는 지금처럼 CCTV_EVENT_ALERT/logs에 남고, 화면 출력은 journalctl -u port_cctv_ai 로 봅니다.
+# 예전 HAI 설치의 cctv_ai.service(~/hai/multi_event.py, 더 이상 안 씀)는 끄고 지웁니다(같이 돌면 NPU 메모리가 넘칩니다).
+if [ -f "/etc/systemd/system/$OLD_AI_SERVICE_NAME" ]; then
+    sudo systemctl disable --now "$OLD_AI_SERVICE_NAME" 2>/dev/null || true
+    sudo rm -f "/etc/systemd/system/$OLD_AI_SERVICE_NAME"
+    sudo systemctl daemon-reload
+    sudo systemctl reset-failed "$OLD_AI_SERVICE_NAME" 2>/dev/null || true
+    echo "-> 예전 자동 실행 서비스($OLD_AI_SERVICE_NAME)를 지웠습니다."
 fi
+
+sudo bash -c "cat > $AI_SERVICE_PATH" << EOL
+[Unit]
+Description=Port AI CCTV event detection (multi_event_port.py, background)
+Requires=dxrt.service
+After=network-online.target dxrt.service
+Wants=network-online.target
+ConditionPathExists=$TARGET_SCRIPT
+ConditionPathExists=$CAM_CSV_FILE
+ConditionPathExists=$CAM_CONFIG_FILE
+
+[Service]
+Type=simple
+User=$ACTUAL_USER
+WorkingDirectory=$PROJECT_DIR
+Environment=PYTHONUNBUFFERED=1 LANG=ko_KR.UTF-8
+# NPU·랜카드가 자리 잡을 때까지 잠깐 기다립니다.
+ExecStartPre=/bin/sleep 15
+ExecStart=/bin/bash -c 'yes "" | exec /usr/bin/python3 -u $TARGET_SCRIPT'
+Restart=always
+RestartSec=15
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOL
+
+sudo systemctl daemon-reload
+sudo systemctl enable "$AI_SERVICE_NAME"
+if pgrep -u "$ACTUAL_USER" -f "python3? .*multi_event_port\.py" > /dev/null && ! systemctl is-active --quiet "$AI_SERVICE_NAME"; then
+    # 직접 실행한 프로그램이 이미 돌고 있으면 지금은 켜지 않습니다(같이 돌면 NPU 메모리가 넘칩니다). 다음 부팅부터 자동 실행.
+    echo "⚠️ 직접 실행한 multi_event_port.py가 돌고 있어 서비스는 지금 켜지 않았습니다(다음 부팅부터 자동 실행)."
+    echo "   바로 서비스로 바꾸려면 직접 실행한 프로그램을 끈 뒤: sudo systemctl start $AI_SERVICE_NAME"
+elif [ ! -f "$CAM_CONFIG_FILE" ]; then
+    echo "⚠️ cameras.json이 없어 서비스가 시작하지 않습니다. 먼저 화면으로 직접 실행해 카메라 설정 마법사를 마치세요:"
+    echo "   cd $PROJECT_DIR && python3 multi_event_port.py --gui"
+    echo "   마법사가 끝나면 프로그램을 끄고: sudo systemctl start $AI_SERVICE_NAME"
+else
+    sudo systemctl restart "$AI_SERVICE_NAME"
+    echo "-> $AI_SERVICE_NAME 을 켰습니다(부팅 때마다 자동 실행)."
+fi
+echo "   상태: systemctl status $AI_SERVICE_NAME   출력: journalctl -u $AI_SERVICE_NAME -f"
+echo "   화면(--gui)으로 직접 실행할 때는 먼저 멈추세요: sudo systemctl stop $AI_SERVICE_NAME"
 
 sudo apt install -y openssh-server
 sudo systemctl enable ssh

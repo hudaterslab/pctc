@@ -117,6 +117,7 @@ from collections import Counter, deque, defaultdict
 import concurrent.futures
 import re
 import requests
+import socket
 import pytz
 from urllib.parse import urlsplit, quote
 from logging.handlers import TimedRotatingFileHandler, QueueHandler, QueueListener
@@ -151,13 +152,25 @@ WATCHDOG_TIMEOUT = 30.0
 # 과속 측정용 PTS 평활 구간(프레임 수). 카메라 PTS의 미세 흔들림을 평균으로 상쇄합니다.
 PTS_SMOOTH_WINDOW = 15
 
-# 메인 모델(hanjin_cctv_v2, 8개 클래스: 0 Helmet, 1 Head, 2 Person, 3 NormalVehicle, 4 LowerBody, 5 Signalman,
-# 6 TrunkLineTruck, 7 XBand) 중 과속 카메라가 쓰는 클래스 번호입니다. 나머지 클래스는 버립니다.
-ID_G_PERSON = 2       # person
-ID_G_CAR = 3          # normalvehicle
-ID_PERSON_LOW = 4     # lowerbody
-ID_G_TRUCK = 6        # trunklinetruck
+# 과속 카메라 모델(speeding.dxnn, models.MAIN_V2) 클래스 번호입니다. 사람·차량 번호는 다른 모델(topdown·side) 검출을
+# 사진 가리기에 넘길 때도 공통 번호로 씁니다.
+# 6·7번(사람·하반신)은 지금 모델(6클래스)에 없어 이름을 비워 둔 자리입니다. 사람·하반신이 든 8클래스 모델을 넣을 때
+# 이름을 채우고 model_confidences.MAIN_V2에 기준을 적으면 과속 사진의 얼굴 가리기가 다시 됩니다(그 전에는 사람 상자가
+# 없어 과속 사진은 얼굴을 가리지 않습니다).
+SPEEDING_CLASS_NAMES = ("trunklinetruck", "normalvehicle", "container", "reachstacker", "yardtruck", "plate", "", "")
+ID_G_TRUCK = 0        # trunklinetruck
+ID_G_CAR = 1          # normalvehicle
+ID_CONTAINER = 2      # container
+ID_REACHSTACKER = 3   # reachstacker
+ID_YARDTRUCK = 4      # yardtruck
+ID_PLATE = 5          # plate(쓰지 않음. 번호판은 plate.dxnn이 원본에서 찾습니다)
+ID_G_PERSON = 6       # person(지금 모델에는 없는 자리)
+ID_PERSON_LOW = 7     # lowerbody(지금 모델에는 없는 자리)
+# 과속 대상 차량: 레이더 점이 이 상자에 붙은 과속만 관제로 보냅니다.
 TARGET_VEHICLES = [ID_G_CAR, ID_G_TRUCK]
+# 과속 대상이 아닌 물체: 레이더 점이 이 상자에 붙으면 과속으로 보지 않습니다(야드트럭·리치스태커는 단속 대상이 아니고,
+# 컨테이너에 붙은 점은 레이더 값이 튄 것). 관제로 보내지 않고 ghost 폴더에 남깁니다(speeding_box_verdict).
+SPEEDING_EXCLUDED_CLASSES = (ID_CONTAINER, ID_REACHSTACKER, ID_YARDTRUCK)
 
 # ------------------------------------------------------------
 # 항만 이벤트: Backreach, 과속(speeding), 콘 미제거 출차(cone_ng), YT 헤드압착(yt_head_crush, yt_zone_person)
@@ -199,25 +212,19 @@ def check_topdown_class_count(count):
         logger.info(f"[MODEL] topdown 클래스 {count}개: {', '.join(names)}")
 
 
-# 메인 모델(hanjin_cctv_v2) 클래스 중 model_confidences에 이름으로 적을 수 있는 것(그 밖의 클래스는 번호로 적음).
-MAIN_CLASS_IDS = {"person": ID_G_PERSON, "normalvehicle": ID_G_CAR, "lowerbody": ID_PERSON_LOW,
-                  "trunklinetruck": ID_G_TRUCK}
 # side.dxnn(콘 카메라 화면) 클래스. 콘 NG 컨테이너(0·1), NG 사진 사람(3)을 씁니다.
 SIDE_CLASS_NAMES = ("container", "tank", "spreader", "person", "YT_HEADER")
 # container_ocr_detector.dxnn(컨테이너 번호 OCR의 글자 영역) 클래스. 0 BIC 컨테이너 번호, 1 TYPE 크기·형식 코드
 CONTAINER_OCR_DET_CLASS_NAMES = ("BIC", "TYPE")
-# 메인 V2를 뺀 모델의 클래스 이름(model_confidences에 이름으로 적음)
-MODEL_CLASS_NAMES = {TOPDOWN_MODEL: TOPDOWN_CLASS_NAMES, "FACE": ("face",), "PLATE": ("plate",), "SIDE": SIDE_CLASS_NAMES,
-                     "CONE": ("cone",), "CONTAINER_OCR_DET": CONTAINER_OCR_DET_CLASS_NAMES}
+# 모델의 클래스 이름(model_confidences에 이름으로 적음). 이름이 빈 칸은 아직 없는 클래스입니다(번호로는 적을 수 있음).
+MODEL_CLASS_NAMES = {"MAIN_V2": SPEEDING_CLASS_NAMES, TOPDOWN_MODEL: TOPDOWN_CLASS_NAMES, "FACE": ("face",),
+                     "PLATE": ("plate",), "SIDE": SIDE_CLASS_NAMES, "CONE": ("cone",),
+                     "CONTAINER_OCR_DET": CONTAINER_OCR_DET_CLASS_NAMES}
 
 
 def model_class_names(model_key):
-    """모델의 {클래스 번호: 이름}. topdown은 TOPDOWN_CLASS_NAMES, 메인 V2는 MAIN_CLASS_IDS에 있는 클래스만입니다."""
-    if model_key in MODEL_CLASS_NAMES:
-        return dict(enumerate(MODEL_CLASS_NAMES[model_key]))
-    if model_key == "MAIN_V2":
-        return {index: name for name, index in MAIN_CLASS_IDS.items()}
-    return {}
+    """모델의 {클래스 번호: 이름}(이름이 빈 칸은 뺌)."""
+    return {index: name for index, name in enumerate(MODEL_CLASS_NAMES.get(model_key, ())) if name}
 
 
 def model_class_ids(model_key):
@@ -386,7 +393,8 @@ def load_system_config():
                                    "blur_face": True, "blur_plate": False, "groups": {}}
         },
         # NPU 모델 7개. 키는 model_confidences·model_output_formats·model_engine_pool_sizes와 같습니다.
-        # - MAIN_V2(hanjin_cctv_v2): 과속. FACE(face): 사진 얼굴 가리기. PLATE(plate): 사진 번호판 가리기·과속 번호판 인식
+        # - MAIN_V2(speeding 640x384, SPEEDING_CLASS_NAMES): 과속 카메라의 차량·컨테이너·리치스태커·야드트럭.
+        #   FACE(face): 사진 얼굴 가리기. PLATE(plate): 사진 번호판 가리기·과속 번호판 인식
         # - TOPDOWN(topdown 1280x736, 9클래스): YT 헤드압착·사람 진입·Backreach
         # - SIDE(side 640x384, 5클래스: 0 container, 1 tank, 2 spreader, 3 person, 4 YT_HEADER): 콘 NG의 컨테이너(0·1),
         #   NG 사진 얼굴 가리기용 사람(3). 5클래스 모두 콘 카메라 화면에 그립니다.
@@ -395,7 +403,7 @@ def load_system_config():
         #   콘 NG가 처음 난 뒤에 올립니다(container_ocr).
         # side·cone은 raw 출력이어야 합니다(PPU는 장치에서 0.25 미만을 버려 콘 0.01 기준을 못 씀).
         "models": {
-            "MAIN_V2": "hanjin_cctv_v2.dxnn",
+            "MAIN_V2": "speeding.dxnn",
             "FACE": "face.dxnn",
             "PLATE": "plate.dxnn",
             "TOPDOWN": "topdown.dxnn",
@@ -405,16 +413,18 @@ def load_system_config():
         },
         # 모델별·클래스별 점수 기준. 모델마다 {"클래스": 기준}이고, 적지 않은 클래스는 버립니다(모델이 찾아도 쓰지 않음).
         # 클래스는 이름(대소문자 무관, model_class_names) 또는 번호("7")로 적습니다.
-        # - 메인 V2: 과속이 쓰는 사람·하반신 0.5, 승용차·트럭 0.6
+        # - 메인 V2(speeding): 승용차·트럭 0.6, 컨테이너·리치스태커·야드트럭 0.5. plate는 적지 않아 버립니다(번호판은
+        #   plate.dxnn). 사람·하반신(6·7번)은 모델에 들어오면 이름을 채우고 여기에 적습니다.
         # - topdown: 9클래스 모두 0.25(YT 헤드압착·사람 진입·Backreach가 같이 씀)
         # - side: 컨테이너·탱크 0.25, NG 사진 얼굴 가리기용 사람 0.5, 스프레더·YT_HEADER 0.25(화면 표시만, 판정에는 안 씀)
         # - cone: 콘 0.01
         # - container_ocr_detector: 컨테이너 번호 영역 BIC·TYPE 0.25
-        # - PPU 출력 모델(메인·얼굴)은 장치가 약 0.25 아래를 먼저 버려서 그보다 낮은 값은 효과가 없습니다.
+        # - PPU 출력 모델(얼굴)은 장치가 약 0.25 아래를 먼저 버려서 그보다 낮은 값은 효과가 없습니다.
         # 검출한 뒤의 판정 기준은 이벤트 설정에 따로 있습니다(콘 판정 cone_ng.logic container_conf 0.7·cone_conf 0.05,
         # 번호판 인식 plr.det_conf).
         "model_confidences": {
-            "MAIN_V2": {"person": 0.5, "lowerbody": 0.5, "normalvehicle": 0.6, "trunklinetruck": 0.6},
+            "MAIN_V2": {"trunklinetruck": 0.6, "normalvehicle": 0.6, "container": 0.5, "reachstacker": 0.5,
+                        "yardtruck": 0.5},
             "FACE": {"face": 0.35},
             "PLATE": {"plate": 0.1},
             "TOPDOWN": {name: 0.25 for name in TOPDOWN_CLASS_NAMES},
@@ -423,7 +433,7 @@ def load_system_config():
             "CONTAINER_OCR_DET": {"BIC": 0.25, "TYPE": 0.25}
         },
         "model_output_formats": {
-            "MAIN_V2": "ppu",
+            "MAIN_V2": "yolo",
             "FACE": "ppu",
             "PLATE": "yolo",
             "TOPDOWN": "yolo",
@@ -623,14 +633,15 @@ SPEEDING_MAX_BOX_AREA_FRAC = 0.9
 
 
 def filter_speed_main_detections(raw_dets, max_area_threshold):
-    """과속 카메라 메인 모델 검출에서 사람·하반신과 승용차·트럭만 남깁니다. 점수 기준(model_confidences.MAIN_V2
+    """과속 카메라 메인 모델 검출에서 승용차·트럭, 컨테이너·리치스태커·야드트럭, 사람·하반신만 남깁니다(plate는 버림).
+    점수 기준(model_confidences.MAIN_V2
     클래스별)은 infer가 이미 걸렀습니다."""
     rows = []
     for d in raw_dets:
         # BBox 면적이 max_area_threshold(화면의 SPEEDING_MAX_BOX_AREA_FRAC)를 넘는 거대 객체(비/IR 노이즈 등) 차단
         if (float(d[2]) - float(d[0])) * (float(d[3]) - float(d[1])) > max_area_threshold:
             continue
-        if int(d[5]) in (ID_G_PERSON, ID_PERSON_LOW, *TARGET_VEHICLES):
+        if int(d[5]) in (ID_G_PERSON, ID_PERSON_LOW, *TARGET_VEHICLES, *SPEEDING_EXCLUDED_CLASSES):
             rows.append(d)
     return detection_array(rows)
 
@@ -1132,6 +1143,266 @@ def receiver_event_send_allowed(cctv_id, event_name):
     return not (isinstance(flags, dict) and flags.get(event_name) is False)
 
 
+# cameras.json 카메라별 receiver_event_off_hours {이벤트 이름: ["17:30", "08:00"]}(시작, 끝): 이 시간대에 난 이벤트는
+# 판정·녹화·번호판 읽기는 그대로 하고 관제 전송(사진·영상)만 막습니다. 시작 시각부터 끝 시각 직전까지이고, 시작이 끝보다
+# 늦으면 자정을 넘깁니다(17:30~다음 날 08:00). 보내는 시각이 아니라 이벤트 시각(KST)으로 봅니다. 이 값이 없는 이벤트는
+# 항상 보냅니다. 마법사가 과속을 고른 카메라에 기본값(RECEIVER_OFF_HOURS_DEFAULT)을 적고, 사람이 고칩니다.
+RECEIVER_OFF_HOURS_DEFAULT = {SPEEDING_EVENT: ["17:30", "08:00"]}
+# {str(cctv_id): {이벤트 이름: (시작 분, 끝 분)}} — Camera가 설정을 읽을 때마다 채웁니다.
+RECEIVER_OFF_HOURS_BY_CAM = {}
+
+
+def _clock_minutes(text):
+    """"17:30" → 자정부터 센 분(1050)."""
+    hour, minute = (int(part) for part in str(text).split(":"))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"{text!r}은 00:00~23:59 밖")
+    return hour * 60 + minute
+
+
+def wizard_receiver_off_hours(events, old_hours):
+    """마법사가 cameras.json에 적을 receiver_event_off_hours: 고른 이벤트 중 기본값이 있는 것(과속)에 기본값을 적고,
+    전에 적어 둔 값이 있으면 그 값을 둡니다. 고르지 않은 이벤트 것은 뺍니다."""
+    hours = {name: list(value) for name, value in RECEIVER_OFF_HOURS_DEFAULT.items() if name in events}
+    if isinstance(old_hours, dict):
+        hours.update({name: value for name, value in old_hours.items() if name in events})
+    return hours
+
+
+def parse_receiver_off_hours(conf, label):
+    """카메라 설정의 receiver_event_off_hours를 {이벤트 이름: (시작 분, 끝 분)}으로 바꿉니다. 잘못 적은 값은 경고하고
+    뺍니다(그 이벤트는 항상 보냄)."""
+    parsed = {}
+    for name, value in ((conf or {}).get("receiver_event_off_hours") or {}).items():
+        try:
+            start, end = (_clock_minutes(text) for text in value)
+        except (TypeError, ValueError) as error:
+            logger.warning(f"[{label}] receiver_event_off_hours.{name} 값 {value!r}을 읽지 못해 관제 전송을 끄지 않습니다"
+                           f'(["17:30", "08:00"]처럼 적으세요): {error}')
+            continue
+        parsed[name] = (start, end)
+    return parsed
+
+
+def receiver_event_off_hours(cctv_id, event_name, when):
+    """when(datetime, KST)이 그 카메라·이벤트의 관제 전송 꺼짐 시간대 안이면 True."""
+    window = (RECEIVER_OFF_HOURS_BY_CAM.get(str(cctv_id)) or {}).get(event_name)
+    if not window:
+        return False
+    start, end = window
+    minute = when.hour * 60 + when.minute
+    if start <= end:
+        return start <= minute < end
+    return minute >= start or minute < end
+
+
+# 현장 IP 스피커 방송. cameras.json 카메라별 ip_speaker(스피커 주소, 예 "172.16.45.97")와 sound(경고 음성 파일 경로,
+# ffmpeg이 읽는 형식이면 wav·mp3·mp4 등 모두. 상대 경로는 프로젝트 폴더 기준)가 둘 다 적혀 있으면 과속 판정 때 그 스피커로
+# 음성을 한 번 냅니다. 하나라도 "none"(기본값, 마법사가 과속 카메라에 적음)이면 방송 없이 이벤트만 냅니다.
+# 방송은 같은 카메라의 speaker_enable이 true일 때만 합니다(기본값 false, 마법사가 과속 카메라에 false로 적음).
+# 주소와 음성을 적어 둔 채로 speaker_enable만 바꿔 방송을 켜고 끕니다.
+# 레이더 가짜 물체와 관제 전송 꺼짐 시간대(receiver_event_off_hours)의 이벤트는 방송하지 않습니다.
+# 스피커(Inter-M IP-1015HS)에는 계정·교환기 없이 SIP 전화를 직접 걸어(sip:<주소>) 음성을 G.711(PCMU) RTP로 보냅니다.
+# 스피커 SIP 계정을 가려야 하면 ip_speaker를 "97@172.16.45.97"처럼 적습니다.
+SITE_SOUND_NONE = "none"
+SITE_SOUND_MAX_SEC = 60.0     # 음성 한 번의 최대 길이(초). 더 긴 파일은 여기서 끊습니다.
+SITE_SOUND_BY_CAM = {}        # {str(cctv_id): (스피커 주소, 음성 파일)} — Camera가 설정을 읽을 때마다 채웁니다(방송 안 하면 None).
+SITE_SOUND_BUSY = set()       # 지금 방송 중인 스피커 주소. 방송이 끝나기 전에 난 이벤트는 방송하지 않습니다.
+SITE_SOUND_LOCK = threading.Lock()
+SIP_COMPACT_HEADERS = {"v": "via", "f": "from", "t": "to", "i": "call-id", "m": "contact", "l": "content-length",
+                       "c": "content-type"}
+
+
+def wizard_site_sound(events, old_conf):
+    """마법사가 cameras.json에 적을 speaker_enable·ip_speaker·sound: 과속을 고른 카메라에 묻지 않고 false·"none"·"none"으로
+    적어 둡니다(사람이 나중에 채움). 전에 적어 둔 값은 그대로 둡니다. 과속을 고르지 않은 카메라에는 적지 않습니다."""
+    if SPEEDING_EVENT not in events:
+        return {}
+    old_conf = old_conf or {}
+    return {"speaker_enable": old_conf.get("speaker_enable") is True,
+            **{key: old_conf.get(key) or SITE_SOUND_NONE for key in ("ip_speaker", "sound")}}
+
+
+def site_sound_conf(conf):
+    """카메라 설정의 ip_speaker·sound → (스피커 주소, 음성 파일 절대 경로). speaker_enable이 true가 아니거나, 주소·음성이
+    하나라도 없거나 "none"이면 None(방송 안 함)."""
+    if (conf or {}).get("speaker_enable") is not True:
+        return None
+    speaker, sound = (str(conf.get(key) or "").strip() for key in ("ip_speaker", "sound"))
+    if not speaker or not sound or SITE_SOUND_NONE in (speaker.lower(), sound.lower()):
+        return None
+    return speaker, sound if os.path.isabs(sound) else os.path.join(PROJECT_ROOT, sound)
+
+
+def sip_parse(data):
+    """SIP 메시지 → (첫 줄, {소문자 헤더 이름: 값}, 본문). 줄임 헤더 이름(v·f·t·i·m·l·c)은 긴 이름으로 바꿉니다."""
+    head, _, body = data.decode("utf-8", "replace").partition("\r\n\r\n")
+    lines = head.split("\r\n")
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        name = name.strip().lower()
+        headers.setdefault(SIP_COMPACT_HEADERS.get(name, name), value.strip())
+    return lines[0], headers, body
+
+
+def site_sound_call(speaker, sound, tag, connect_timeout=10.0):
+    """스피커에 SIP 전화를 걸어 음성 파일을 한 번 틀고 끊습니다. 방송을 끝까지 보냈으면 True."""
+    target = speaker[4:] if speaker.lower().startswith("sip:") else speaker
+    host, _, port = target.rsplit("@", 1)[-1].partition(":")
+    uri = f"sip:{target}"
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    player = None
+    try:
+        sock.connect((host, int(port or 5060)))
+        local_ip, local_port = sock.getsockname()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.bind((local_ip, 0))
+            rtp_port = probe.getsockname()[1]          # ffmpeg이 RTP를 내보낼 우리 쪽 포트
+        call_id, from_tag = os.urandom(12).hex(), os.urandom(4).hex()
+        from_header = f"<sip:pctc@{local_ip}>;tag={from_tag}"
+
+        def request(method, cseq, request_uri, to_header, branch, body=""):
+            lines = [f"{method} {request_uri} SIP/2.0",
+                     f"Via: SIP/2.0/UDP {local_ip}:{local_port};branch=z9hG4bK{branch};rport",
+                     "Max-Forwards: 70", f"From: {from_header}", f"To: {to_header}", f"Call-ID: {call_id}",
+                     f"CSeq: {cseq} {method}", f"Contact: <sip:pctc@{local_ip}:{local_port}>", "User-Agent: pctc"]
+            if body:
+                lines.append("Content-Type: application/sdp")
+            lines.append(f"Content-Length: {len(body.encode())}")
+            sock.send(("\r\n".join(lines) + "\r\n\r\n" + body).encode())
+
+        session = int(time.time())
+        sdp = "\r\n".join(["v=0", f"o=pctc {session} {session} IN IP4 {local_ip}", "s=pctc", f"c=IN IP4 {local_ip}", "t=0 0",
+                           f"m=audio {rtp_port} RTP/AVP 0", "a=rtpmap:0 PCMU/8000", "a=ptime:20"]) + "\r\n"
+        invite_branch = os.urandom(6).hex()
+        request("INVITE", 1, uri, f"<{uri}>", invite_branch, sdp)
+
+        # 1. 스피커가 받을 때까지(200 OK). 응답이 전혀 없으면 INVITE를 다시 보냅니다.
+        deadline, resend_at, resend_gap, answered = time.monotonic() + connect_timeout, time.monotonic() + 0.5, 0.5, False
+        status, headers, body = 0, {}, ""
+        while time.monotonic() < deadline:
+            sock.settimeout(max(0.05, min(resend_at, deadline) - time.monotonic()))
+            try:
+                first, headers, body = sip_parse(sock.recv(8192))
+            except socket.timeout:
+                if not answered and time.monotonic() >= resend_at:
+                    request("INVITE", 1, uri, f"<{uri}>", invite_branch, sdp)
+                    resend_gap = min(resend_gap * 2, 4.0)
+                    resend_at = time.monotonic() + resend_gap
+                continue
+            if not first.startswith("SIP/2.0 ") or " INVITE" not in headers.get("cseq", ""):
+                continue
+            answered, resend_at = True, deadline
+            status = int(first.split()[1])
+            if status >= 200:
+                break
+        if status < 200:
+            if answered:
+                request("CANCEL", 1, uri, f"<{uri}>", invite_branch)
+            logger.warning(f"[SITE SOUND] 스피커가 전화를 받지 않습니다({'울리기만 함' if answered else '응답 없음'}). {tag}")
+            return False
+        if status >= 300:
+            request("ACK", 1, uri, headers.get("to", f"<{uri}>"), invite_branch)
+            logger.warning(f"[SITE SOUND] 스피커가 전화를 거절했습니다(SIP {status}). {tag}")
+            return False
+        to_header = headers.get("to", f"<{uri}>")
+        contact = re.search(r"<([^>]+)>", headers.get("contact", ""))
+        dialog_uri = contact.group(1) if contact else uri
+        ack_branch = os.urandom(6).hex()
+        request("ACK", 1, dialog_uri, to_header, ack_branch)
+        audio = re.search(r"^m=audio (\d+) ", body, re.M)
+        address = re.search(r"^c=IN IP4 (\S+)", body, re.M)
+        if not audio:
+            request("BYE", 2, dialog_uri, to_header, os.urandom(6).hex())
+            logger.warning(f"[SITE SOUND] 스피커 응답에 음성 포트가 없어 끊습니다. {tag}")
+            return False
+
+        # 2. 음성 파일을 G.711(PCMU) 20ms RTP로 실시간 속도에 맞춰 보냅니다.
+        player = subprocess.Popen(
+            ["ffmpeg", "-nostdin", "-loglevel", "error", "-re", "-i", sound, "-vn", "-t", str(SITE_SOUND_MAX_SEC),
+             "-af", "aresample=8000,asetnsamples=n=160:p=0", "-ac", "1", "-c:a", "pcm_mulaw", "-f", "rtp",
+             f"rtp://{address.group(1) if address else host}:{audio.group(1)}?localrtpport={rtp_port}&pkt_size=172"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        hung_up = False
+        sock.settimeout(0.2)
+        while player.poll() is None:
+            try:
+                first, headers, _ = sip_parse(sock.recv(8192))
+            except socket.timeout:
+                continue
+            if first.startswith("SIP/2.0 200") and " INVITE" in headers.get("cseq", ""):
+                request("ACK", 1, dialog_uri, to_header, ack_branch)      # 200 OK가 다시 왔으면 ACK를 다시 보냄
+            elif first.startswith("BYE "):
+                # 스피커가 먼저 끊음(최대 통화 시간 등): 200 OK로 답하고 보내기를 멈춥니다.
+                reply = ["SIP/2.0 200 OK"] + [f"{name}: {headers[key]}" for name, key in
+                                              (("Via", "via"), ("From", "from"), ("To", "to"), ("Call-ID", "call-id"),
+                                               ("CSeq", "cseq")) if key in headers] + ["Content-Length: 0"]
+                sock.send(("\r\n".join(reply) + "\r\n\r\n").encode())
+                hung_up = True
+                player.terminate()
+        error = (player.stderr.read() or b"").decode("utf-8", "replace").strip()
+        code = player.wait()
+        if not hung_up:
+            time.sleep(0.3)   # 마지막 소리가 스피커에서 다 나오게 잠깐 두고 끊습니다.
+            request("BYE", 2, dialog_uri, to_header, os.urandom(6).hex())
+            sock.settimeout(1.0)
+            try:
+                sock.recv(8192)
+            except socket.timeout:
+                pass
+        if hung_up or code != 0:
+            logger.warning(f"[SITE SOUND] 방송이 중간에 끝났습니다({'스피커가 끊음' if hung_up else f'ffmpeg {code}: {error[-300:]}'}). {tag}")
+            return False
+        return True
+    except Exception as error:
+        logger.warning(f"[SITE SOUND] 방송 실패: {error}. {tag}")
+        return False
+    finally:
+        if player is not None and player.poll() is None:
+            player.kill()
+        sock.close()
+
+
+def _site_sound_worker(speaker, sound, tag):
+    started = time.monotonic()
+    try:
+        if site_sound_call(speaker, sound, tag):
+            logger.info(f"[SITE SOUND] 방송 끝({time.monotonic() - started:.1f}초). {tag}")
+    finally:
+        with SITE_SOUND_LOCK:
+            SITE_SOUND_BUSY.discard(speaker)
+
+
+def play_site_sound(cctv_id, event_name, event_id, collected_at, ghost=False):
+    """이 카메라에 현장 스피커 방송이 설정돼 있으면(ip_speaker·sound) 별도 스레드로 음성을 냅니다(이벤트 처리를 붙잡지 않음).
+    방송을 시작했으면 True. 설정이 없으면 아무것도 하지 않고, 방송하지 않는 이유가 있으면 로그만 남깁니다."""
+    conf = SITE_SOUND_BY_CAM.get(str(cctv_id))
+    if not conf:
+        return False
+    speaker, sound = conf
+    tag = f"event_id={event_id} cam={cctv_id} speaker={speaker} sound={os.path.basename(sound)}"
+    reason = None
+    if ghost:
+        reason = "레이더 가짜 물체"
+    elif receiver_event_off_hours(cctv_id, event_name, datetime.datetime.fromisoformat(str(collected_at))):
+        reason = "관제 전송 꺼짐 시간대"
+    elif not os.path.isfile(sound):
+        reason = f"음성 파일 없음({sound})"
+    else:
+        with SITE_SOUND_LOCK:
+            if speaker in SITE_SOUND_BUSY:
+                reason = "앞 방송이 아직 안 끝남"
+            else:
+                SITE_SOUND_BUSY.add(speaker)
+    if reason:
+        logger.info(f"[SITE SOUND] 방송하지 않습니다({reason}). {tag}")
+        return False
+    logger.info(f"[SITE SOUND] 방송 시작. {tag}")
+    threading.Thread(target=_site_sound_worker, args=(speaker, sound, tag), daemon=True, name="site-sound").start()
+    return True
+
+
 def _send_receiver_file(file_path, file_field, config_key, event_meta, extra_fields=None):
     """녹화/저장이 완료된 파일만 보내고 HTTP 및 업무 처리 결과를 함께 확인합니다."""
     config = SYS_CFG[config_key]
@@ -1149,6 +1420,9 @@ def _send_receiver_file(file_path, file_field, config_key, event_meta, extra_fie
         reason = "missing_event_identity"
     elif event_meta.get("api_event_type") is None:
         reason = "unknown_event_type"
+    elif receiver_event_off_hours(event_meta.get("cctv_id"), event_meta.get("event_name"),
+                                  datetime.datetime.fromisoformat(str(event_meta["collected_at"]))):
+        reason = "event_off_hours"  # cameras.json receiver_event_off_hours 시간대에 난 이벤트: 전송만 막음(판정·저장은 했음)
     if reason:
         logger.debug("[API SKIP] event_id=%s kind=%s reason=%s", event_id, file_field, reason)
         append_event_audit_record(audit, stage=stage, status="skipped", extra={"reason": reason})
@@ -3022,13 +3296,15 @@ def box_band_in_roi(t, roi_poly):
 
 
 def associate_radar_tracks(tracks, track_map, radar_rows, project, gate_px, extra_tracks=None, frame_shape=None,
-                           focal_px=None, roi_poly=None):
+                           focal_px=None, roi_poly=None, classes=TARGET_VEHICLES):
     """투영한 레이더 점과 차량 박스(하단 띠, box_point_distance)의 거리가 gate_px 이내인 쌍을 가까운 순으로 1:1 매칭합니다.
     extra_tracks: tracks(움직이는 차량)와 짝이 안 된 점은, 정지로 보였던 박스라도 점이 하단 띠 안에 있으면 연결
     (멀리서 천천히 다가오는 큰 차는 박스가 거의 안 움직여 정지로 오판되기 때문).
     frame_shape: 주면 화면 밖으로 투영된 점(센서 옆을 지나가는 차 등)은 연결하지 않습니다.
     focal_px: 주면 박스 크기가 레이더 거리와 맞지 않는 쌍은 연결하지 않습니다(size_consistent).
     roi_poly: 주면(추론 프레임 px 다각형, 단속 차로) 하단 띠가 ROI에 걸친 박스만 연결합니다(box_band_in_roi).
+    classes: 연결할 박스 클래스(기본 과속 대상 차량). 과속 판정은 RADAR_BOX_CLASSES(대상이 아닌 물체 포함)를 넘겨,
+    레이더 점이 컨테이너 등에 더 가까우면 차량 대신 그 박스에 붙게 합니다.
     반환: {rgb tid: (row, (u, v))}, 그리고 모든 행의 투영점 [(row, (u, v))]."""
     projected = []
     for row in radar_rows:
@@ -3045,7 +3321,7 @@ def associate_radar_tracks(tracks, track_map, radar_rows, project, gate_px, extr
         out = []
         for t in cands:
             tid = int(t[4])
-            if track_map.get(tid) not in TARGET_VEHICLES:
+            if track_map.get(tid) not in classes:
                 continue
             if roi_poly is not None and not box_band_in_roi(t, roi_poly):
                 continue
@@ -3157,7 +3433,7 @@ def vote_event_track(ev, votes, offset):
     t0 = float(ev['window_arrival'][0]) + offset - 0.5
     t1 = float(ev['decision_arrival']) + offset + 0.2
     counts = {}
-    for ct, rid, tid in list(votes):
+    for ct, rid, tid, _ in list(votes):
         if rid == ev['radar_id'] and t0 <= ct <= t1:
             counts[tid] = counts.get(tid, 0) + 1
     if not counts:
@@ -3166,6 +3442,32 @@ def vote_event_track(ev, votes, offset):
     if n >= 3 and n / float(sum(counts.values())) >= 0.6:
         return tid, counts
     return None, counts
+
+
+# 과속 판정에서 레이더 점을 붙여 보는 박스: 과속 대상 차량 + 대상이 아닌 물체
+RADAR_BOX_CLASSES = (*TARGET_VEHICLES, *SPEEDING_EXCLUDED_CLASSES)
+
+
+def speeding_box_verdict(assoc_tid, counts, class_of):
+    """레이더 과속 이벤트에 붙은 박스로 관제에 보낼지 정합니다.
+    assoc_tid: 다수결·한 프레임 연결로 고른 박스(없으면 None), counts: 판정 구간 {박스 tid: 붙은 프레임 수},
+    class_of(tid): 그 박스의 클래스 번호.
+    - 고른 박스가 승용차·트럭이면 그 차의 과속입니다(보냄).
+    - 고른 박스가 컨테이너·리치스태커·야드트럭이면 과속으로 보지 않습니다(안 보냄, 그 이름을 돌려줌).
+    - 고른 박스가 없으면, 판정 구간에 차량 박스가 GHOST_MIN_BOX_FRAMES 프레임 이상 붙었을 때만 차가 있었던 것으로
+      봅니다. 아무 박스도 없으면 레이더 가짜 물체입니다(안 보냄).
+    반환 (과속 차량 박스 tid 또는 None, 대상이 아닌 물체 이름 또는 None, 차량 박스 프레임 수,
+          대상이 아닌 박스 프레임 수, 보낼 차가 있었는지)."""
+    target = max((n for tid, n in counts.items() if class_of(tid) in TARGET_VEHICLES), default=0)
+    others = {tid: n for tid, n in counts.items() if class_of(tid) in SPEEDING_EXCLUDED_CLASSES}
+    other = max(others.values(), default=0)
+    excluded = None
+    if assoc_tid is not None and class_of(assoc_tid) in SPEEDING_EXCLUDED_CLASSES:
+        excluded, assoc_tid = SPEEDING_CLASS_NAMES[class_of(assoc_tid)], None
+    elif assoc_tid is None and target < GHOST_MIN_BOX_FRAMES <= other:
+        excluded = SPEEDING_CLASS_NAMES[class_of(max(others, key=others.get))]
+    has_vehicle = excluded is None and (assoc_tid is not None or target >= GHOST_MIN_BOX_FRAMES)
+    return assoc_tid, excluded, target, other, has_vehicle
 
 
 class SpeedingDetector(BaseEventDetector):
@@ -3209,7 +3511,8 @@ class SpeedingDetector(BaseEventDetector):
                                                         if frame is not None else None,
                                                         focal_px=projection_focal_px(frame.shape if frame is not None else None,
                                                                                      kwargs.get('radar_camera_cfg')),
-                                                        roi_poly=self.roi_poly if len(self.roi_poly) >= 3 else None)
+                                                        roi_poly=self.roi_poly if len(self.roi_poly) >= 3 else None,
+                                                        classes=RADAR_BOX_CLASSES)
                     if matched:
                         single = next(iter(matched))
             voted, counts = vote_event_track(ev, votes, offset)
@@ -3221,6 +3524,14 @@ class SpeedingDetector(BaseEventDetector):
                 assoc_tid, method = single, "frame"
             elif single is not None:
                 method = "conflict"
+            # 붙은 박스가 과속 대상(승용차·트럭)인지 봅니다. 컨테이너·리치스태커·야드트럭이면 과속으로 보지 않습니다.
+            # 박스 클래스는 지금 화면의 박스(track_map), 화면에서 사라진 박스는 표에 적어 둔 클래스로 압니다.
+            vote_class = {int(v[2]): int(v[3]) for v in list(votes or [])}
+            assoc_tid, excluded_class, box_frames, other_frames, has_vehicle = speeding_box_verdict(
+                assoc_tid, counts, lambda box_tid: track_map.get(box_tid, vote_class.get(box_tid)))
+            if excluded_class:
+                logger.info(f"[RADAR SPEEDING] R{ev['radar_id']} seq={ev['seq']} {ev['median_kmh']:.1f}km/h는 레이더 점이 "
+                            f"{excluded_class} 상자에 붙어({other_frames}프레임) 과속으로 보지 않습니다.")
             if assoc_tid is not None:
                 # 같은 차 박스: same_vehicle_guard_sec 안에 이 카메라에서 같은 차 박스에 붙어 과속을 낸 레이더 점이 있으면
                 # 속도·간격이 달라도 같은 차(레이더가 트럭 앞쪽·컨테이너를 둘로 잡음). 차 검출 박스 하나가 차 한 대라는 전제.
@@ -3291,15 +3602,17 @@ class SpeedingDetector(BaseEventDetector):
                     'threshold_kmh': ev['threshold_kmh'],
                     'radar_sensor_ts': ev['sensor_ts'], 'radar_x_m': round(ev['x_m'], 2), 'radar_y_m': round(ev['y_m'], 2),
                     'camera_association': 'matched' if assoc_track is not None else (
-                        'no_calibration' if project is None else ('conflict' if method == 'conflict' else 'no_match')),
+                        'no_calibration' if project is None else (
+                            'excluded' if excluded_class else ('conflict' if method == 'conflict' else 'no_match'))),
                     'camera_tid': assoc_tid,
                     'assoc_method': method, 'assoc_votes': {str(k): v for k, v in counts.items()},
                     'assoc_single_frame': single,
                     # 판정 구간 동안 이 레이더 점에 차량 박스가 붙은 프레임 수와, 차가 있었는지(레이더 가짜 판단,
                     # radar_ghost_check). 보정값이 없으면(투영 불가) 알 수 없어 None.
-                    'vehicle_box_frames': max(counts.values(), default=0),
-                    'vehicle_box': None if project is None else (
-                        assoc_track is not None or max(counts.values(), default=0) >= GHOST_MIN_BOX_FRAMES),
+                    'vehicle_box_frames': box_frames,
+                    'vehicle_box': None if project is None else has_vehicle,
+                    # 레이더 점이 과속 대상이 아닌 물체에 붙었으면 그 이름(container·reachstacker·yardtruck)과 붙은 프레임 수
+                    'excluded_class': excluded_class, 'excluded_box_frames': other_frames,
                     'latency_offset_sec': offset,
                     'radar_source': 'umrr11_t132_mse_live',
                 }
@@ -4586,7 +4899,7 @@ def topdown_privacy_tracks(t_topdown):
 
 def event_model_keys(events):
     """설정된 이벤트가 쓰는 메인·Backreach 모델 키입니다(NPU에 올릴 모델).
-    과속: 메인 V2(사람·하반신·승용차·트럭). Backreach·YT: topdown(같은 엔진을 같이 씀).
+    과속: 메인 V2(speeding.dxnn: 승용차·트럭·컨테이너·리치스태커·야드트럭). Backreach·YT: topdown(같은 엔진을 같이 씀).
     콘 NG의 side·cone 모델은 ConeObserver가 올립니다(NG 사진 블러용 사람도 side). 매 프레임 돌리는 것은
     main의 run_camera_inference입니다."""
     keys = []
@@ -6142,6 +6455,17 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                         kept_status = {name: on for name, on in old_status.items() if name in events}
                         if kept_status:
                             configs[ip]["receiver_event_status"] = kept_status
+                    # 관제 전송 꺼짐 시간대(receiver_event_off_hours): 과속을 고르면 기본값 17:30~08:00을 적고, 전에 적어 둔
+                    # 값은 그대로 둡니다.
+                    off_hours = wizard_receiver_off_hours(events, old_conf.get("receiver_event_off_hours"))
+                    # 현장 스피커 방송(speaker_enable·ip_speaker·sound): 과속 카메라에 묻지 않고 false·"none"·"none"으로 적어
+                    # 둡니다(사람이 나중에 채움).
+                    configs[ip].update(wizard_site_sound(events, old_conf))
+                    if off_hours:
+                        configs[ip]["receiver_event_off_hours"] = off_hours
+                        print(f"[{ip}] 관제 전송 꺼짐 시간대: "
+                              + ", ".join(f"{name} {'~'.join(map(str, hours))}" for name, hours in off_hours.items())
+                              + " (이 시간대에는 판정만 하고 관제로 보내지 않습니다. cameras.json receiver_event_off_hours에서 고칩니다)")
         except Exception as e:
             logger.error(f"마법사 설정 중 오류 발생: {e}")
 
@@ -7184,8 +7508,10 @@ GHOST_MIN_BOX_FRAMES = 3            # 판정 구간 동안 그 레이더 점에 
 
 
 def radar_ghost_check(meta):
-    """레이더 가짜 물체인지: 판정 구간 동안 그 레이더 점에 차량 박스가 붙지 않았으면(그 자리에 차가 없음) True.
-    레이더가 가까운 트럭의 반사로 2~3배 먼 거리·약 2배 속도의 물체를 더 내는 경우 등. 모델이 차를 늘 찾는다는 전제입니다."""
+    """관제로 보내지 않을 과속인지: 판정 구간 동안 그 레이더 점에 과속 대상 차량(승용차·트럭) 박스가 붙지 않았으면 True.
+    - 아무 박스도 없음: 레이더 가짜 물체(가까운 트럭의 반사로 2~3배 먼 거리·약 2배 속도의 물체를 더 내는 경우 등).
+    - 컨테이너·리치스태커·야드트럭에 붙음: 과속 대상이 아님(evidence.excluded_class에 이름, speeding_box_verdict).
+    모델이 차를 늘 찾는다는 전제입니다."""
     return meta.get("event_name") == SPEEDING_EVENT and (meta.get("evidence") or {}).get("vehicle_box") is False
 
 
@@ -7219,7 +7545,10 @@ def run_plr_on_fullres(out_dir, meta):
             final = (result or {}).get("final")
             if radar_ghost_check(meta):
                 GHOST_EVENTS.append(str(meta.get("event_id")))
-                logger.warning(f"[GHOST] 판정 구간에 차량 박스가 붙지 않아 레이더 가짜 물체로 봅니다"
+                excluded = (meta.get("evidence") or {}).get("excluded_class")
+                why = (f"레이더 점이 과속 대상이 아닌 {excluded} 상자에 붙었습니다" if excluded
+                       else "판정 구간에 차량 박스가 붙지 않아 레이더 가짜 물체로 봅니다")
+                logger.warning(f"[GHOST] {why}"
                                f"(번호판 {(final or {}).get('text') or '-'} {(final or {}).get('status') or '-'}). "
                                f"관제로 보내지 않습니다. event_id={meta.get('event_id')}")
                 final = {"text": "", "status": GHOST_STATUS}
@@ -8612,13 +8941,15 @@ class Camera:
         self.lock = threading.RLock()
         self.receiver_event_status = dict(conf.get('receiver_event_status') or {})
         RECEIVER_EVENT_STATUS_BY_CAM[str(self.cam_id)] = self.receiver_event_status
+        RECEIVER_OFF_HOURS_BY_CAM[str(self.cam_id)] = parse_receiver_off_hours(conf, f"CAM:{cam_id}({ip})")
+        SITE_SOUND_BY_CAM[str(self.cam_id)] = site_sound_conf(conf)
         # 과속 이벤트는 실제 레이더(MSE)를 수신합니다. 수신 워커는 모든 카메라가 함께 쓰고(MseRadarHub),
         # 카메라마다 cameras.json의 radar_client_id 레이더를 씁니다(없으면 routing_table의 첫 레이더).
         self.radar_provider = radar_provider
         if self.radar_provider is None and SPEEDING_EVENT in self.events:
             self.radar_provider = MseRadarHub.shared().input(conf.get('radar_client_id'))
 
-        # 과속은 메인 모델 V2(사람·하반신·승용차·트럭), Backreach·YT는 topdown, 콘 NG는 side.dxnn(ConeObserver)을 씁니다.
+        # 과속은 메인 모델 V2(speeding.dxnn: 승용차·트럭·컨테이너·리치스태커·야드트럭), Backreach·YT는 topdown, 콘 NG는 side.dxnn(ConeObserver)을 씁니다.
         # 추론은 메인 루프(run_camera_inference)에서 하고, 여기서는 수신기 크기를 정하는 데만 씁니다.
         self.det_main_v2 = det_main_v2
         self.det_face = det_face
@@ -8657,7 +8988,7 @@ class Camera:
             SEASIDE_GROUP_RECORDERS[self.camera_key] = (self.recorder, cam_id)
         self.current_frame_meta = None
         self.speed_track_hist = {}                 # 과속: 움직이는 차량 판정 이력(moving_tracks)
-        self.assoc_votes = deque(maxlen=4000)      # 과속: (카메라 시각, 레이더 id, 박스 tid) 프레임별 연결 → 이벤트 차량 다수결
+        self.assoc_votes = deque(maxlen=4000)      # 과속: (카메라 시각, 레이더 id, 박스 tid, 박스 클래스) 프레임별 연결 → 이벤트 차량 다수결
         self.track_boxes = {}                      # 과속: tid -> deque[[pts, 박스]] 번호판 촬영 시점 고르기용
         self.plr_follow = {}                       # 과속: event_id -> 판정 후 차량 박스를 따라가며 원본 추출 대기
         self._radar_zone_key = None                # 과속: 레이더 판정 구역으로 넘긴 (ROI, 보정값) — 바뀔 때만 다시 계산
@@ -8703,12 +9034,16 @@ class Camera:
 
     def update_config(self, new_conf):
         with self.lock:
-            old_base = {k: v for k, v in (self.conf or {}).items() if k != "receiver_event_status"}
-            new_base = {k: v for k, v in (new_conf or {}).items() if k != "receiver_event_status"}
+            send_keys = ("receiver_event_status", "receiver_event_off_hours", "speaker_enable", "ip_speaker", "sound")
+            old_base = {k: v for k, v in (self.conf or {}).items() if k not in send_keys}
+            new_base = {k: v for k, v in (new_conf or {}).items() if k not in send_keys}
             self.receiver_event_status = dict(new_conf.get("receiver_event_status") or {})
             RECEIVER_EVENT_STATUS_BY_CAM[str(self.cam_id)] = self.receiver_event_status
+            RECEIVER_OFF_HOURS_BY_CAM[str(self.cam_id)] = parse_receiver_off_hours(new_conf, f"CAM:{self.cam_id}({self.ip})")
+            SITE_SOUND_BY_CAM[str(self.cam_id)] = site_sound_conf(new_conf)
             if old_base == new_base:
-                # 관제 전송 켜짐·꺼짐(receiver_event_status)만 바뀌었으면 추적 ID, 처리한 객체, 쿨다운을 그대로 둡니다.
+                # 관제 전송 켜짐·꺼짐과 꺼짐 시간대(receiver_event_status, receiver_event_off_hours), 현장 스피커 방송
+                # (speaker_enable, ip_speaker, sound)만 바뀌었으면 추적 ID, 처리한 객체, 쿨다운을 그대로 둡니다.
                 self.conf = new_conf
                 return
 
@@ -9101,12 +9436,13 @@ class Camera:
             all_rows = judge.rows_for_frame(radar_frame) if radar_frame is not None else []
             rows = [r for r in all_rows if r['in_zone']]
             matched, projected = associate_radar_tracks(moving, track_map_main, rows, project, gate, frame_shape=fr.shape,
-                                                        focal_px=projection_focal_px(fr.shape, rc), roi_poly=roi)
+                                                        focal_px=projection_focal_px(fr.shape, rc), roi_poly=roi,
+                                                        classes=RADAR_BOX_CLASSES)
             self.radar_log = {"radar_arrival": round(float(radar_frame['arrival']), 3) if radar_frame is not None else None,
                               "points": radar_log_points(all_rows, project, matched), **radar_log_dropped(radar_frame)}
             if camera_time is not None:
                 for tid, (row, _) in matched.items():
-                    self.assoc_votes.append((camera_time, int(row['radar_id']), int(tid)))
+                    self.assoc_votes.append((camera_time, int(row['radar_id']), int(tid), int(track_map_main[int(tid)])))
             if rc.get("display_speed", True):
                 speed_boxes = {int(x[4]): [float(c) for c in x[:4]] for x in moving}
                 self.radar_display = {
@@ -9518,6 +9854,7 @@ class Camera:
                                     "threshold_kmh": decision_trace.get('threshold_kmh'),
                                     "radar_id": decision_trace.get('radar_id'), "radar_client_id": radar_client_id,
                                     "video_check": video_check, "vehicle_box": decision_trace.get('vehicle_box'),
+                                    "excluded_class": decision_trace.get('excluded_class'),
                                     "vehicle_box_frames": decision_trace.get('vehicle_box_frames')}
                     if ename == SPEEDING_EVENT and ev.get('fullres_window') and fullres_enabled(ename):
                         # 과속 판정은 레이더가 멀리서 먼저 내리므로, 그 차량을 레이더로 따라가 화면 안에 있던 동안의 원본으로
@@ -9544,6 +9881,11 @@ class Camera:
                         )
                     if fullres_dir:
                         event_meta['fullres_dir'] = fullres_dir
+
+                    if ename == SPEEDING_EVENT:
+                        # 현장 스피커 방송(cameras.json ip_speaker·sound): 번호판을 기다리지 않고 판정 순간에 냅니다.
+                        play_site_sound(self.cam_id, ename, event_id, event_meta['collected_at'],
+                                        ghost=decision_trace.get('vehicle_box') is False)
 
                     self.recorder.trigger(ename, event_meta=event_meta)
                     self.alerted.setdefault(tid, set()).add(ename)
@@ -9659,8 +10001,9 @@ class Camera:
             best = max(((calculate_iou(box, b), row) for b, row in radar_by_box), key=lambda x: x[0], default=(0.0, None))
             return best[1] if best[0] >= 0.5 else None
 
-        # 메인 모델 트랙은 과속 카메라에만 있고, 차량(승용차·트럭)만 표시합니다.
-        allowed_classes = set(TARGET_VEHICLES)
+        # 메인 모델 트랙은 과속 카메라에만 있고, 차량(승용차·트럭)과 과속 대상이 아닌 물체(컨테이너·리치스태커·야드트럭)를
+        # 표시합니다.
+        allowed_classes = set(RADAR_BOX_CLASSES)
 
         for t in t_main:
             tid = int(t[4])
@@ -9682,6 +10025,9 @@ class Camera:
             elif cls_id == ID_PERSON_LOW: label, color = f"LowBody [{tid}]", (0, 150, 0)
             elif cls_id == ID_G_CAR: label, color = f"Car [{tid}]", (255, 100, 0)
             elif cls_id == ID_G_TRUCK: label, color = f"LineTruck [{tid}]", (255, 100, 0)
+            elif cls_id == ID_CONTAINER: label, color = f"Container [{tid}]", (160, 160, 160)
+            elif cls_id == ID_REACHSTACKER: label, color = f"ReachStacker [{tid}]", (160, 160, 160)
+            elif cls_id == ID_YARDTRUCK: label, color = f"YardTruck [{tid}]", (160, 160, 160)
             else: label = f"OBJ [{tid}]"
             # 객체 점수(conf): 추적이 마지막으로 맞춘 검출의 점수입니다(관제 영상에는 적지 않음).
             if not for_record:
@@ -9841,9 +10187,10 @@ class Camera:
             display_name = EVENT_REGISTRY[evt].gui_name if evt in EVENT_REGISTRY else evt.upper()
             color = (0, 0, 255) if evt in active_alarms else (0, 255, 0)
             prefix = "[!] " if evt in active_alarms else " -  "
-            if self.receiver_event_status.get(evt, True) is False or not receiver_send_enabled(self.cam_id):
-                # 설정에서 관제 전송을 끈 이벤트(cameras.json receiver_event_status false, 또는 system_config.json
-                # receiver.enabled false·cctv_ids에 없는 카메라): 관제 전송만 꺼짐(판정은 계속).
+            if (self.receiver_event_status.get(evt, True) is False or not receiver_send_enabled(self.cam_id)
+                    or receiver_event_off_hours(self.cam_id, evt, datetime.datetime.now(pytz.timezone("Asia/Seoul")))):
+                # 설정에서 관제 전송을 끈 이벤트(cameras.json receiver_event_status false·지금이 receiver_event_off_hours
+                # 시간대, 또는 system_config.json receiver.enabled false·cctv_ids에 없는 카메라): 관제 전송만 꺼짐(판정은 계속).
                 color, prefix = (160, 160, 160), "[API OFF] "
             hud_text(f"{prefix}{display_name}", (w_frame - px(10), y_pos), color, 0.5, align_right=True)
             y_pos += px(24)
@@ -10326,7 +10673,7 @@ def main():
         run_wizard_groups(rtsp_list, camera_configs)
 
     models_cfg = SYS_CFG["models"]
-    # 설정된 이벤트가 쓰는 모델만 올립니다(event_model_keys). 과속: 메인 모델 V2(사람·하반신·승용차·트럭),
+    # 설정된 이벤트가 쓰는 모델만 올립니다(event_model_keys). 과속: 메인 모델 V2(speeding.dxnn: 승용차·트럭·컨테이너·리치스태커·야드트럭),
     # Backreach·YT: topdown(같은 엔진을 같이 씀). 콘 NG의 side·cone은 첫 콘 프레임에서 ConeObserver가 올립니다.
     # 실행 중 cameras.json에 이벤트가 추가되면 load_event_models가 그때 모델을 올립니다.
     event_models = {}
@@ -10452,7 +10799,7 @@ def main():
         d_topdown = None
         h, w = fr.shape[:2]
         if SPEEDING_EVENT in cam.events and "MAIN_V2" in event_models:
-            # 과속은 메인 V2 하나에서 사람·하반신·승용차·트럭(6번)을 모두 가져옵니다.
+            # 과속은 메인 V2(speeding.dxnn) 하나에서 승용차·트럭·컨테이너·리치스태커·야드트럭을 모두 가져옵니다.
             # 점수 기준은 model_confidences.MAIN_V2(클래스별)이고 infer가 클래스마다 거릅니다.
             d_main_res = filter_speed_main_detections(event_models["MAIN_V2"].infer(fr),
                                                       max_area_threshold=(h * w) * SPEEDING_MAX_BOX_AREA_FRAC)
