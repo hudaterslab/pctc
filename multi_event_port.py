@@ -2847,13 +2847,14 @@ def speeding_lane_settings(cfg):
 class RadarSpeedJudge:
     """레이더 트랙 기준 과속 판정기. 레이더(client_id)마다 하나씩 둡니다.
 
-    - ROI(단속 차로): ROI를 레이더 좌표로 바꾼 다각형 안에 lane_min_samples 이상 찍힌 트랙만 그 카메라의 판정 대상이고,
-      판정 순간(레이더가 놓쳤으면 마지막으로 본 위치)에도 차로 안이어야 합니다(차로를 벗어난 차는 이 차로의 차가 아님).
-      측정 거리는 ROI와 상관없어서, 카메라에 안 보이는 먼 곳에서 잰 속도도 씁니다.
+    - ROI(단속 차로): 측정 구간(measure_m) 안에서, ROI를 레이더 좌표로 바꾼 다각형 안에 lane_min_samples 이상 찍힌
+      트랙만 그 카메라의 판정 대상입니다. 측정 구간 끝을 지날 때(또는 레이더가 놓칠 때)까지 모자라면 그 차로는 판정하지
+      않습니다(로그만 남김). 판정 순간(레이더가 놓쳤으면 마지막으로 본 위치)에도 차로 안이어야 합니다(차로를 벗어난 차는
+      이 차로의 차가 아님). 속도 샘플은 ROI와 상관없어서, 카메라에 안 보이는 먼 곳에서 잰 속도도 씁니다.
     - 방향: 센서로 다가오는 차만 단속합니다(트랙을 처음 본 거리보다 2m 넘게 가까워진 것, _approaching).
     - 속도: 측정 구간(레이더 거리, measure_m) 안 샘플의 중앙값.
-    - 판정 시점: 측정 구간 가까운 끝을 지날 때입니다. 그때 아직 ROI를 안 지났으면 ROI에 들어올 때, 그 전에 레이더가
-      놓치면 놓쳤을 때 판정합니다. 측정 샘플이 모자라면 판정하지 않습니다.
+    - 판정 시점: 측정 구간 가까운 끝을 지날 때입니다. 그 전에 레이더가 놓치면 놓쳤을 때 판정합니다.
+      측정 샘플이 모자라면 판정하지 않습니다.
     - 트랙당 이벤트 1회. 과속을 낸 점이 사라진 자리 근처에 곧 새로 잡힌 점은 재검출로 보고 판정하지 않습니다(_track_for).
     - 레이더 가짜와 과속 대상이 아닌 물체는 여기서 거르지 않고, 판정 구간에 어떤 상자가 붙었는지로 이벤트 뒤에 가립니다
       (SpeedingDetector speeding_box_verdict, no_vehicle_kind).
@@ -2961,9 +2962,19 @@ class RadarSpeedJudge:
                 st['samples'].append((arrival, frame.get('timestamp_us'), float(obj['speed_kmh']), x, y))
                 while st['samples'] and st['samples'][0][0] < arrival - p["keep_sec"]:
                     st['samples'].popleft()
+                rng = math.hypot(x, y)
                 for key, lane in p["lanes"].items():
-                    if self._in_lane(lane, x, y, p):
+                    lo, hi = lane["measure"]
+                    if not self._in_lane(lane, x, y, p):
+                        continue
+                    if lo <= rng <= hi:
                         st['lane_hits'][key] = st['lane_hits'].get(key, 0) + 1
+                    elif key in st.get('lane_late', ()):
+                        # 측정 구간에서는 차로 안에 한 번도 안 찍혔다가 구간을 지난 뒤에야 차로에 들어온 점(로그 한 번)
+                        st['lane_late'].discard(key)
+                        logger.info(f"[RADAR SPEEDING] {self.client_label}R{st['radar_id']} seq={st['seq']} 측정 구간"
+                                    f"({lo:.0f}~{hi:.0f}m)을 지난 뒤에 차로에 들어와(x={x:.1f} y={y:.1f}, "
+                                    f"{float(obj['speed_kmh']):.1f}km/h) 판정하지 않습니다.")
                 self._judge(st, p, events, near, lost=False)
             for oid in [k for k, st in self._tracks.items() if arrival - st['last_arrival'] > p["timeout"]]:
                 st = self._tracks.pop(oid)
@@ -3069,11 +3080,23 @@ class RadarSpeedJudge:
         last = st['samples'][-1]
         rng = math.hypot(last[3], last[4])
         for key, lane in p["lanes"].items():
-            hits = st['lane_hits'].get(key, 0)
-            if key in st['done'] or hits < p["lane_min_samples"]:
+            if key in st['done']:
                 continue
             lo, hi = lane["measure"]
             if not (lost or rng < lo):
+                continue
+            # 측정 구간 안에서 차로 안에 찍힌 횟수가 모자라면 이 차로의 차가 아닙니다. 한 번도 안 찍힌 점은 여기서는
+            # 로그를 남기지 않고, 뒤늦게 차로에 들어오면 그때 남깁니다(on_frame, lane_late).
+            hits = st['lane_hits'].get(key, 0)
+            if hits < p["lane_min_samples"]:
+                st['done'].add(key)
+                if not hits:
+                    st.setdefault('lane_late', set()).add(key)
+                else:
+                    logger.info(f"[RADAR SPEEDING] {self.client_label}R{st['radar_id']} seq={st['seq']} 측정 구간"
+                                f"({lo:.0f}~{hi:.0f}m)에서 차로 안에 찍힌 횟수가 모자라({hits}/{p['lane_min_samples']}, "
+                                f"x={last[3]:.1f} y={last[4]:.1f}, {last[2]:.1f}km/h, {'놓침' if lost else '측정 구간 끝'}) "
+                                f"판정하지 않습니다.")
                 continue
             # 판정 위치가 차로 밖이면 이 차로의 차가 아닙니다(차로를 벗어난 차). 다시 차로에 들어오면 그때 판정합니다.
             if not self._in_lane(lane, last[3], last[4], p):
@@ -3087,10 +3110,8 @@ class RadarSpeedJudge:
             ev = self._evaluate(st, p, lo, hi)
             if ev is None:
                 continue
-            # 판정한 까닭: 레이더가 놓침 / 측정 구간 끝을 지나서 / (이미 지났는데) 이제 ROI 차로에 들어와서
-            ev.update(camera_key=key, lane_hits=hits,
-                      decided_by="radar_lost" if lost else "lane_entered" if hits == p["lane_min_samples"]
-                      else "passed_near_end")
+            # 판정한 까닭: 레이더가 놓침 / 측정 구간 끝을 지나서
+            ev.update(camera_key=key, lane_hits=hits, decided_by="radar_lost" if lost else "passed_near_end")
             if ev['median_kmh'] <= p["threshold"]:
                 if ev['median_kmh'] > p["limit"]:
                     near.append(ev)
