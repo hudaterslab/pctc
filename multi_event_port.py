@@ -486,6 +486,12 @@ def load_system_config():
             # (세그먼트가 2초씩이라 실제 보관은 ring_sec의 약 2배, 120이면 약 4분·카메라당 약 250MB, /dev/shm 메모리).
             # 번호판 판독을 기다리는 상한(과속 api_wait_sec)보다 길어야 밀린 이벤트의 원본이 남습니다.
             "ring_sec": 120,
+            # 과속 재현 묶음(오탐을 같은 입력으로 다시 돌려 보는 용도): 번호판 읽기가 끝난 뒤 clip.ts를 판정 replay_pre_sec 앞
+            # ~ 뽑는 구간 끝 replay_post_sec 뒤로 다시 쓰고, 같은 구간의 레이더 값을 radar.jsonl로 남깁니다(원본은 초당 약 1MB).
+            # 판정기가 레이더 기록을 20초(track_keep_sec)까지 들고 있어 앞 20초면 판정에 쓰인 값이 다 들어갑니다.
+            # replay_pre_sec이 0이면 예전처럼 뽑는 구간만 저장합니다.
+            "replay_pre_sec": 20.0,
+            "replay_post_sec": 5.0,
             "pre_sec": 3.0,
             "post_sec": 2.0,
             "every_n": 1,
@@ -2733,6 +2739,7 @@ class MseRadarInput:
         self._last_timestamp = None
         self._frame_listeners = []
         self._history = deque(maxlen=64)  # 최근 레이더 프레임(약 8초). 화면 두 곳이 같은 프레임을 그리도록 시각으로 찾습니다.
+        self._replay_frames = deque()     # 최근 REPLAY_KEEP_SEC 동안의 레이더 프레임(과속 재현 묶음 radar.jsonl용)
 
     def add_frame_listener(self, listener):
         """레이더 프레임마다 listener({'timestamp_us','arrival','objects','client_id'})를 수신 스레드에서 호출합니다."""
@@ -2788,12 +2795,22 @@ class MseRadarInput:
             self._latest = {'timestamp_us': stamp, 'arrival': time.monotonic(), 'objects': objects,
                             'dropped': dropped, 'client_id': self.client_id}
             self._history.append(self._latest)
+            self._replay_frames.append(self._latest)
+            while self._replay_frames[0]['arrival'] < self._latest['arrival'] - self.REPLAY_KEEP_SEC:
+                self._replay_frames.popleft()
             latest, listeners = self._latest, list(self._frame_listeners)
         for listener in listeners:
             try:
                 listener(latest)
             except Exception as error:
                 MSE_LOGGER.error('[Radar] frame listener failed: %s', error)
+
+    REPLAY_KEEP_SEC = 180.0  # 재현 묶음용 보관 시간(초): 판정 앞 구간 + 따라가기 최대 30초 + 원본 추출·번호판 읽기 대기보다 길게
+
+    def frames_between(self, t0, t1):
+        """도착 시각이 t0~t1인 레이더 프레임 목록(오래된 것부터, 최근 REPLAY_KEEP_SEC 안)."""
+        with self._lock:
+            return [f for f in self._replay_frames if t0 <= f['arrival'] <= t1]
 
     def frame_at(self, t_arrival, max_gap=0.3, max_age=1.0):
         """도착 시각 t_arrival에 가장 가까운 레이더 프레임 {'timestamp_us','arrival','objects'} (없으면 None).
@@ -6816,6 +6833,8 @@ class FullResExtractor:
                           "elapsed_sec": round(time.monotonic() - started, 3)}
         meta["status"] = "ok" if frames else "decode_failed"
         self._write_meta(out_dir, meta)
+        if meta["status"] != "ok":
+            self._save_replay(job, gen_dir, out_dir, meta)
         logger.info(
             f"[FULLRES] event_id={job['event_id']} status={meta['status']} frames={len(frames)} "
             f"window=[{t0:.3f},{t1:.3f}] covered=[{segs[0][1]:.3f},{segs[-1][2]:.3f}] complete={complete} "
@@ -6828,6 +6847,7 @@ class FullResExtractor:
                     result = run_plr_on_fullres(out_dir, meta)
                 self._drop_unused_frames(out_dir, meta, result)
             finally:
+                self._save_replay(job, gen_dir, out_dir, meta)
                 kind = NO_VEHICLE_EVENTS.get(str(meta.get("event_id")))
                 if kind:
                     # 레이더 가짜·대상 아닌 물체: 안 쓴 원본을 지운 뒤 사진·원본을 ghost·excluded 폴더로 옮깁니다
@@ -6837,6 +6857,41 @@ class FullResExtractor:
                         logger.info(f"{NO_VEHICLE_LOG_TAG[kind]} 사진·원본을 옮겼습니다. event_id={meta.get('event_id')} dir={gdir}")
                     except Exception as e:
                         logger.error(f"{NO_VEHICLE_LOG_TAG[kind]} 사진·원본 옮기기 실패 event_id={meta.get('event_id')}: {e}")
+
+    def _save_replay(self, job, gen_dir, out_dir, meta):
+        """과속 재현 묶음: clip.ts를 재현 구간(job["replay"]["window"])으로 다시 쓰고 레이더 값을 radar.jsonl로 남깁니다.
+        사진 뽑기·번호판 읽기가 끝난 뒤에 하므로 그쪽 동작과 시간은 그대로입니다. 실패해도 이벤트 처리는 이어집니다."""
+        replay = job.get("replay")
+        if not replay:
+            return
+        try:
+            c0, c1 = replay["window"]
+            segs = PacketRing.segments_for(gen_dir, c0, c1)
+            if segs:
+                tmp = out_dir / ".clip.tmp"
+                with open(tmp, "wb") as dst:
+                    for name, _, _ in segs:
+                        with open(gen_dir / name, "rb") as src:
+                            shutil.copyfileobj(src, dst)
+                # 쓰는 동안 링이 덮어쓴 세그먼트가 있으면(목록에서 빠짐) 길게 쓴 것을 버리고 처음 clip.ts를 둡니다.
+                listed = {(e[0], e[1]) for e in PacketRing.read_list(gen_dir)}
+                if all((name, start) in listed for name, start, _ in segs):
+                    tmp.replace(out_dir / "clip.ts")
+                    covered = [segs[0][1], segs[-1][2]]
+                else:
+                    tmp.unlink()
+                    covered = meta.get("covered")
+            else:
+                covered = meta.get("covered")
+            info = {"window": [c0, c1], "clip_covered": covered}
+            if replay.get("radar") is not None and covered:
+                info["radar"] = write_replay_radar(out_dir, replay, covered)
+            meta["replay"] = info
+            self._write_meta(out_dir, meta)
+            logger.info(f"[REPLAY] 재현 묶음 저장 event_id={job['event_id']} clip=[{covered[0]:.3f},{covered[1]:.3f}] "
+                        f"({covered[1] - covered[0]:.1f}초) radar={(info.get('radar') or {}).get('frames')}프레임")
+        except Exception as e:
+            logger.error(f"[REPLAY] 재현 묶음 저장 실패 event_id={job.get('event_id')}: {e}")
 
     def _drop_unused_frames(self, out_dir, meta, result):
         """번호판을 찾아보지 않은 원본 프레임 파일을 지웁니다. 초당 15장으로 뽑아 장수가 많은데(한 장 약 1.4MB),
@@ -6927,6 +6982,42 @@ class FullResExtractor:
 
 FULLRES_EXTRACTOR = None
 PLR_LOCK = threading.Lock()
+REPLAY_RADAR_FILE = "radar.jsonl"
+
+
+def replay_request(cam, window, event_pts):
+    """과속 재현 묶음에 넣을 것(원본 추출 요청 때 잡아 둠): 재현 구간 window (시작 PTS, 끝 PTS), 레이더 입력,
+    영상 시각(PTS)↔PC 시각 맞춤값, 그때 설정. 레이더가 없거나 시각을 맞출 수 없으면 영상만 길게 저장합니다(radar None)."""
+    radar = cam.radar_provider if isinstance(cam.radar_provider, MseRadarInput) else None
+    cam_t0 = cam.reader.camera_time_of(window[0])
+    if radar is None or cam_t0 is None:
+        return {"window": window, "radar": None}
+    return {"window": window, "radar": radar,
+            "header": {"type": "header", "event_pts": event_pts, "client_id": radar.client_id,
+                       # 카메라 시각(PC monotonic) = PTS + pts_to_mono. 레이더 프레임의 arrival과 같은 시계입니다.
+                       "pts_to_mono": cam_t0 - window[0],
+                       "camera": {k: v for k, v in (cam.conf or {}).items() if k != "url"},
+                       "speeding": radar_speeding_cfg(radar.client_id),
+                       "radar_camera": radar_camera_cfg(radar.client_id)}}
+
+
+def write_replay_radar(out_dir, replay, covered):
+    """clip.ts가 담은 구간 covered (시작 PTS, 끝 PTS)의 레이더 프레임을 radar.jsonl로 씁니다. 첫 줄은 header(시각 맞춤값·설정),
+    이어서 프레임마다 한 줄 {"type": "radar", "arrival", "timestamp_us", "objects", "dropped"}(받은 그대로).
+    돌려주는 값은 fullres_meta.json에 남길 요약."""
+    header = dict(replay["header"], clip_covered=list(covered))
+    # 영상 앞뒤 2초의 레이더 값까지(지연값만큼 어긋난 프레임과 트랙의 앞 기록)
+    shift = header["pts_to_mono"]
+    frames = replay["radar"].frames_between(covered[0] + shift - 2.0, covered[1] + shift + 2.0)
+    path = Path(out_dir) / REPLAY_RADAR_FILE
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(to_json_safe(header), ensure_ascii=False) + "\n")
+        for fr in frames:
+            f.write(json.dumps(to_json_safe({"type": "radar", "arrival": fr["arrival"], "timestamp_us": fr["timestamp_us"],
+                                             "objects": fr["objects"], "dropped": fr["dropped"]}),
+                               ensure_ascii=False) + "\n")
+    return {"file": path.name, "frames": len(frames),
+            "arrival": [frames[0]["arrival"], frames[-1]["arrival"]] if frames else None}
 
 
 def fullres_out_dir(cam, event_name, event_id):
@@ -7061,6 +7152,12 @@ def request_fullres_capture(cam, event_name, event_id, event_fid, bbox, inferenc
         box = roi_search_box(cam, inference_shape)
         if box:
             job["search_box"] = box
+    # 과속 재현 묶음: 번호판 읽기가 끝난 뒤 clip.ts를 판정 replay_pre_sec 앞 ~ 구간 끝 replay_post_sec 뒤로 다시 쓰고
+    # 레이더 값을 같이 남깁니다(FullResExtractor._save_replay). 사진을 뽑는 구간(t0~t1)은 그대로입니다.
+    replay_pre = float(cfg["replay_pre_sec"])
+    if event_name == SPEEDING_EVENT and replay_pre > 0:
+        job["replay"] = replay_request(cam, (min(job["t0"], event_pts - replay_pre),
+                                             job["t1"] + float(cfg["replay_post_sec"])), event_pts)
     # 구간이 길면 전체 장수가 PLR_EXTRACT_MAX_FRAMES를 넘지 않게 every_n을 키웁니다.
     job["every_n"] = max(job["every_n"],
                          int(math.ceil(max(0.0, job["t1"] - job["t0"]) * PLR_SOURCE_FPS / PLR_EXTRACT_MAX_FRAMES)))
