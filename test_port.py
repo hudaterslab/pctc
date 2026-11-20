@@ -2,22 +2,24 @@
 """과속 로직 검증 도구: 저장된 재현 묶음(과속 이벤트 폴더의 clip.ts + radar.jsonl)을 multi_event_port.py에 그대로 다시 넣어
 같은 판정이 나오는지 봅니다(오탐 재현 → 원인 확인 → 코드 수정 뒤 다시 돌려 확인).
 
+쓰는 법(옵션 없음):
+  1) 단말기의 과속 이벤트 폴더를 통째로 ./test_videos 에 넣습니다.
+       events/<카메라>/fullres/speeding/<이벤트>  또는  events/<카메라>/ghost·excluded/<이벤트>
+  2) python test_port.py
+  3) ./test_results/<이벤트>/ 에 결과가 생깁니다.
+       result.mp4(상자·레이더 점을 그린 화면), summary.txt(원래 결과와 다시 돌린 결과, 단계별 로그),
+       CCTV_EVENT_ALERT/(단말기와 같은 모양의 로그·이벤트 폴더), api_posts.jsonl(관제로 보냈을 내용)
+  모니터가 있으면 화면에 띄워 보면서 돌고(q를 누르면 다음 묶음으로), 없으면 화면 없이 돕니다.
+  단말기에서 돌릴 때는 실행 중인 프로그램을 먼저 꺼야 합니다(NPU를 같이 쓸 수 없음).
+
 multi_event_port.py는 고치지 않고 불러와 main()을 돌립니다. 바꿔 끼우는 것은 바깥과 닿는 곳뿐입니다.
   1) 카메라 → clip.ts(ffmpeg -re로 실제 속도 재생)
   2) 레이더 → radar.jsonl(영상 프레임과 저장 때의 시간 관계 그대로 넣음)
   3) 관제 서버 → 보내는 내용을 api_posts.jsonl에 적고 성공 응답만 돌려줌(실제로는 아무 데도 안 보냄). 스피커는 끔
-  4) NPU가 없는 PC·서버에서는 dxnn 대신 원본 pt를 GPU로 계산(--models 표가 있어야 함)
-판정 기준·ROI·보정값은 묶음에 저장된 그때 값(radar.jsonl 첫 줄)을 씁니다. 나머지 설정은 --config 파일입니다.
-
-사용:
-  python test_port.py <이벤트 폴더> [--out test_results] [--code multi_event_port.py] [--config system_config.json]
-                      [--models test_port_models.json] [--device cuda:0] [--gui]
-  <이벤트 폴더>: events/<카메라>/fullres/speeding/<이벤트>  또는  events/<카메라>/ghost·excluded/<이벤트>/fullres
-결과(<out>/<이벤트>/): result.mp4(상자·레이더 점을 그린 화면), summary.txt(원래 결과와 다시 돌린 결과),
-  CCTV_EVENT_ALERT/(단말기와 같은 모양의 로그·이벤트 폴더), api_posts.jsonl(관제로 보냈을 내용)
-단말기에서 돌릴 때는 실행 중인 프로그램을 먼저 꺼야 합니다(NPU·화면을 같이 쓸 수 없음).
+  4) NPU가 없는 PC·서버에서는 dxnn 대신 원본 pt를 GPU로 계산(test_port_models.json 표가 있어야 함)
+설정은 저장 때 값을 씁니다: 묶음에 든 설정(radar.jsonl 첫 줄의 system_config) → 없으면 묶음 폴더의 system_config.json
+→ 그것도 없으면 이 폴더의 system_config.json. 판정 기준·ROI·보정값은 늘 묶음에 저장된 값입니다. 모델 파일은 이 폴더의 것을 씁니다.
 """
-import argparse
 import importlib.util
 import json
 import os
@@ -31,6 +33,16 @@ import types
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+# ==========================================
+# 환경 설정
+# ==========================================
+TEST_DIR = HERE / "test_videos"               # 재현 묶음(과속 이벤트 폴더)을 넣는 곳
+TEST_RESULT_DIR = HERE / "test_results"       # 결과가 생기는 곳
+CODE_FILE = HERE / "multi_event_port.py"      # 검증할 코드
+MODELS_FILE = HERE / "test_port_models.json"  # NPU가 없을 때만: dxnn 이름 → pt 표
+PT_DEVICE = "cuda:0"                          # NPU가 없을 때만: pt를 계산할 장치
+WAIT_AFTER_VIDEO_SEC = 180.0                  # 영상이 끝난 뒤 번호판 읽기·전송 판단을 기다리는 최대 시간(초)
 MPEGTS_PTS_WRAP_SEC = 2 ** 33 / 90000.0
 LOG_KEYS = ("[RADAR SPEEDING]", "EVENT TRIGGERED", "[GHOST]", "[EXCLUDED]", "[PLR FOLLOW]", "[FULLRES] event_id",
             "[PLR] event_id", "[SPEEDING API]", "[SITE SOUND]", "[TEST_PORT]")
@@ -107,7 +119,7 @@ def has_npu():
 # 묶음 읽기와 실행 폴더 준비
 # ---------------------------------------------------------------------------
 def load_bundle(folder):
-    folder = Path(folder).resolve()
+    top = folder = Path(folder).resolve()
     if not (folder / "clip.ts").exists() and (folder / "fullres" / "clip.ts").exists():
         folder = folder / "fullres"                      # ghost·excluded/<이벤트> 폴더를 준 경우
     clip, radar_file = folder / "clip.ts", folder / "radar.jsonl"
@@ -124,7 +136,7 @@ def load_bundle(folder):
     if header is None:
         sys.exit(f"[오류] radar.jsonl 첫 줄(header)이 없습니다: {radar_file}")
     meta = json.loads((folder / "fullres_meta.json").read_text(encoding="utf-8")) if (folder / "fullres_meta.json").exists() else {}
-    return {"folder": folder, "clip": clip, "header": header, "frames": frames, "meta": meta}
+    return {"top": top, "folder": folder, "clip": clip, "header": header, "frames": frames, "meta": meta}
 
 
 def clip_shift(bundle):
@@ -137,22 +149,40 @@ def clip_shift(bundle):
     return start + round((covered0 - start) / MPEGTS_PTS_WRAP_SEC) * MPEGTS_PTS_WRAP_SEC
 
 
-def build_run_dir(args, bundle, npu):
+def find_bundles():
+    """./test_videos 안의 재현 묶음 폴더들(이름 순). ghost·excluded에서 가져온 폴더는 그 안의 fullres를 봅니다."""
+    found = []
+    for d in sorted(TEST_DIR.iterdir()):
+        if d.is_dir() and any((x / "clip.ts").exists() and (x / "radar.jsonl").exists() for x in (d, d / "fullres")):
+            found.append(d)
+    return found
+
+
+def bundle_config(bundle):
+    """설정과 그 출처: 묶음에 든 설정 → 묶음 폴더의 system_config.json → 이 폴더의 system_config.json."""
+    if bundle["header"].get("system_config"):
+        return json.loads(json.dumps(bundle["header"]["system_config"])), "묶음에 저장된 설정"
+    for path, name in ((bundle["folder"] / "system_config.json", "묶음 폴더의 system_config.json"),
+                       (bundle["top"] / "system_config.json", "묶음 폴더의 system_config.json"),
+                       (HERE / "system_config.json", "이 폴더의 system_config.json(저장 때 설정과 다를 수 있음)")):
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8")), name
+    sys.exit("[오류] system_config.json을 찾지 못했습니다.")
+
+
+def build_run_dir(bundle, npu):
     header, meta = bundle["header"], bundle["meta"]
-    event_id = str(meta.get("event_id") or bundle["folder"].name)
+    event_id = str(meta.get("event_id") or bundle["top"].name)
     ip = str(meta.get("ip") or "cam")
-    run = (Path(args.out) / event_id).resolve()
+    run = (TEST_RESULT_DIR / bundle["top"].name).resolve()
     if run.exists():
         shutil.rmtree(run)
     run.mkdir(parents=True)
-    code = Path(args.code).resolve()
-    shutil.copyfile(code, run / "multi_event_port.py")
+    shutil.copyfile(CODE_FILE, run / "multi_event_port.py")
     for name in ("plate_ocr.onnx", "plate_dict.txt"):
-        for base in (Path(args.assets).resolve() if args.assets else code.parent, code.parent):
-            if (base / name).exists():
-                shutil.copyfile(base / name, run / name)
-                break
-    cfg = json.loads(Path(args.config).read_text(encoding="utf-8"))
+        if (HERE / name).exists():
+            shutil.copyfile(HERE / name, run / name)
+    cfg, cfg_from = bundle_config(bundle)
     cid = str(header["client_id"])
     # 판정 기준·보정값은 저장 때 값 그대로(이 레이더에만 덮어쓴 설정은 이미 합쳐져 있어 지움)
     cfg.setdefault("event_config", {})["speeding"] = header["speeding"]
@@ -167,7 +197,9 @@ def build_run_dir(args, bundle, npu):
     fr_cfg.update(ring_dir=f"/dev/shm/test_port_ring/{event_id}_{os.getpid()}", replay_pre_sec=0.0)
     models = {}
     if not npu:
-        models = json.loads(Path(args.models).read_text(encoding="utf-8"))
+        if not MODELS_FILE.exists():
+            sys.exit(f"[오류] NPU(dx_engine)가 없습니다. pt로 돌리려면 {MODELS_FILE.name}(dxnn 이름 → pt 표)이 있어야 합니다.")
+        models = json.loads(MODELS_FILE.read_text(encoding="utf-8"))
         for key in (cfg.get("models") or {}):
             cfg.setdefault("model_output_formats", {})[key] = "yolo"       # pt 출력은 raw YOLO
         cfg.setdefault("video_decode", {})["hw_acceleration"] = "none"
@@ -176,11 +208,9 @@ def build_run_dir(args, bundle, npu):
             if name in models:
                 (run / name).touch()
     else:
-        # 모델 파일은 --assets 폴더에 있으면 그것, 없으면 코드 옆의 것을 씁니다.
-        for name in (cfg.get("models") or {}).values():
-            for base in ([Path(args.assets).resolve()] if args.assets else []) + [code.parent]:
-                if (base / name).exists() and not (run / name).exists():
-                    os.symlink(base / name, run / name)
+        for name in (cfg.get("models") or {}).values():                     # 모델 파일은 이 폴더의 것
+            if (HERE / name).exists() and not (run / name).exists():
+                os.symlink(HERE / name, run / name)
     (run / "system_config.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
     conf = dict(header["camera"])
     for drop in ("receiver_event_off_hours", "ip_speaker", "sound"):        # 재생 시각은 저장 때와 달라 시간대 규칙을 뺌
@@ -188,7 +218,7 @@ def build_run_dir(args, bundle, npu):
     conf.update(speaker_enable=False, radar_client_id=int(cid), url=str(bundle["clip"]))
     (run / "cameras.json").write_text(json.dumps({ip: conf}, ensure_ascii=False, indent=1), encoding="utf-8")
     (run / "cameras.csv").write_text(str(bundle["clip"]) + "\n", encoding="utf-8")
-    return run, ip, models, event_id
+    return run, ip, models, event_id, cfg_from
 
 
 class FakeResponse:
@@ -262,32 +292,23 @@ def write_summary(run, bundle, started_line):
 
 
 # ---------------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser(description="과속 로직 검증 도구(재현 묶음 다시 돌리기)")
-    ap.add_argument("bundle", help="과속 이벤트 폴더(clip.ts·radar.jsonl)")
-    ap.add_argument("--out", default=str(HERE / "test_results"))
-    ap.add_argument("--code", default=str(HERE / "multi_event_port.py"))
-    ap.add_argument("--config", default=str(HERE / "system_config.json"))
-    ap.add_argument("--assets", default="", help="모델(dxnn)·plate_ocr.onnx·plate_dict.txt를 먼저 찾을 폴더(없는 것은 --code 옆)")
-    ap.add_argument("--models", default=str(HERE / "test_port_models.json"), help="NPU가 없을 때 dxnn 이름 → pt 표")
-    ap.add_argument("--device", default="cuda:0")
-    ap.add_argument("--gui", action="store_true", help="화면에 띄워 보면서 재생")
-    ap.add_argument("--wait", type=float, default=180.0, help="영상이 끝난 뒤 번호판 읽기·전송 판단을 기다리는 최대 시간(초)")
-    args = ap.parse_args()
-
-    bundle = load_bundle(args.bundle)
+def run_bundle(folder):
+    """묶음 하나를 다시 돌립니다(묶음마다 새 프로세스: multi_event_port.py의 main()을 처음부터 돌리기 때문)."""
+    bundle = load_bundle(folder)
     npu = has_npu()
-    run, ip, models, event_id = build_run_dir(args, bundle, npu)
+    run, ip, models, event_id, cfg_from = build_run_dir(bundle, npu)
     if not npu:
-        install_pt_engine(models, args.device)
+        install_pt_engine(models, PT_DEVICE)
     shift = clip_shift(bundle)
     header, frames = bundle["header"], bundle["frames"]
-    started_line = (f"코드 {Path(args.code).resolve()} | 계산 {'NPU(dxnn)' if npu else 'pt ' + args.device} | "
+    gui = bool(os.environ.get("DISPLAY"))
+    engine = "NPU(dxnn)" if npu else "pt " + PT_DEVICE
+    started_line = (f"코드 {CODE_FILE} | 계산 {engine} | 설정 {cfg_from} | "
                     f"영상 {header['clip_covered'][1] - header['clip_covered'][0]:.1f}초 | 레이더 {len(frames)}프레임")
 
     os.environ.setdefault("NUMPY_MADVISE_HUGEPAGE", "0")
     os.chdir(run)
-    sys.argv = [str(run / "multi_event_port.py")] + (["--gui"] if args.gui else [])
+    sys.argv = [str(run / "multi_event_port.py")] + (["--gui"] if gui else [])
     spec = importlib.util.spec_from_file_location("multi_event_port", run / "multi_event_port.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["multi_event_port"] = mod
@@ -377,24 +398,12 @@ def main():
     threading.Thread(target=feed, name="test-port-radar", daemon=True).start()
 
     # --- 끝내기: 영상이 끝나고, 과속 판정마다 전송 판단([SPEEDING API])이 나올 때까지 기다림 ---
-    def finish():
-        t0 = time.time()
-        while not eof.is_set():
-            time.sleep(0.5)
-            if time.time() - t0 > 60 and not readers:
-                log.error("[TEST_PORT] 60초 동안 영상이 시작되지 않아 끝냅니다.")
-                break
-        deadline = time.time() + args.wait
-        log_dir = run / "CCTV_EVENT_ALERT" / "logs"
-        while time.time() < deadline:
-            time.sleep(3.0)
-            text = "".join(p.read_text(encoding="utf-8", errors="replace") for p in log_dir.glob("cctv_*.log"))
-            ids = set(re.findall(r"EVENT TRIGGERED\] event_id=(\S+)", text))
-            decided = {i for i in ids if re.search(r"\[SPEEDING API\][^\n]*" + re.escape(i), text)}
-            following = "[PLR FOLLOW]" in text and len(re.findall(r"\[FULLRES\] 요청 event_id", text)) < len(ids)
-            if ids == decided and not following:
-                break
-        time.sleep(2.0)
+    done = threading.Lock()
+
+    def finalize():
+        """결과 영상을 닫고 요약을 쓴 뒤 끝냅니다(한 번만)."""
+        if not done.acquire(blocking=False):
+            return
         if writer["w"] is not None:
             writer["w"].release()
         import logging
@@ -402,11 +411,58 @@ def main():
         write_summary(run, bundle, started_line)
         shutil.rmtree(mod.SYS_CFG["fullres_capture"]["ring_dir"], ignore_errors=True)
         print(f"결과 폴더: {run}")
+        sys.stdout.flush()
         os._exit(0)
+
+    def finish():
+        t0 = time.time()
+        while not eof.is_set():
+            time.sleep(0.5)
+            if time.time() - t0 > 60 and not readers:
+                log.error("[TEST_PORT] 60초 동안 영상이 시작되지 않아 끝냅니다.")
+                break
+        deadline = time.time() + WAIT_AFTER_VIDEO_SEC
+        log_dir = run / "CCTV_EVENT_ALERT" / "logs"
+        while time.time() < deadline:
+            time.sleep(3.0)
+            text = "".join(q.read_text(encoding="utf-8", errors="replace") for q in log_dir.glob("cctv_*.log"))
+            ids = set(re.findall(r"EVENT TRIGGERED\] event_id=(\S+)", text))
+            decided = {i for i in ids if re.search(r"\[SPEEDING API\][^\n]*" + re.escape(i), text)}
+            following = "[PLR FOLLOW]" in text and len(re.findall(r"\[FULLRES\] 요청 event_id", text)) < len(ids)
+            if ids == decided and not following:
+                break
+        time.sleep(2.0)
+        finalize()
 
     threading.Thread(target=finish, name="test-port-finish", daemon=True).start()
     log.info(f"[TEST_PORT] 재현 시작 event_id={event_id} | {started_line}")
-    mod.main()
+    try:
+        mod.main()
+    finally:
+        finalize()                                       # 화면에서 q를 눌러 끝낸 경우
+
+
+def main():
+    if os.environ.get("TEST_PORT_BUNDLE"):
+        return run_bundle(os.environ["TEST_PORT_BUNDLE"])
+    if not TEST_DIR.exists():
+        TEST_DIR.mkdir()
+        print(f"[{TEST_DIR}] 폴더를 만들었습니다. 다시 돌려 볼 과속 이벤트 폴더(clip.ts·radar.jsonl)를 넣고 다시 실행하세요.")
+        return
+    bundles = find_bundles()
+    if not bundles:
+        print(f"[{TEST_DIR}] 폴더에 재현 묶음(clip.ts·radar.jsonl이 든 과속 이벤트 폴더)이 없습니다.")
+        return
+    TEST_RESULT_DIR.mkdir(exist_ok=True)
+    print("=====================================")
+    print(f"과속 로직 검증 시작: 묶음 {len(bundles)}개 | 코드 {CODE_FILE}")
+    print(f"저장 경로: {TEST_RESULT_DIR}")
+    print("=====================================")
+    for i, folder in enumerate(bundles, 1):
+        print(f"\n▶ [{i}/{len(bundles)}] {folder.name}")
+        sys.stdout.flush()
+        subprocess.run([sys.executable, str(Path(__file__).resolve())], env=dict(os.environ, TEST_PORT_BUNDLE=str(folder)))
+    print("\n✅ 모든 묶음을 다시 돌렸습니다. 결과:", TEST_RESULT_DIR)
 
 
 if __name__ == "__main__":

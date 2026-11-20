@@ -1221,8 +1221,9 @@ def receiver_event_off_hours(cctv_id, event_name, when):
     return minute >= start or minute < end
 
 
-# 현장 IP 스피커 방송. cameras.json 카메라별 ip_speaker(스피커 주소, 예 "172.16.45.97")와 sound(경고 음성 파일 경로,
-# ffmpeg이 읽는 형식이면 wav·mp3·mp4 등 모두. 상대 경로는 프로젝트 폴더 기준)가 둘 다 적혀 있으면 과속 사진이 관제로 전송됐을 때
+# 현장 IP 스피커 방송. cameras.json 카메라별 ip_speaker(스피커 주소, 예 "172.16.45.97")와 sound(경고 음성 파일 이름,
+# 예 "06_speeding.wav". 프로젝트의 sounds 폴더에서 찾습니다. ffmpeg이 읽는 형식이면 wav·mp3·mp4 등 모두, 절대 경로를
+# 적으면 그 파일)가 둘 다 적혀 있으면 과속 사진이 관제로 전송됐을 때
 # 그 스피커로 음성을 한 번 냅니다. 하나라도 "none"(기본값, 마법사가 과속 카메라에 적음)이면 방송 없이 이벤트만 냅니다.
 # 방송은 같은 카메라의 speaker_enable이 true일 때만 합니다(기본값 false, 마법사가 과속 카메라에 false로 적음).
 # 주소와 음성을 적어 둔 채로 speaker_enable만 바꿔 방송을 켜고 끕니다.
@@ -1231,6 +1232,7 @@ def receiver_event_off_hours(cctv_id, event_name, when):
 # 스피커(Inter-M IP-1015HS)에는 계정·교환기 없이 SIP 전화를 직접 걸어(sip:<주소>) 음성을 G.711(PCMU) RTP로 보냅니다.
 # 스피커 SIP 계정을 가려야 하면 ip_speaker를 "97@172.16.45.97"처럼 적습니다.
 SITE_SOUND_NONE = "none"
+SITE_SOUND_DIR = os.path.join(PROJECT_ROOT, "sounds")   # 경고 음성 파일 폴더(깃에 같이 올라감)
 SITE_SOUND_MAX_SEC = 60.0     # 음성 한 번의 최대 길이(초). 더 긴 파일은 여기서 끊습니다.
 SITE_SOUND_BY_CAM = {}        # {str(cctv_id): (스피커 주소, 음성 파일)} — Camera가 설정을 읽을 때마다 채웁니다(방송 안 하면 None).
 SITE_SOUND_BUSY = set()       # 지금 방송 중인 스피커 주소. 방송이 끝나기 전에 난 이벤트는 방송하지 않습니다.
@@ -1257,7 +1259,7 @@ def site_sound_conf(conf):
     speaker, sound = (str(conf.get(key) or "").strip() for key in ("ip_speaker", "sound"))
     if not speaker or not sound or SITE_SOUND_NONE in (speaker.lower(), sound.lower()):
         return None
-    return speaker, sound if os.path.isabs(sound) else os.path.join(PROJECT_ROOT, sound)
+    return speaker, sound if os.path.isabs(sound) else os.path.join(SITE_SOUND_DIR, sound)
 
 
 def sip_parse(data):
@@ -6998,7 +7000,9 @@ def replay_request(cam, window, event_pts):
                        "pts_to_mono": cam_t0 - window[0],
                        "camera": {k: v for k, v in (cam.conf or {}).items() if k != "url"},
                        "speeding": radar_speeding_cfg(radar.client_id),
-                       "radar_camera": radar_camera_cfg(radar.client_id)}}
+                       "radar_camera": radar_camera_cfg(radar.client_id),
+                       # 그때 설정 전체(모델·점수 기준 등). test_port.py가 이 설정으로 다시 돌립니다.
+                       "system_config": SYS_CFG}}
 
 
 def write_replay_radar(out_dir, replay, covered):
