@@ -505,7 +505,7 @@ def load_system_config():
             "enabled": True,
             # 상대 경로는 프로젝트 폴더 기준입니다(resolve_model_path).
             # OCR 모델은 편 번호판으로 학습한 것입니다. 펴지 않은 번호판을 넣으면 정확도가 떨어집니다.
-            "ocr_cpu_model": "plate_rec_flat_64x320.onnx",
+            "ocr_cpu_model": "plate_ocr.onnx",
             # 번호판 모서리 4점 모델(CPU ONNX). 이 4점으로 번호판을 폅니다(PlateFlattener).
             "pose_model": "pose_plate.onnx",
             "ocr_dict": "plate_dict.txt",
@@ -7215,7 +7215,7 @@ def request_fullres_capture(cam, event_name, event_id, event_fid, bbox, inferenc
 # ==========================================
 # 번호판 펴기: 번호판 모서리 4점(pose_plate.onnx, CPU) → 실제 번호판 비율의 반듯한 직사각형
 # ==========================================
-# 번호판 OCR(plate_rec_flat_64x320.onnx)은 편 번호판으로 학습했습니다. 그래서 읽기 전에 폅니다(_plr_on_fullres).
+# 번호판 OCR(plate_ocr.onnx)은 편 번호판으로 학습했습니다. 그래서 읽기 전에 폅니다(_plr_on_fullres).
 # 173의 flatten.py(pctc/plate_ocr/ai는여기 폴더안에서 사용/shpark/flatten_pose_20261120, OCR 학습 사진을 편 코드)를
 # 옮긴 것입니다. 계산이 달라지면 학습 사진과 어긋나므로, 고칠 때는 173 test 사진으로 flatten.py와 결과가 같은지 다시 봅니다.
 PLATE_FLAT_RATIO = {"long": 520 / 110, "short": 2.0}   # 긴 번호판 520x110, 짧은·두 줄 번호판(335x155·335x170·440x220)은 2:1 하나로
@@ -7352,7 +7352,7 @@ class PlateFlattener:
 
 # ==========================================
 # 번호판 인식(PLR): 원본 프레임 → 번호판 검출(plate.dxnn, NPU) → 번호판 펴기(pose_plate.onnx, CPU)
-#                   → OCR(plate_rec_flat_64x320.onnx, CPU)
+#                   → OCR(plate_ocr.onnx, CPU)
 # ==========================================
 # 한국 번호판 형식: 신형 "12가3456"/"123가4567", 구형 지역 "서울12가3456"(지역 + 1~2자리)
 PLATE_REGIONS = ("서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종", "경기", "강원",

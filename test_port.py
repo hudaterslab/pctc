@@ -179,7 +179,7 @@ def build_run_dir(bundle, npu):
         shutil.rmtree(run)
     run.mkdir(parents=True)
     shutil.copyfile(CODE_FILE, run / "multi_event_port.py")
-    for name in ("pose_plate.onnx", "plate_rec_flat_64x320.onnx", "plate_dict.txt"):
+    for name in ("pose_plate.onnx", "plate_ocr.onnx", "plate_dict.txt"):
         if (HERE / name).exists():
             shutil.copyfile(HERE / name, run / name)
     cfg, cfg_from = bundle_config(bundle)
