@@ -499,12 +499,15 @@ def load_system_config():
             "hwaccel": True
         },
         # 번호판 인식(PLR). fullres_capture가 뽑은 원본 프레임에서 번호판을 찾고(사진 번호판 가리기와 같은
-        # models.PLATE plate.dxnn 엔진), 글자는 CPU(ONNX Runtime)로 읽습니다. dxnn으로 바꾼 PP-OCR은 ONNX보다
-        # 정확도가 10% 넘게 낮아 OCR은 CPU만 씁니다.
+        # models.PLATE plate.dxnn 엔진), 번호판을 편 뒤(pose_model, PlateFlattener) 글자는 CPU(ONNX Runtime)로 읽습니다.
+        # dxnn으로 바꾼 PP-OCR은 ONNX보다 정확도가 10% 넘게 낮아 OCR은 CPU만 씁니다.
         "plr": {
             "enabled": True,
             # 상대 경로는 프로젝트 폴더 기준입니다(resolve_model_path).
-            "ocr_cpu_model": "plate_ocr.onnx",
+            # OCR 모델은 편 번호판으로 학습한 것입니다. 펴지 않은 번호판을 넣으면 정확도가 떨어집니다.
+            "ocr_cpu_model": "plate_rec_flat_64x320.onnx",
+            # 번호판 모서리 4점 모델(CPU ONNX). 이 4점으로 번호판을 폅니다(PlateFlattener).
+            "pose_model": "pose_plate.onnx",
             "ocr_dict": "plate_dict.txt",
             "ocr_cpu_threads": 2,
             # 번호판 인식에 쓸 번호판의 최소 점수. 모델 점수 기준(model_confidences.PLATE, 사진 가리기)보다 높게 씁니다.
@@ -7210,7 +7213,146 @@ def request_fullres_capture(cam, event_name, event_id, event_fid, bbox, inferenc
 
 
 # ==========================================
-# 번호판 인식(PLR): 원본 프레임 → 번호판 검출(plate.dxnn, NPU) → OCR(plate_ocr.onnx, CPU)
+# 번호판 펴기: 번호판 모서리 4점(pose_plate.onnx, CPU) → 실제 번호판 비율의 반듯한 직사각형
+# ==========================================
+# 번호판 OCR(plate_rec_flat_64x320.onnx)은 편 번호판으로 학습했습니다. 그래서 읽기 전에 폅니다(_plr_on_fullres).
+# 173의 flatten.py(pctc/plate_ocr/ai는여기 폴더안에서 사용/shpark/flatten_pose_20261120, OCR 학습 사진을 편 코드)를
+# 옮긴 것입니다. 계산이 달라지면 학습 사진과 어긋나므로, 고칠 때는 173 test 사진으로 flatten.py와 결과가 같은지 다시 봅니다.
+PLATE_FLAT_RATIO = {"long": 520 / 110, "short": 2.0}   # 긴 번호판 520x110, 짧은·두 줄 번호판(335x155·335x170·440x220)은 2:1 하나로
+PLATE_FLAT_KIND_SPLIT = 2.6     # 보이는 가로/세로가 이 값 이상이면 긴 번호판
+PLATE_FLAT_CONTEXT = 0.35       # 모서리 모델에 넣는 크롭 = 번호판 상자 둘레를 이만큼 넓힌 것(모델 학습 크롭과 같음)
+PLATE_FLAT_PAD = 0.10           # 편 사진 둘레 여백(원본의 실제 둘레가 들어감)
+PLATE_FLAT_MIN_BOX = 0.25       # 모서리 모델이 번호판으로 본 점수가 이 값 이하면 못 찾은 것(no_plate)
+PLATE_FLAT_MIN_KPT = 0.5        # 4점 점수 중 가장 낮은 것이 이보다 낮으면 펴지 않음(low_kpt)
+PLATE_FLAT_MIN_PLATE_H = 10.0   # 번호판 세로(px)가 이보다 작으면 펴지 않음(small)
+PLATE_FLAT_MAX_W = 640          # 편 사진 가로 상한(px, 여백 제외)
+PLATE_FLAT_SIZE = 320           # 모서리 모델 입력(정사각 px)
+
+
+def plate_quad_sides(q):
+    """4점(왼위·오위·오아래·왼아래)의 (가로, 세로) = 마주 보는 변의 평균 길이."""
+    w = (np.linalg.norm(q[1] - q[0]) + np.linalg.norm(q[2] - q[3])) / 2
+    h = (np.linalg.norm(q[3] - q[0]) + np.linalg.norm(q[2] - q[1])) / 2
+    return float(w), float(h)
+
+
+def plate_quad_kind(q):
+    """긴 번호판 "long" / 짧은·두 줄 번호판 "short"."""
+    w, h = plate_quad_sides(q)
+    return "long" if w / max(h, 1e-6) >= PLATE_FLAT_KIND_SPLIT else "short"
+
+
+def check_plate_quad(q, shape, min_plate_h=PLATE_FLAT_MIN_PLATE_H):
+    """펼 수 있는 4점이면 "", 아니면 이유(small: 너무 작음, bad_quad: 사각형이 뒤틀림, out_of_image: 화면 밖으로 잘림).
+    shape: 4점 좌표가 놓인 사진(원본 프레임) 크기."""
+    w, h = plate_quad_sides(q)
+    if h < min_plate_h or w < 1.5 * min_plate_h:
+        return "small"
+    c = q.reshape(-1, 1, 2).astype(np.float32)
+    if not cv2.isContourConvex(c) or cv2.contourArea(c) < 0.5 * w * h:
+        return "bad_quad"
+    if q[1][0] - q[0][0] <= 0 or q[2][0] - q[3][0] <= 0 or q[3][1] - q[0][1] <= 0 or q[2][1] - q[1][1] <= 0:
+        return "bad_quad"                                     # 점 순서가 뒤집힘
+    for i in range(4):                                        # 모서리 각 40~140도
+        a, b = q[i - 1] - q[i], q[(i + 1) % 4] - q[i]
+        ang = math.degrees(math.acos(float(np.clip(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-6), -1, 1))))
+        if not 40 <= ang <= 140:
+            return "bad_quad"
+    top, bot = np.linalg.norm(q[1] - q[0]), np.linalg.norm(q[2] - q[3])
+    lef, rig = np.linalg.norm(q[3] - q[0]), np.linalg.norm(q[2] - q[1])
+    if min(top, bot) / max(top, bot) < 0.5 or min(lef, rig) / max(lef, rig) < 0.5 or not 1.0 <= w / h <= 8.0:
+        return "bad_quad"
+    H, W = shape[:2]
+    tol = 2 + 0.05 * h                                        # 화면 밖으로 이만큼 넘게 나가면 잘린 번호판
+    if q[:, 0].min() < -tol or q[:, 1].min() < -tol or q[:, 0].max() > W - 1 + tol or q[:, 1].max() > H - 1 + tol:
+        return "out_of_image"
+    return ""
+
+
+def warp_plate_quad(src, q, kind=None, pad=PLATE_FLAT_PAD, max_w=PLATE_FLAT_MAX_W):
+    """4점을 실제 번호판 비율로 폅니다(src에서 보간 1번). 해상도는 번호판이 가진 화소 수를 그대로 둡니다(줄이지 않음)."""
+    r = PLATE_FLAT_RATIO[kind or plate_quad_kind(q)]
+    top, bot = np.linalg.norm(q[1] - q[0]), np.linalg.norm(q[2] - q[3])
+    lef, rig = np.linalg.norm(q[3] - q[0]), np.linalg.norm(q[2] - q[1])
+    W = min(max(top, bot, max(lef, rig) * r), max_w)          # 가로·세로 중 화소가 더 많은 쪽 기준
+    Hh = W / r
+    mx, my = W * pad, Hh * pad
+    dst = np.float32([[mx, my], [mx + W, my], [mx + W, my + Hh], [mx, my + Hh]])
+    M = cv2.getPerspectiveTransform(q.astype(np.float32), dst)
+    return cv2.warpPerspective(src, M, (int(round(W + 2 * mx)), int(round(Hh + 2 * my))),
+                               flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+
+class PlateFlattener:
+    """번호판 모서리 4점 찾기(YOLO11s-pose, 입력 320x320, CPU ONNX)와 펴기.
+    모델 출력 [1, 17, 2100]: 후보마다 상자 cx·cy·w·h, 번호판 점수, 4점(왼위·오위·오아래·왼아래)의 x·y·점수."""
+
+    def __init__(self, model_path, threads=2):
+        import onnxruntime as ort
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = max(1, int(threads))
+        options.inter_op_num_threads = 1
+        self.session = ort.InferenceSession(model_path, options, providers=["CPUExecutionProvider"])
+        self._input = self.session.get_inputs()[0].name
+
+    def locate(self, crop):
+        """번호판 둘레 크롭에서 4점을 찾습니다 → (4점(크롭 좌표) 또는 None, 번호판 점수, 4점 점수 중 가장 낮은 것).
+        전처리·좌표 되돌리기는 ultralytics(flatten.py가 쓴 것)와 같습니다: 비율을 지켜 320에 맞추고 남는 곳은 회색 114,
+        되돌릴 때 여백은 반올림 전 값으로 빼고 크롭 밖으로 나간 점은 크롭 끝으로 당깁니다."""
+        h, w = crop.shape[:2]
+        size = PLATE_FLAT_SIZE
+        r = min(size / h, size / w)
+        nw, nh = int(round(w * r)), int(round(h * r))
+        dw, dh = (size - nw) / 2.0, (size - nh) / 2.0
+        img = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_LINEAR) if (w, h) != (nw, nh) else crop
+        img = cv2.copyMakeBorder(img, int(round(dh - 0.1)), int(round(dh + 0.1)), int(round(dw - 0.1)), int(round(dw + 0.1)),
+                                 cv2.BORDER_CONSTANT, value=(114, 114, 114))
+        x = np.ascontiguousarray(img[:, :, ::-1].transpose(2, 0, 1)[None], dtype=np.float32) / 255.0
+        out = self.session.run(None, {self._input: x})[0][0]
+        i = int(out[4].argmax())                              # 가장 확실한 후보 하나
+        box_conf = float(out[4, i])
+        if box_conf <= PLATE_FLAT_MIN_BOX:
+            return None, 0.0, 0.0
+        k = out[5:, i].reshape(4, 3)
+        q = np.empty((4, 2), np.float32)
+        q[:, 0] = np.clip((k[:, 0] - (size - w * r) / 2.0) / r, 0, w)
+        q[:, 1] = np.clip((k[:, 1] - (size - h * r) / 2.0) / r, 0, h)
+        return q, box_conf, float(k[:, 2].min())
+
+    def flatten(self, image, box, origin=(0, 0), full_shape=None):
+        """번호판 하나를 폅니다.
+        image: 번호판 둘레가 PLATE_FLAT_CONTEXT 넘게 들어 있는 사진(원본 프레임, 또는 원본에서 origin (x, y)부터 잘라 낸 크롭),
+        box: 번호판 상자 [x1, y1, x2, y2](원본 좌표), full_shape: 원본 프레임 크기(없으면 image 크기).
+        반환 {"ok", "image": 편 사진(못 폈으면 None), "quad": 4점(원본 좌표, 못 찾았으면 None), "kind": long·short,
+              "reason": 못 편 이유(no_plate·low_kpt·small·bad_quad·out_of_image), "box_conf", "kpt_conf"}.
+        못 폈으면 부르는 쪽이 크롭을 그대로 읽습니다(OCR 학습 사진도 못 편 것은 그대로 썼음)."""
+        ox, oy = int(origin[0]), int(origin[1])
+        H, W = (full_shape if full_shape is not None else image.shape)[:2]
+        x1, y1, x2, y2 = (float(v) for v in box[:4])
+        ex, ey = (x2 - x1) * PLATE_FLAT_CONTEXT, (y2 - y1) * PLATE_FLAT_CONTEXT
+        cx1, cy1 = max(ox, 0, int(x1 - ex)), max(oy, 0, int(y1 - ey))
+        cx2, cy2 = min(int(W), int(math.ceil(x2 + ex))), min(int(H), int(math.ceil(y2 + ey)))
+        crop = image[cy1 - oy:cy2 - oy, cx1 - ox:cx2 - ox]
+        res = {"ok": False, "image": None, "quad": None, "kind": "", "reason": "no_plate", "box_conf": 0.0, "kpt_conf": 0.0}
+        if crop.shape[0] < 2 or crop.shape[1] < 2:
+            return res
+        q, box_conf, kpt_conf = self.locate(crop)
+        if q is None:
+            return res
+        q = q + np.float32([cx1, cy1])                        # 원본 좌표
+        res.update(quad=q, kind=plate_quad_kind(q), box_conf=box_conf, kpt_conf=kpt_conf,
+                   reason="low_kpt" if kpt_conf < PLATE_FLAT_MIN_KPT else check_plate_quad(q, (H, W)))
+        if res["reason"]:
+            return res
+        # image가 크롭이면 4점을 크롭 좌표로 옮겨 폅니다(편 결과는 원본 프레임에서 편 것과 같음).
+        res["image"] = warp_plate_quad(image, q - np.float32([ox, oy]), res["kind"])
+        res["ok"] = True
+        return res
+
+
+# ==========================================
+# 번호판 인식(PLR): 원본 프레임 → 번호판 검출(plate.dxnn, NPU) → 번호판 펴기(pose_plate.onnx, CPU)
+#                   → OCR(plate_rec_flat_64x320.onnx, CPU)
 # ==========================================
 # 한국 번호판 형식: 신형 "12가3456"/"123가4567", 구형 지역 "서울12가3456"(지역 + 1~2자리)
 PLATE_REGIONS = ("서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종", "경기", "강원",
@@ -7291,7 +7433,8 @@ def finalize_plate(rows):
 
 
 class PlateRecognizer:
-    """번호판 검출(plate.dxnn, 사진 번호판 가리기와 같은 엔진)과 OCR(SVTR_LCNet CTC, CPU ONNX).
+    """번호판 검출(plate.dxnn, 사진 번호판 가리기와 같은 엔진), 펴기(PlateFlattener), OCR(SVTR_LCNet CTC, CPU ONNX).
+    OCR 모델은 편 번호판으로 학습한 것이라 읽기 전에 폅니다(못 편 장만 크롭 그대로, _plr_on_fullres).
 
     OCR 입력: BGR 64x320(높이 64 비율 유지, 폭 <= 320, 오른쪽 128 패딩 = 정규화 후 0)을 /255, (x-0.5)/0.5, CHW로 넣습니다.
     """
@@ -7311,7 +7454,12 @@ class PlateRecognizer:
         options.inter_op_num_threads = 1
         self.ocr_cpu = ort.InferenceSession(cpu_path, options, providers=["CPUExecutionProvider"])
         self._cpu_input = self.ocr_cpu.get_inputs()[0].name
-        logger.info(f"[PLR] 모델 로드: det={os.path.basename(det.engine_path)} ocr_cpu={os.path.basename(cpu_path)}")
+        pose_path = resolve_model_path(cfg.get("pose_model"))
+        if not pose_path or not os.path.exists(pose_path):
+            raise RuntimeError(f"번호판 모서리 모델(pose_model)이 없습니다: {pose_path}")
+        self.flattener = PlateFlattener(pose_path, cfg.get("ocr_cpu_threads", 2))
+        logger.info(f"[PLR] 모델 로드: det={os.path.basename(det.engine_path)} pose={os.path.basename(pose_path)} "
+                    f"ocr_cpu={os.path.basename(cpu_path)}")
 
     def detect(self, image):
         t0 = time.perf_counter()
@@ -7367,7 +7515,7 @@ class PlateRecognizer:
         return text, float(p ** (1.0 / max(1, len(text))))
 
     def read_plate(self, plate):
-        """번호판 크롭 → {"cpu": {"text", "conf", "ms"[, "rule"]}}."""
+        """번호판 사진(편 것, 못 폈으면 크롭) → {"cpu": {"text", "conf", "ms"[, "rule"]}}."""
         x = np.ascontiguousarray(self.ocr_input(plate))
         t0 = time.perf_counter()
         xf = ((x.astype(np.float32) / 255.0 - 0.5) / 0.5).transpose(2, 0, 1)[None]
@@ -7963,7 +8111,8 @@ def drop_receding_plate(final, rows):
 
 
 def _plr_on_fullres(out_dir, meta):
-    """원본 프레임에서 그 차의 번호판을 찾고, 잘림·선명도·시각으로 고른 장(pick_plates_for_ocr)만 OCR해 결과를 남깁니다."""
+    """원본 프레임에서 그 차의 번호판을 찾고, 잘림·선명도·시각으로 고른 장(pick_plates_for_ocr)만 펴서(PlateFlattener)
+    OCR해 결과를 남깁니다."""
     cfg = SYS_CFG["plr"]
     if not cfg["enabled"]:
         return None
@@ -8094,7 +8243,7 @@ def _plr_on_fullres(out_dir, meta):
                 row["plate"] = {"file": f"plr/{name}", "det_conf": round(score, 4), "box_full": box_full,
                                 "size": [int(pw), int(ph)], "sharp": round(plate_sharpness(plate), 1),
                                 "edge": plate_touches_edge(box_full, full_shape)}
-                plates[row["frame"]] = plate
+                plates[row["frame"]] = (plate, (gx1, gy1))     # 크롭과, 원본에서 그 크롭이 시작하는 곳
                 found += 0 if row["plate"]["edge"] else 1
         rows.append(row)
         return row
@@ -8123,8 +8272,25 @@ def _plr_on_fullres(out_dir, meta):
     plates = {i: plates[r["frame"]] for i, r in enumerate(rows) if r["frame"] in plates}
     picked = pick_plates_for_ocr([{"key": i, "width": rows[i]["plate"]["size"][0], "edge": rows[i]["plate"]["edge"],
                                    "sharp": rows[i]["plate"]["sharp"]} for i in plates])
+    flat_dir = out_dir / "plr_flat"
     for i in picked:
-        rows[i]["plate"]["ocr"] = recognizer.read_plate(plates[i])
+        # 번호판을 펴서 읽습니다(OCR은 편 번호판으로 학습). 못 편 장은 학습 사진과 같이 크롭을 그대로 읽습니다.
+        plate, origin = plates[i]
+        info = rows[i]["plate"]
+        t0 = time.perf_counter()
+        flat = recognizer.flattener.flatten(plate, info["box_full"], origin, full_shape)
+        # 분석용: 폈는지, 못 편 이유, 번호판 종류(long·short), 점수, 4점(원본 좌표), 걸린 시간, 편 사진 파일
+        info["flat"] = {"ok": flat["ok"], "reason": flat["reason"], "kind": flat["kind"],
+                        "box_conf": round(flat["box_conf"], 4), "kpt_conf": round(flat["kpt_conf"], 4),
+                        "quad": ([[round(float(x), 1), round(float(y), 1)] for x, y in flat["quad"]]
+                                 if flat["quad"] is not None else None),
+                        "ms": round((time.perf_counter() - t0) * 1000.0, 2)}
+        if flat["ok"]:
+            flat_dir.mkdir(exist_ok=True)
+            name = f"flat_{Path(rows[i]['frame']).stem}.jpg"
+            cv2.imwrite(str(flat_dir / name), flat["image"], [cv2.IMWRITE_JPEG_QUALITY, 95])
+            info["flat"]["file"] = f"plr_flat/{name}"
+        info["ocr"] = recognizer.read_plate(flat["image"] if flat["ok"] else plate)
 
     summary = {}
     reads = [r["plate"]["ocr"]["cpu"] for r in rows if r["plate"] and "cpu" in (r["plate"].get("ocr") or {})]
@@ -8138,7 +8304,8 @@ def _plr_on_fullres(out_dir, meta):
     result = {
         "event_id": meta.get("event_id"), "cam_id": meta.get("cam_id"), "ip": meta.get("ip"),
         "event_name": meta.get("event_name"), "created_at": now_kst().isoformat(),
-        "models": {"det_model": os.path.basename(recognizer.det.engine_path), "ocr_cpu_model": cfg["ocr_cpu_model"]},
+        "models": {"det_model": os.path.basename(recognizer.det.engine_path), "pose_model": cfg["pose_model"],
+                   "ocr_cpu_model": cfg["ocr_cpu_model"]},
         "vehicle_crop_full": list(event_crop), "frames_used": len(rows),
         "final": drop_receding_plate(finalize_plate(rows), rows), "ocr_frames": len(picked),
         "follow_boxes": meta.get("follow_boxes"),

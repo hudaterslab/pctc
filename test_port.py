@@ -179,10 +179,13 @@ def build_run_dir(bundle, npu):
         shutil.rmtree(run)
     run.mkdir(parents=True)
     shutil.copyfile(CODE_FILE, run / "multi_event_port.py")
-    for name in ("plate_ocr.onnx", "plate_dict.txt"):
+    for name in ("pose_plate.onnx", "plate_rec_flat_64x320.onnx", "plate_dict.txt"):
         if (HERE / name).exists():
             shutil.copyfile(HERE / name, run / name)
     cfg, cfg_from = bundle_config(bundle)
+    # 번호판 모델 이름은 묶음에 저장된 것 대신 지금 코드의 기본값을 씁니다(모델 파일은 이 폴더의 것).
+    for key in ("pose_model", "ocr_cpu_model"):
+        (cfg.get("plr") or {}).pop(key, None)
     cid = str(header["client_id"])
     # 판정 기준·보정값은 저장 때 값 그대로(이 레이더에만 덮어쓴 설정은 이미 합쳐져 있어 지움)
     cfg.setdefault("event_config", {})["speeding"] = header["speeding"]
