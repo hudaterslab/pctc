@@ -768,6 +768,24 @@ logger.setLevel(logging.DEBUG)
 _SHOWINFO_FILTER = None
 
 
+# showinfo 한 줄: "n: 12 pts: 21756738558 pts_time:241742 ...". pts_time 글자는 유효숫자 6자리로만 찍혀, 프로그램을 켠 지
+# 1만 초(2.8시간)가 넘으면 0.1초, 10만 초(27.8시간)가 넘으면 1초 단위로 뭉개집니다(같은 초의 프레임 시각이 모두 같아져
+# 레이더·차량 상자·원본 사진의 시각 맞춤이 어긋남). 그래서 시각은 정수 pts × 시간 단위로 계산합니다.
+# 시간 단위는 showinfo가 처음에 한 번 찍는 "config in time_base: 1/90000" 줄에서 읽습니다.
+SHOWINFO_TIME_BASE_RE = re.compile(r"Parsed_showinfo.*?config in time_base:\s*(\d+)/(\d+)")
+
+
+def showinfo_time_base(line):
+    """showinfo의 시간 단위 줄이면 그 값(초, 예 1/90000), 아니면 None."""
+    m = SHOWINFO_TIME_BASE_RE.search(line)
+    return int(m.group(1)) / float(m.group(2)) if m and int(m.group(2)) else None
+
+
+def showinfo_seconds(pts, pts_time, time_base):
+    """showinfo 프레임 줄의 시각(초): 정수 pts × 시간 단위. 시간 단위 줄을 못 읽었으면 pts_time 글자를 그대로 씁니다."""
+    return int(pts) * time_base if time_base else float(pts_time)
+
+
 def showinfo_filter():
     """PTS를 얻는 showinfo 필터. 기본값은 프레임마다 모든 픽셀의 체크섬·평균·표준편차를 계산해
     1080p 10fps에서 ffmpeg 하나에 CPU 17%를 더 씁니다(2026-10-20 146: 39% → 23%). checksum 옵션(FFmpeg 4.4+)이 있으면 끕니다."""
@@ -6780,7 +6798,7 @@ class FullResExtractor:
     """이벤트 구간 [t0, t1]의 원본 프레임을 링버퍼 세그먼트에서 디코딩해 이벤트 폴더에 저장합니다.
     카메라마다 워커 1개로 직렬 처리합니다(카메라끼리는 동시에). 한 건에 약 10~13초라, 워커 하나를 모든 카메라가
     나눠 쓰면 이벤트가 몰릴 때 대기 중 링버퍼가 덮어써져 번호판을 놓칩니다."""
-    _SHOWINFO_PTS_RE = re.compile(r"Parsed_showinfo.*?\bn:\s*\d+\s+pts:\s*-?\d+\s+pts_time:\s*(-?[\d.]+)")
+    _SHOWINFO_PTS_RE = re.compile(r"Parsed_showinfo.*?\bn:\s*\d+\s+pts:\s*(-?\d+)\s+pts_time:\s*(-?[\d.]+)")
 
     def __init__(self, cfg):
         self.cfg = cfg
@@ -6985,10 +7003,13 @@ class FullResExtractor:
 
         pts_list = []
         def drain(pipe):
+            time_base = None
             for raw_line in iter(pipe.readline, b""):
-                m = self._SHOWINFO_PTS_RE.search(raw_line.decode("utf-8", "replace"))
+                line = raw_line.decode("utf-8", "replace")
+                time_base = showinfo_time_base(line) or time_base
+                m = self._SHOWINFO_PTS_RE.search(line)
                 if m:
-                    pts_list.append(float(m.group(1)) + wrap_offset)
+                    pts_list.append(showinfo_seconds(m.group(1), m.group(2), time_base) + wrap_offset)
         quality = int(self.cfg["jpeg_quality"])
         written = []
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -9062,7 +9083,7 @@ class SpeedFrameReader(FrameReader):
     - 원본 링버퍼(번호판용), PTS 지연이 커지면 재접속, 수신 통계 로그
     FFmpeg가 안 되면 공통 수신기의 GStreamer → OpenCV 경로로 받습니다(이때는 PTS·링버퍼 없음).
     """
-    _SHOWINFO_RE = re.compile(r"Parsed_showinfo.*?\bn:\s*(\d+)\s+pts:\s*-?\d+\s+pts_time:\s*(-?[\d.]+).*?\biskey:(\d)")
+    _SHOWINFO_RE = re.compile(r"Parsed_showinfo.*?\bn:\s*(\d+)\s+pts:\s*(-?\d+)\s+pts_time:\s*(-?[\d.]+).*?\biskey:(\d)")
     _HEVC_PARAM_SET_RE = re.compile(r"VPS \d+ does not exist|PPS id out of range|Error parsing NAL unit|Invalid data found when processing input")
     _VAAPI_FAIL_RE = re.compile(r"(?i)vaapi|hwaccel|hardware device|Device creation failed|Failed to (initialise|create|map|transfer)|scale_vaapi|hwdownload")
     _OPENCV_PTS = True
@@ -9199,10 +9220,12 @@ class SpeedFrameReader(FrameReader):
                 m = self._SHOWINFO_RE.search(line)
                 if m:
                     with cond:
-                        frame_info[int(m.group(1))] = (float(m.group(2)), m.group(3) == "1")
+                        frame_info[int(m.group(1))] = (showinfo_seconds(m.group(2), m.group(3), state.get("time_base")),
+                                                       m.group(4) == "1")
                         cond.notify_all()
                     continue
                 if "Parsed_showinfo" in line:
+                    state["time_base"] = showinfo_time_base(line) or state.get("time_base")
                     continue
                 if self._HEVC_PARAM_SET_RE.search(line):
                     if state["frames"] == 0:
