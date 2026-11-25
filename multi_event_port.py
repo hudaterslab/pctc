@@ -166,11 +166,11 @@ ID_YARDTRUCK = 4      # yardtruck
 ID_PLATE = 5          # plate(쓰지 않음. 번호판은 plate.dxnn이 원본에서 찾습니다)
 ID_G_PERSON = 6       # person(지금 모델에는 없는 자리)
 ID_PERSON_LOW = 7     # lowerbody(지금 모델에는 없는 자리)
-# 과속 대상 차량: 레이더 점이 이 상자에 붙은 과속만 관제로 보냅니다.
-TARGET_VEHICLES = [ID_G_CAR, ID_G_TRUCK]
-# 과속 대상이 아닌 물체: 레이더 점이 이 상자에 붙으면 과속으로 보지 않습니다(야드트럭·리치스태커는 단속 대상이 아니고,
+# 과속 대상 차량: 레이더 점이 이 상자에 붙은 과속만 관제로 보냅니다(야드트럭도 대상, 11/25).
+TARGET_VEHICLES = [ID_G_CAR, ID_G_TRUCK, ID_YARDTRUCK]
+# 과속 대상이 아닌 물체: 레이더 점이 이 상자에 붙으면 과속으로 보지 않습니다(리치스태커는 단속 대상이 아니고,
 # 컨테이너에 붙은 점은 레이더 값이 튄 것). 관제로 보내지 않고 excluded 폴더에 남깁니다(speeding_box_verdict).
-SPEEDING_EXCLUDED_CLASSES = (ID_CONTAINER, ID_REACHSTACKER, ID_YARDTRUCK)
+SPEEDING_EXCLUDED_CLASSES = (ID_CONTAINER, ID_REACHSTACKER)
 
 # ------------------------------------------------------------
 # 항만 이벤트: Backreach, 과속(speeding), 콘 미제거 출차(cone_ng), YT 헤드압착(yt_head_crush, yt_zone_person)
@@ -423,7 +423,7 @@ def load_system_config():
         },
         # 모델별·클래스별 점수 기준. 모델마다 {"클래스": 기준}이고, 적지 않은 클래스는 버립니다(모델이 찾아도 쓰지 않음).
         # 클래스는 이름(대소문자 무관, model_class_names) 또는 번호("7")로 적습니다.
-        # - 메인 V2(speeding): 승용차·트럭 0.6, 컨테이너·리치스태커·야드트럭 0.5. plate는 적지 않아 버립니다(번호판은
+        # - 메인 V2(speeding): 승용차·트럭·야드트럭 0.6, 컨테이너·리치스태커 0.5. plate는 적지 않아 버립니다(번호판은
         #   plate.dxnn). 사람·하반신(6·7번)은 모델에 들어오면 이름을 채우고 여기에 적습니다.
         # - topdown: 9클래스 모두 0.25(YT 헤드압착·사람 진입·Backreach가 같이 씀)
         # - side: 컨테이너·탱크 0.25, NG 사진 얼굴 가리기용 사람 0.5, 스프레더·YT_HEADER 0.25(화면 표시만, 판정에는 안 씀)
@@ -434,7 +434,7 @@ def load_system_config():
         # 번호판 인식 plr.det_conf).
         "model_confidences": {
             "MAIN_V2": {"trunklinetruck": 0.6, "normalvehicle": 0.6, "container": 0.5, "reachstacker": 0.5,
-                        "yardtruck": 0.5},
+                        "yardtruck": 0.6},
             "FACE": {"face": 0.35},
             "PLATE": {"plate": 0.1},
             "TOPDOWN": {name: 0.25 for name in TOPDOWN_CLASS_NAMES},
@@ -652,7 +652,7 @@ SPEEDING_MAX_BOX_AREA_FRAC = 0.9
 
 
 def filter_speed_main_detections(raw_dets, max_area_threshold):
-    """과속 카메라 메인 모델 검출에서 승용차·트럭, 컨테이너·리치스태커·야드트럭, 사람·하반신만 남깁니다(plate는 버림).
+    """과속 카메라 메인 모델 검출에서 승용차·트럭·야드트럭, 컨테이너·리치스태커, 사람·하반신만 남깁니다(plate는 버림).
     점수 기준(model_confidences.MAIN_V2
     클래스별)은 infer가 이미 걸렀습니다."""
     rows = []
@@ -2405,7 +2405,7 @@ class VideoRecorder:
                         shutil.move(path, os.path.join(gdir, os.path.basename(path)))
             except Exception as e:
                 logger.error(f"{NO_VEHICLE_LOG_TAG[kind]} 영상 옮기기 실패 event_id={event_id}: {e}")
-            logger.info(f"{NO_VEHICLE_LOG_TAG[kind]} 관제로 보내지 않는 과속({NO_VEHICLE_STATUS[kind]})이라 영상을 {gdir}로 옮기고 "
+            logger.info(f"{NO_VEHICLE_LOG_TAG[kind]} 관제로 보내지 않는 과속이라 영상을 {gdir}로 옮기고 "
                         f"보내지 않습니다. event_id={event_id}")
             return
         if event_id in RECEIVER_SKIPPED_EVENTS:
@@ -3167,7 +3167,7 @@ class RadarSpeedJudge:
             return
 
     def release(self, seq):
-        """seq 트랙이 낸 과속이 관제로 안 가게 됐을 때(레이더 점에 차량 상자가 없음, 컨테이너·리치스태커·야드트럭에 붙음)
+        """seq 트랙이 낸 과속이 관제로 안 가게 됐을 때(레이더 점에 차량 상자가 없음, 컨테이너·리치스태커에 붙음)
         부릅니다(SpeedingDetector). 그 과속의 재검출로 보고 판정에서 뺐던 트랙을 다시 판정 대상으로 돌리고,
         앞으로도 이 트랙 근처에 새로 잡힌 점을 재검출로 보지 않습니다. 그 트랙 자신은 다시 판정하지 않습니다."""
         with self._lock:
@@ -3612,8 +3612,8 @@ def speeding_box_verdict(assoc_tid, counts, class_of):
     """레이더 과속 이벤트에 붙은 박스로 관제에 보낼지 정합니다.
     assoc_tid: 다수결·한 프레임 연결로 고른 박스(없으면 None), counts: 판정 구간 {박스 tid: 붙은 프레임 수},
     class_of(tid): 그 박스의 클래스 번호.
-    - 고른 박스가 승용차·트럭이면 그 차의 과속입니다(보냄).
-    - 고른 박스가 컨테이너·리치스태커·야드트럭이면 과속으로 보지 않습니다(안 보냄, 그 이름을 돌려줌).
+    - 고른 박스가 승용차·트럭·야드트럭이면 그 차의 과속입니다(보냄).
+    - 고른 박스가 컨테이너·리치스태커면 과속으로 보지 않습니다(안 보냄, 그 이름을 돌려줌).
     - 고른 박스가 없으면, 판정 구간에 차량 박스가 GHOST_MIN_BOX_FRAMES 프레임 이상 붙었을 때만 차가 있었던 것으로
       봅니다. 그만큼 안 붙었으면 과속으로 보지 않습니다(안 보냄, ghost·excluded는 no_vehicle_kind가 가름).
     반환 (과속 차량 박스 tid 또는 None, 대상이 아닌 물체 이름 또는 None, 차량 박스 프레임 수,
@@ -3677,7 +3677,7 @@ class SpeedingDetector(BaseEventDetector):
             voted, counts = vote_event_track(ev, votes, offset)
             live = {int(t[4]): t for t in tracks}
             assoc_tid, method = pick_event_box(voted, counts, single, live)
-            # 붙은 박스가 과속 대상(승용차·트럭)인지 봅니다. 컨테이너·리치스태커·야드트럭이면 과속으로 보지 않습니다.
+            # 붙은 박스가 과속 대상(승용차·트럭·야드트럭)인지 봅니다. 컨테이너·리치스태커면 과속으로 보지 않습니다.
             # 박스 클래스는 지금 화면의 박스(track_map), 화면에서 사라진 박스는 표에 적어 둔 클래스로 압니다.
             vote_class = {int(v[2]): int(v[3]) for v in list(votes or [])}
             assoc_tid, excluded_class, box_frames, other_frames, has_vehicle = speeding_box_verdict(
@@ -3785,7 +3785,7 @@ class SpeedingDetector(BaseEventDetector):
                     # no_vehicle_kind). 보정값이 없으면(투영 불가) 알 수 없어 None.
                     'vehicle_box_frames': box_frames,
                     'vehicle_box': None if project is None else has_vehicle,
-                    # 레이더 점이 과속 대상이 아닌 물체에 붙었으면 그 이름(container·reachstacker·yardtruck)과 붙은 프레임 수
+                    # 레이더 점이 과속 대상이 아닌 물체에 붙었으면 그 이름(container·reachstacker)과 붙은 프레임 수
                     'excluded_class': excluded_class, 'excluded_box_frames': other_frames,
                     # 판정 구간 동안 이 레이더 점이 다른 레이더 점과 한 박스에 함께 걸린 프레임 수, 그 박스가 과속 대상 차량인지,
                     # 그 박스의 가장 느린 점보다 빨랐던 정도(km/h 중앙값). GHOST_MIN_BOX_FRAMES 프레임 이상 GHOST_FASTER_KMH
@@ -6934,6 +6934,7 @@ class FullResExtractor:
             meta["status"] = "no_segments"
             self._write_meta(out_dir, meta)
             logger.warning(f"[FULLRES] 링버퍼에 해당 구간이 없습니다. event_id={job['event_id']} window=[{t0:.3f},{t1:.3f}] ring={gen_dir}")
+            self._file_without_plate(out_dir, meta)
             return
 
         # 링이 덮어쓰기 전에 이벤트 폴더로 이어 붙여 고정합니다(mpegts는 바이트 연결로 이어집니다).
@@ -6965,6 +6966,7 @@ class FullResExtractor:
         self._write_meta(out_dir, meta)
         if meta["status"] != "ok":
             self._save_replay(job, gen_dir, out_dir, meta)
+            self._file_without_plate(out_dir, meta)
         logger.info(
             f"[FULLRES] event_id={job['event_id']} status={meta['status']} frames={len(frames)} "
             f"window=[{t0:.3f},{t1:.3f}] covered=[{segs[0][1]:.3f},{segs[-1][2]:.3f}] complete={complete} "
@@ -6980,13 +6982,30 @@ class FullResExtractor:
                 self._save_replay(job, gen_dir, out_dir, meta)
                 kind = NO_VEHICLE_EVENTS.get(str(meta.get("event_id")))
                 if kind:
-                    # 관제로 안 보내는 과속(ghost·excluded): 안 쓴 원본을 지운 뒤 사진·원본을 ghost·excluded 폴더로 옮깁니다
+                    # 관제로 안 보내는 과속(excluded, 그 밖은 ghost): 안 쓴 원본을 지운 뒤 사진·원본을 그 폴더로 옮깁니다
                     # (영상은 녹화가 끝나면 _queue_video_upload).
                     try:
                         gdir = move_no_vehicle_event(meta, out_dir, kind)
                         logger.info(f"{NO_VEHICLE_LOG_TAG[kind]} 사진·원본을 옮겼습니다. event_id={meta.get('event_id')} dir={gdir}")
                     except Exception as e:
                         logger.error(f"{NO_VEHICLE_LOG_TAG[kind]} 사진·원본 옮기기 실패 event_id={meta.get('event_id')}: {e}")
+
+    def _file_without_plate(self, out_dir, meta):
+        """원본 추출이 실패해 번호판을 읽지 못한 과속: 차량번호가 없어 관제로 보내지 않으므로 기다리지 않고 바로 그렇게 알리고,
+        사진·원본을 ghost 폴더(규칙이 거른 과속이면 excluded)로 옮깁니다(영상은 녹화가 끝나면 _queue_video_upload)."""
+        if meta.get("event_name") != SPEEDING_EVENT:
+            return
+        kind = no_vehicle_kind(meta) or "ghost"
+        mark_unsent_speeding(meta.get("event_id"), kind)
+        logger.warning(f"{NO_VEHICLE_LOG_TAG[kind]} 원본 추출 실패({meta.get('status')})로 번호판을 읽지 못한 과속입니다. "
+                       f"관제로 보내지 않습니다. event_id={meta.get('event_id')}")
+        resolve_plate_future(meta.get("event_id"),
+                             {"text": "", "status": NO_VEHICLE_STATUS[kind] if kind == "excluded" else "원본 추출 실패"})
+        try:
+            gdir = move_no_vehicle_event(meta, out_dir, kind)
+            logger.info(f"{NO_VEHICLE_LOG_TAG[kind]} 사진·원본을 옮겼습니다. event_id={meta.get('event_id')} dir={gdir}")
+        except Exception as e:
+            logger.error(f"{NO_VEHICLE_LOG_TAG[kind]} 사진·원본 옮기기 실패 event_id={meta.get('event_id')}: {e}")
 
     def _save_replay(self, job, gen_dir, out_dir, meta):
         """과속 재현 묶음: clip.ts를 재현 구간(job["replay"]["window"])으로 다시 쓰고 레이더 값을 radar.jsonl로 남깁니다.
@@ -7996,17 +8015,26 @@ def speeding_api_objects(objects, final):
              "plateStatus": status, "speed": o.get("speed_kmh")} for o in objects]
 
 
-# 과속 대상 차량 상자가 없어 관제로 보내지 않는 과속: event_id -> 종류(최근 NO_VEHICLE_EVENTS_MAX건).
-# 사진·원본·영상을 events/<ip>/<종류>/<event_id>/로 옮깁니다(no_vehicle_event_dir).
+# 관제로 보내지 않는 과속: event_id -> 종류(최근 NO_VEHICLE_EVENTS_MAX건). 보낸 과속만 일반 과속 폴더에 남고,
+# 안 보낸 과속은 사진·원본·영상을 events/<ip>/<종류>/<event_id>/로 옮깁니다(no_vehicle_event_dir).
 #   "excluded": 우리 규칙이 의도한 대로 걸러낸 것. 과속 대상이 아닌 물체(SPEEDING_EXCLUDED_CLASSES) 상자에 붙음,
 #               관제 전송 꺼짐 시간대(밤, 단속하지 않기로 함), 판정 구간에 차량 상자가 GHOST_MIN_BOX_FRAMES 이상 안 붙음
 #               (같은 차의 다른 레이더 점 = 차량 상자에 붙은 점과 속도가 같은 점, 대상 아닌 물체 옆의 점도 여기),
 #               다른 레이더 점과 한 차량 박스에 GHOST_MIN_BOX_FRAMES 프레임 이상 함께 걸렸고(붙었든 옆에 있었든)
 #               그 박스의 가장 느린 점보다 GHOST_FASTER_KMH 넘게 빨랐음, 붙은 박스보다 GHOST_RANGE_RATIO배 넘게 멀리 찍힘
-#               (둘 다 이 점에 차량 박스가 붙었어도 안 보냅니다, SpeedingDetector).
-#   "ghost": 살펴봐야 할 것. 지금은 여기로 가는 경우가 없습니다(11/23: 위 두 가지도 의도대로 거르는 것이라 excluded).
+#               (둘 다 이 점에 차량 박스가 붙었어도 안 보냅니다, SpeedingDetector),
+#               같은 차량번호를 방금 보냄(same_plate_guard_sec).
+#   "ghost": 그 밖에 안 보낸 것 전부(살펴봐야 할 것, 11/25). 차량 상자는 있었는데 차량번호가 없음: 번호판을 못 찾음(미인식,
+#            번호판이 없는 야드트럭 포함)·멀어지는 차·차량 상자 없음(drop_boxless_plate)·읽기 실패나 시간초과·원본 추출 실패.
 NO_VEHICLE_EVENTS = {}
 NO_VEHICLE_EVENTS_MAX = 2000
+
+
+def mark_unsent_speeding(event_id, kind):
+    """관제로 보내지 않는 과속을 종류(ghost·excluded)와 함께 적어 둡니다(사진·원본·영상을 그 폴더로 옮길 때 봄)."""
+    NO_VEHICLE_EVENTS[str(event_id)] = kind
+    while len(NO_VEHICLE_EVENTS) > NO_VEHICLE_EVENTS_MAX:
+        NO_VEHICLE_EVENTS.pop(next(iter(NO_VEHICLE_EVENTS)), None)
 NO_VEHICLE_STATUS = {"ghost": "확인 필요", "excluded": "과속 대상 아님"}   # 번호판 결과 자리에 넣는 상태(안 보낸 까닭)
 NO_VEHICLE_LOG_TAG = {"ghost": "[GHOST]", "excluded": "[EXCLUDED]"}
 GHOST_MIN_BOX_FRAMES = 5            # 판정 구간 동안 그 레이더 점에 차량 박스가 이만큼(프레임) 이상 붙어야 차가 있었던 것.
@@ -8017,16 +8045,16 @@ GHOST_RANGE_RATIO = 1.3             # 레이더 점 거리가 붙은 박스의 �
 
 
 def no_vehicle_kind(meta):
-    """관제로 보내지 않을 과속이면 그 종류, 아니면 None. 판정 구간 동안 그 레이더 점에 과속 대상 차량(승용차·트럭) 박스가
+    """관제로 보내지 않을 과속이면 그 종류, 아니면 None. 판정 구간 동안 그 레이더 점에 과속 대상 차량(승용차·트럭·야드트럭) 박스가
     붙지 않은 과속입니다(evidence.vehicle_box False, speeding_box_verdict).
-    - "excluded": 규칙이 의도한 대로 걸러낸 것. 컨테이너·리치스태커·야드트럭에 붙음(evidence.excluded_class에 이름),
+    - "excluded": 규칙이 의도한 대로 걸러낸 것. 컨테이너·리치스태커에 붙음(evidence.excluded_class에 이름),
       관제 전송 꺼짐 시간대(cameras.json receiver_event_off_hours, 밤), 차량 박스가 모자람(같은 차의 다른 레이더 점,
       대상 아닌 물체 옆의 점, 박스가 띄엄띄엄 잡힌 차 등), 이 레이더 점이 다른 레이더 점과 한 차량 박스에
       GHOST_MIN_BOX_FRAMES 프레임 이상 함께 걸렸고(evidence.shared_box_frames·shared_box_vehicle) 그 박스의 가장 느린
       점보다 GHOST_FASTER_KMH 넘게 빨랐음(evidence.shared_faster_kmh), 이 점이 붙은 박스보다 GHOST_RANGE_RATIO배 넘게
       멀리 찍혔음(evidence.box_range_frames·box_range_ratio). 뒤의 두 가지는 박스가 붙었어도 SpeedingDetector가
       vehicle_box를 False로 둡니다.
-    "ghost"(살펴봐야 할 것)로 가는 경우는 지금 없습니다.
+    차량 상자는 있었는데 차량번호가 없어 안 보내는 과속은 여기서 가르지 않습니다("ghost", run_plr_on_fullres).
     모델이 차를 늘 찾는다는 전제입니다."""
     evidence = meta.get("evidence") or {}
     if meta.get("event_name") != SPEEDING_EVENT or evidence.get("vehicle_box") is not False:
@@ -8072,8 +8100,9 @@ def move_no_vehicle_event(meta, out_dir, kind):
 
 def run_plr_on_fullres(out_dir, meta):
     """원본 프레임에서 번호판을 읽습니다(_plr_on_fullres). 과속이면 관제 사진이 기다리는 번호판 결과를 넘깁니다
-    (못 읽었으면 None). 차량 상자가 없는 과속(no_vehicle_kind: ghost·excluded)이면 결과를 NO_VEHICLE_STATUS로
-    넘겨 관제로 보내지 않습니다(사진·원본은 FullResExtractor._process가 안 쓴 원본을 지운 뒤 ghost·excluded 폴더로 옮김)."""
+    (못 읽었으면 None). 규칙이 거른 과속(no_vehicle_kind: excluded)이면 결과를 NO_VEHICLE_STATUS로 넘겨 관제로 보내지
+    않습니다. 차량번호가 없어 안 보내는 과속은 ghost, 같은 차량번호를 방금 보내 안 보내는 과속은 excluded로 적습니다
+    (사진·원본은 FullResExtractor._process가 안 쓴 원본을 지운 뒤 ghost·excluded 폴더로 옮김)."""
     result = None
     try:
         result = _plr_on_fullres(out_dir, meta)
@@ -8081,11 +8110,10 @@ def run_plr_on_fullres(out_dir, meta):
     finally:
         if meta.get("event_name") == SPEEDING_EVENT:
             final = (result or {}).get("final")
+            event_id = str(meta.get("event_id"))
             kind = no_vehicle_kind(meta)
             if kind:
-                NO_VEHICLE_EVENTS[str(meta.get("event_id"))] = kind
-                while len(NO_VEHICLE_EVENTS) > NO_VEHICLE_EVENTS_MAX:
-                    NO_VEHICLE_EVENTS.pop(next(iter(NO_VEHICLE_EVENTS)), None)
+                mark_unsent_speeding(event_id, kind)
                 excluded_class = (meta.get("evidence") or {}).get("excluded_class")
                 evidence = meta.get("evidence") or {}
                 beside = int(evidence.get("shared_box_frames") or 0) >= GHOST_MIN_BOX_FRAMES
@@ -8107,9 +8135,20 @@ def run_plr_on_fullres(out_dir, meta):
                                f"(번호판 {(final or {}).get('text') or '-'} {(final or {}).get('status') or '-'}). "
                                f"관제로 보내지 않습니다. event_id={meta.get('event_id')}")
                 final = {"text": "", "status": NO_VEHICLE_STATUS[kind]}
+            elif not (final or {}).get("text") or event_id in RECEIVER_SKIPPED_EVENTS:
+                # 차량 상자는 있었는데 차량번호가 없어 안 보내는 과속(번호판 못 찾음·멀어지는 차·차량 상자 없음·읽기 실패, 또는
+                # 기다리다 시간이 지나 이미 안 보내기로 함): 규칙이 거른 것이 아니라 살펴봐야 할 것이라 ghost 폴더로 갑니다.
+                mark_unsent_speeding(event_id, "ghost")
+                logger.warning(f"[GHOST] 차량번호가 없어({plate_number_missing_reason(final) or '시간초과'}) 관제로 보내지 않는 "
+                               f"과속입니다(번호판 {(final or {}).get('text') or '-'}). event_id={event_id}")
             if final and final.get("text") and (result or {}).get("api_scene"):
                 final = dict(final, api_scene=result["api_scene"])     # 관제 사진을 원본 장면으로(_save_and_send_task)
-            resolve_plate_future(meta.get("event_id"), dict(final) if final else None)
+            resolve_plate_future(event_id, dict(final) if final else None)
+            if event_id not in NO_VEHICLE_EVENTS and event_id in RECEIVER_SKIPPED_EVENTS:
+                # 번호는 읽었는데 같은 차량번호를 방금 보내 안 보내는 과속(위 resolve에서 _save_and_send_task의 send가 정함):
+                # 규칙이 의도대로 거른 것이라 excluded 폴더로 갑니다.
+                mark_unsent_speeding(event_id, "excluded")
+                logger.info(f"[EXCLUDED] 같은 차량번호({(final or {}).get('text')})를 방금 보낸 과속입니다. event_id={event_id}")
 
 
 def radar_point_at(radar_path, pts, frame_shape, max_dt=PLR_RADAR_MAX_DT):
@@ -10618,7 +10657,7 @@ class Camera:
             best = max(((calculate_iou(box, b), row) for b, row in radar_by_box), key=lambda x: x[0], default=(0.0, None))
             return best[1] if best[0] >= 0.5 else None
 
-        # 메인 모델 트랙은 과속 카메라에만 있고, 차량(승용차·트럭)과 과속 대상이 아닌 물체(컨테이너·리치스태커·야드트럭)를
+        # 메인 모델 트랙은 과속 카메라에만 있고, 차량(승용차·트럭·야드트럭)과 과속 대상이 아닌 물체(컨테이너·리치스태커)를
         # 표시합니다.
         allowed_classes = set(RADAR_BOX_CLASSES)
 
@@ -10644,7 +10683,7 @@ class Camera:
             elif cls_id == ID_G_TRUCK: label, color = f"LineTruck [{tid}]", (255, 100, 0)
             elif cls_id == ID_CONTAINER: label, color = f"Container [{tid}]", (160, 160, 160)
             elif cls_id == ID_REACHSTACKER: label, color = f"ReachStacker [{tid}]", (160, 160, 160)
-            elif cls_id == ID_YARDTRUCK: label, color = f"YardTruck [{tid}]", (160, 160, 160)
+            elif cls_id == ID_YARDTRUCK: label, color = f"YardTruck [{tid}]", (255, 100, 0)
             else: label = f"OBJ [{tid}]"
             # 객체 점수(conf): 추적이 마지막으로 맞춘 검출의 점수입니다(관제 영상에는 적지 않음).
             if not for_record:
