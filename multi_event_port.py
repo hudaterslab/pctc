@@ -193,6 +193,12 @@ TOPDOWN_MODEL = "TOPDOWN"
 # topdown.dxnn 클래스(최종 구성 9클래스, 1280x736). 트위스트락은 cone.dxnn이 찾습니다.
 TOPDOWN_CLASS_NAMES = ("YT_HEADER", "CONTAINER_40FT", "CONTAINER_20FT", "YT_CHASSIS_EMPTY", "YT_CHASSIS_HALF",
                        "TANK_20FT", "SPREADER", "PERSON", "VEHICLE")
+# hanjin_cctv_v2.dxnn(한진 CCTV 사람 모델, 옆·비스듬한 시점, 8클래스) 모델 키. 해측 추락 방지 사람 검출의 기본입니다
+# (event_config.seaside_person.person_model). 해측만 켠 카메라는 topdown 자리(엔진 결과·추적기 trk_topdown)에 이 모델을
+# 돌리고, 사람 3종(person·lowerbody·signalman)을 topdown PERSON 번호로 바꿔 넣습니다(hanjin_persons_as_topdown).
+HANJIN_MODEL = "HANJIN_V2"
+HANJIN_CLASS_NAMES = ("helmet", "head", "person", "normalvehicle", "lowerbody", "signalman", "trunklinetruck", "xband")
+HANJIN_PERSON_IDS = tuple(HANJIN_CLASS_NAMES.index(name) for name in ("person", "lowerbody", "signalman"))
 # Backreach·YT 이벤트 tid = 이 값 + topdown 추적 번호(과속 1,000,000+·콘 900,000+와 겹치지 않게).
 TOPDOWN_TID_BASE = 3_000_000
 # 개인정보 블러용으로 topdown 클래스 번호를 메인 모델 번호로 바꿉니다(사람=얼굴 블러, 차량·YT=번호판 블러).
@@ -217,7 +223,8 @@ SIDE_CLASS_NAMES = ("container", "tank", "spreader", "person", "YT_HEADER")
 # container_ocr_detector.dxnn(컨테이너 번호 OCR의 글자 영역) 클래스. 0 BIC 컨테이너 번호, 1 TYPE 크기·형식 코드
 CONTAINER_OCR_DET_CLASS_NAMES = ("BIC", "TYPE")
 # 모델의 클래스 이름(model_confidences에 이름으로 적음). 이름이 빈 칸은 아직 없는 클래스입니다(번호로는 적을 수 있음).
-MODEL_CLASS_NAMES = {"MAIN_V2": SPEEDING_CLASS_NAMES, TOPDOWN_MODEL: TOPDOWN_CLASS_NAMES, "FACE": ("face",),
+MODEL_CLASS_NAMES = {"MAIN_V2": SPEEDING_CLASS_NAMES, TOPDOWN_MODEL: TOPDOWN_CLASS_NAMES,
+                     HANJIN_MODEL: HANJIN_CLASS_NAMES, "FACE": ("face",),
                      "PLATE": ("plate",), "SIDE": SIDE_CLASS_NAMES, "CONE": ("cone",),
                      "CONTAINER_OCR_DET": CONTAINER_OCR_DET_CLASS_NAMES}
 
@@ -414,10 +421,11 @@ def load_system_config():
             # 해측 추락 방지(관제 14 SEASIDE_DETECT). 판정 기준값은 SEASIDE_DEFAULT_CONFIG이고 바꿀 값만 여기에 적습니다.
             # groups: 같은 크레인 카메라 묶음 {"묶음 이름": ["ip", ...]}(마법사가 정함). 카메라별 끝선·위험 구역·색과
             # 제외 구역은 cameras.json 카메라의 event_config.seaside_person에 마법사가 적습니다.
+            # person_model: 사람 검출 모델 "HANJIN_V2"(hanjin_cctv_v2, 옆·비스듬한 시점) 또는 "TOPDOWN"(topdown PERSON).
             SEASIDE_PERSON_EVENT: {"enabled": True, "cooldown_sec": 60, "api_event_type": 14,
-                                   "blur_face": True, "blur_plate": False, "groups": {}}
+                                   "blur_face": True, "blur_plate": False, "groups": {}, "person_model": "HANJIN_V2"}
         },
-        # NPU 모델 7개. 키는 model_confidences·model_output_formats·model_engine_pool_sizes와 같습니다.
+        # NPU 모델 8개. 키는 model_confidences·model_output_formats·model_engine_pool_sizes와 같습니다.
         # - MAIN_V2(speeding 640x384, SPEEDING_CLASS_NAMES): 과속 카메라의 차량·컨테이너·리치스태커·야드트럭.
         #   FACE(face): 사진 얼굴 가리기. PLATE(plate): 사진 번호판 가리기·과속 번호판 인식
         # - TOPDOWN(topdown 1280x736, 9클래스): YT 헤드압착·사람 진입·Backreach
@@ -426,12 +434,14 @@ def load_system_config():
         # - CONE(cone 640x384, 1클래스 콘): 콘 NG 모서리 크롭(1280x736을 반으로 줄여 넣음)
         # - CONTAINER_OCR_DET(container_ocr_detector 1280x736, 2클래스: 0 BIC, 1 TYPE): 컨테이너 번호 OCR의 글자 영역.
         #   콘 NG가 처음 난 뒤에 올립니다(container_ocr).
+        # - HANJIN_V2(hanjin_cctv_v2, PPU, 8클래스): 해측 추락 방지 사람(person·lowerbody·signalman). 해측 카메라에만 올림
         # side·cone은 raw 출력이어야 합니다(PPU는 장치에서 0.25 미만을 버려 콘 0.01 기준을 못 씀).
         "models": {
             "MAIN_V2": "speeding.dxnn",
             "FACE": "face.dxnn",
             "PLATE": "plate.dxnn",
             "TOPDOWN": "topdown.dxnn",
+            "HANJIN_V2": "hanjin_cctv_v2.dxnn",
             "SIDE": "side.dxnn",
             "CONE": "cone.dxnn",
             "CONTAINER_OCR_DET": "container_ocr_detector.dxnn"
@@ -453,6 +463,7 @@ def load_system_config():
             "FACE": {"face": 0.35},
             "PLATE": {"plate": 0.1},
             "TOPDOWN": {name: 0.25 for name in TOPDOWN_CLASS_NAMES},
+            "HANJIN_V2": {"person": 0.5, "lowerbody": 0.5, "signalman": 0.5},
             "SIDE": {"container": 0.25, "tank": 0.25, "spreader": 0.25, "person": 0.5, "YT_HEADER": 0.25},
             "CONE": {"cone": 0.01},
             "CONTAINER_OCR_DET": {"BIC": 0.25, "TYPE": 0.25}
@@ -462,6 +473,7 @@ def load_system_config():
             "FACE": "ppu",
             "PLATE": "yolo",
             "TOPDOWN": "yolo",
+            "HANJIN_V2": "ppu",
             "SIDE": "yolo",
             "CONE": "yolo",
             "CONTAINER_OCR_DET": "yolo"
@@ -475,6 +487,7 @@ def load_system_config():
             "FACE": 1,
             "PLATE": 1,
             "TOPDOWN": 2,
+            "HANJIN_V2": 2,
             "SIDE": 2,
             "CONE": 2,
             "CONTAINER_OCR_DET": 1
@@ -5250,9 +5263,34 @@ def event_model_keys(events):
     keys = []
     if SPEEDING_EVENT in events:
         keys.append("MAIN_V2")
-    if any(name in events for name in PERSON_TOPDOWN_EVENTS):
+    if any(name in events for name in PERSON_TOPDOWN_EVENTS if name != SEASIDE_PERSON_EVENT):
         keys.append(TOPDOWN_MODEL)
+    if SEASIDE_PERSON_EVENT in events and seaside_person_model() not in keys:
+        keys.append(seaside_person_model())
     return keys
+
+
+def seaside_person_model():
+    """해측 사람 검출 모델 키(event_config.seaside_person.person_model): HANJIN_V2(기본) 또는 TOPDOWN."""
+    key = str(SYS_CFG["event_config"].get(SEASIDE_PERSON_EVENT, {}).get("person_model") or HANJIN_MODEL).upper()
+    return TOPDOWN_MODEL if key == TOPDOWN_MODEL else HANJIN_MODEL
+
+
+def person_pass_model(events):
+    """카메라의 topdown 자리(검출·추적기 trk_topdown)에서 돌릴 모델 키. Backreach·YT가 있으면 topdown,
+    해측만 있으면 seaside_person_model(), 둘 다 없으면 None."""
+    if any(name in events for name in PERSON_TOPDOWN_EVENTS if name != SEASIDE_PERSON_EVENT):
+        return TOPDOWN_MODEL   # shortcut: 해측을 Backreach·YT와 한 카메라에 켜면 해측도 topdown PERSON을 씀. 그런 카메라가 생기면 모델을 따로 돌림
+    return seaside_person_model() if SEASIDE_PERSON_EVENT in events else None
+
+
+def hanjin_persons_as_topdown(rows):
+    """hanjin_cctv_v2 검출 중 사람 3종(person·lowerbody·signalman)만 topdown PERSON 번호로 바꿉니다.
+    topdown 추적기·해측 판정·화면 표시를 그대로 씁니다. 같은 사람에 person과 lowerbody가 같이 잡혀도 묶음 쿨다운으로 1건."""
+    det = detection_array(rows)
+    det = det[np.isin(det[:, 5].astype(int), HANJIN_PERSON_IDS)].copy()
+    det[:, 5] = TOPDOWN_CLASS_NAMES.index("PERSON")
+    return det
 
 
 def format_ai_fps_log(cam):
@@ -6139,7 +6177,7 @@ def yt_draw_overlay(image, snapshot, scale=(1.0, 1.0), ui=1.0):
 # TODO(현장): 끝선이 멀어지면(화면 위로) 같은 거리가 작게 보이는데, 지금은 구역을 이동·회전만 하고 크기는 그대로 둡니다.
 # ============================================================================
 SEASIDE_DEFAULT_CONFIG = {
-    "person_classes": ["PERSON"],     # topdown 9클래스의 PERSON
+    "person_classes": ["PERSON"],     # topdown PERSON(person_model HANJIN_V2면 한진 사람 3종을 이 번호로 바꿔 넣음)
     "person_hold_sec": 1.0,           # 위험 구역 안에 이만큼 머물면 알람 TODO(현장)
     "gap_tolerance_sec": 0.5,         # 검출이 잠깐 끊겨도 머무름을 이어 셈
     "group_cooldown_sec": 60.0,       # 묶음 쿨다운 TODO(현장)
@@ -11726,7 +11764,7 @@ def main():
             ip, conf,
             event_models.get("MAIN_V2") if "MAIN_V2" in event_model_keys(events) else None,
             d_face, d_plate, cam_id=cam_id,
-            det_topdown=event_models.get(TOPDOWN_MODEL) if any(name in events for name in PERSON_TOPDOWN_EVENTS) else None,
+            det_topdown=event_models.get(person_pass_model(events)) if person_pass_model(events) else None,
         )
 
     cams = []
@@ -11808,8 +11846,14 @@ def main():
             # Backreach 감시 OFF이고 YT 양하 감시 중도 아닌 동안은 초당 idle_infer_fps장만 추론하고,
             # 그 사이 프레임은 직전 검출을 다시 씁니다(Camera.backreach_inference_due).
             if cam.backreach_inference_due():
-                model = event_models.get(TOPDOWN_MODEL)
-                cam.last_topdown_res = detection_array(model.infer(fr)) if model is not None else None
+                key = person_pass_model(cam.events)
+                model = event_models.get(key)
+                if model is None:
+                    cam.last_topdown_res = None
+                elif key == HANJIN_MODEL:   # 해측만 켠 카메라: 한진 모델의 사람만 topdown PERSON으로
+                    cam.last_topdown_res = hanjin_persons_as_topdown(model.infer(fr))
+                else:
+                    cam.last_topdown_res = detection_array(model.infer(fr))
                 # 새로 추론한 검출의 스프레더로 Backreach 감시 ON·OFF를 정합니다(다시 쓰는 검출은 세지 않음).
                 cam.update_backreach_gate(cam.last_topdown_res)
             d_topdown = cam.last_topdown_res
