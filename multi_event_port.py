@@ -1271,12 +1271,16 @@ def receiver_event_off_hours(cctv_id, event_name, when):
 
 # 현장 IP 스피커 방송. cameras.json 카메라별 ip_speaker(스피커 주소, 예 "172.16.45.97")와 sound(경고 음성 파일 이름,
 # 예 "06_speeding.wav". 프로젝트의 sounds 폴더에서 찾습니다. ffmpeg이 읽는 형식이면 wav·mp3·mp4 등 모두, 절대 경로를
-# 적으면 그 파일)가 둘 다 적혀 있으면 과속 사진이 관제로 전송됐을 때
-# 그 스피커로 음성을 한 번 냅니다. 하나라도 "none"(기본값, 마법사가 과속 카메라에 적음)이면 방송 없이 이벤트만 냅니다.
-# 방송은 같은 카메라의 speaker_enable이 true일 때만 합니다(기본값 false, 마법사가 과속 카메라에 false로 적음).
-# 주소와 음성을 적어 둔 채로 speaker_enable만 바꿔 방송을 켜고 끕니다.
-# 관제로 안 가는 과속(차량 상자 없음, 차량번호 없음, 같은 번호 중복, 꺼짐 시간대 receiver_event_off_hours, 전송 실패)은
-# 방송하지 않습니다.
+# 적으면 그 파일)가 둘 다 적혀 있으면 그 스피커로 음성을 한 번 냅니다. 하나라도 "none"(기본값, 마법사가 적음)이면
+# 방송 없이 이벤트만 냅니다.
+# 방송은 같은 카메라의 speaker_enable이 true일 때만 합니다(기본값 false, 마법사가 false로 적음).
+# 주소와 음성을 적어 둔 채로 speaker_enable만 바꿔 방송을 켜고 끕니다(cameras.json만 고치면 앱을 다시 켜지 않아도 됨).
+# 언제 내나:
+#   - 콘 NG·해측·YT 헤드압착(SITE_SOUND_DETECT_EVENTS): 판정 순간. 관제 전송·회선과 상관없이 현장에 바로 알립니다.
+#     PCTC는 이벤트마다 스피커가 달라(콘 = 육측, 해측 = 해측, 헤드압착 = 헤드압착 스피커) 그 이벤트 카메라에 그 스피커를 적습니다.
+#   - 과속: 사진이 관제로 전송됐을 때. 관제로 안 가는 과속(차량 상자 없음, 차량번호 없음, 같은 번호 중복,
+#     꺼짐 시간대 receiver_event_off_hours, 전송 실패)은 방송하지 않습니다.
+# shortcut: 음성은 카메라마다 하나라, 한 카메라에 위 이벤트를 둘 이상 켜면 같은 음성이 납니다. 그런 카메라가 생기면 이벤트별 음성으로.
 # 스피커(Inter-M IP-1015HS)에는 계정·교환기 없이 SIP 전화를 직접 걸어(sip:<주소>) 음성을 G.711(PCMU) RTP로 보냅니다.
 # 스피커 SIP 계정을 가려야 하면 ip_speaker를 "97@172.16.45.97"처럼 적습니다.
 SITE_SOUND_NONE = "none"
@@ -1285,14 +1289,15 @@ SITE_SOUND_MAX_SEC = 60.0     # 음성 한 번의 최대 길이(초). 더 긴 �
 SITE_SOUND_BY_CAM = {}        # {str(cctv_id): (스피커 주소, 음성 파일)} — Camera가 설정을 읽을 때마다 채웁니다(방송 안 하면 None).
 SITE_SOUND_BUSY = set()       # 지금 방송 중인 스피커 주소. 방송이 끝나기 전에 난 이벤트는 방송하지 않습니다.
 SITE_SOUND_LOCK = threading.Lock()
+SITE_SOUND_DETECT_EVENTS = (CONE_NG_EVENT, SEASIDE_PERSON_EVENT, YT_HEAD_CRUSH_EVENT)   # 판정 순간에 방송하는 이벤트
 SIP_COMPACT_HEADERS = {"v": "via", "f": "from", "t": "to", "i": "call-id", "m": "contact", "l": "content-length",
                        "c": "content-type"}
 
 
 def wizard_site_sound(events, old_conf):
-    """마법사가 cameras.json에 적을 speaker_enable·ip_speaker·sound: 과속을 고른 카메라에 묻지 않고 false·"none"·"none"으로
-    적어 둡니다(사람이 나중에 채움). 전에 적어 둔 값은 그대로 둡니다. 과속을 고르지 않은 카메라에는 적지 않습니다."""
-    if SPEEDING_EVENT not in events:
+    """마법사가 cameras.json에 적을 speaker_enable·ip_speaker·sound: 방송하는 이벤트(과속, SITE_SOUND_DETECT_EVENTS)를
+    고른 카메라에 묻지 않고 false·"none"·"none"으로 적어 둡니다(사람이 나중에 채움). 전에 적어 둔 값은 그대로 둡니다."""
+    if not any(name in events for name in (SPEEDING_EVENT, *SITE_SOUND_DETECT_EVENTS)):
         return {}
     old_conf = old_conf or {}
     return {"speaker_enable": old_conf.get("speaker_enable") is True,
@@ -1451,9 +1456,8 @@ def _site_sound_worker(speaker, sound, tag):
 
 
 def play_site_sound(cctv_id, event_id):
-    """이 카메라에 현장 스피커 방송이 설정돼 있으면(ip_speaker·sound) 별도 스레드로 음성을 냅니다(전송 일꾼을 붙잡지 않음).
-    과속 사진이 관제로 전송됐을 때 부릅니다(_send_event_image_task). 관제로 안 가는 과속(차량 상자 없음, 차량번호 없음,
-    같은 번호 중복, 전송 꺼짐 시간대, 전송 실패)은 방송하지 않습니다.
+    """이 카메라에 현장 스피커 방송이 설정돼 있으면(ip_speaker·sound) 별도 스레드로 음성을 냅니다(부른 쪽을 붙잡지 않음).
+    콘 NG·해측·헤드압착은 판정 순간(Camera 이벤트 처리), 과속은 사진이 관제로 전송됐을 때(_send_event_image_task) 부릅니다.
     방송을 시작했으면 True. 설정이 없으면 아무것도 하지 않고, 방송하지 않는 이유가 있으면 로그만 남깁니다."""
     conf = SITE_SOUND_BY_CAM.get(str(cctv_id))
     if not conf:
@@ -6643,8 +6647,8 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                     # 관제 전송 꺼짐 시간대(receiver_event_off_hours): 과속을 고르면 기본값 17:30~08:00을 적고, 전에 적어 둔
                     # 값은 그대로 둡니다.
                     off_hours = wizard_receiver_off_hours(events, old_conf.get("receiver_event_off_hours"))
-                    # 현장 스피커 방송(speaker_enable·ip_speaker·sound): 과속 카메라에 묻지 않고 false·"none"·"none"으로 적어
-                    # 둡니다(사람이 나중에 채움).
+                    # 현장 스피커 방송(speaker_enable·ip_speaker·sound): 과속·콘 NG·해측·헤드압착 카메라에 묻지 않고
+                    # false·"none"·"none"으로 적어 둡니다(사람이 나중에 채움).
                     configs[ip].update(wizard_site_sound(events, old_conf))
                     if off_hours:
                         configs[ip]["receiver_event_off_hours"] = off_hours
@@ -10349,6 +10353,8 @@ class Camera:
                         # 블러 처리 중 감시 구간이 바뀌어도 이전 구간 결과는 저장하지 않습니다.
                         break
                     send_cps_alarm(ename, event_id)   # PCTC 캐빈실 경고음(cps_alarm). 사진 저장·관제 전송을 기다리지 않음
+                    if ename in SITE_SOUND_DETECT_EVENTS:
+                        play_site_sound(self.cam_id, event_id)   # 현장 스피커(카메라별 speaker_enable·ip_speaker·sound), 판정 순간
 
                     # 블러 처리 메타데이터 로깅 (추적용)
                     privacy_blur_meta["scope"] = "event_snapshot"
