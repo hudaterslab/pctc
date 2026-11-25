@@ -284,6 +284,8 @@ RECEIVER_EVENT_NAMES = {10: "QC_APRON_HDS", 11: "YT_HEAD_CRUSH", 12: "BACKREACH_
 # PCTC면 PLC·CPS 정보도 받습니다(PlcCpsPoller). 주소는 마법사에서 고칠 수 있습니다.
 RECEIVER_SITES = {"hjit": ("HJIT(인천)", "http://100.105.106.40/hjit/receiver/api/v1/cctv"),
                   "pctc": ("PCTC(평택)", "http://210.182.112.138/pctc/receiver/api/v1/cctv")}
+# 이벤트 영상(앞뒤 30초)을 관제로 보내는지(사이트별). PCTC는 사진만 보냅니다(11/25 사용자 결정). 영상은 단말에 그대로 남습니다.
+RECEIVER_SEND_VIDEO = {"hjit": True, "pctc": False}
 
 
 def deep_merge_dict(base, override):
@@ -2524,6 +2526,10 @@ class VideoRecorder:
             return
         if event_id in RECEIVER_SKIPPED_EVENTS:
             logger.info(f"[VIDEO API] 관제로 보내지 않기로 한 과속 이벤트(차량번호 없음·같은 번호 중복)라 영상도 보내지 않습니다. "
+                        f"event_id={event_id}")
+            return
+        if not RECEIVER_SEND_VIDEO.get(receiver_site(), True):
+            logger.info(f"[VIDEO API] {receiver_site().upper()}는 영상을 관제로 보내지 않습니다(사진만). 단말에 남김: {fpath} "
                         f"event_id={event_id}")
             return
         try:
