@@ -7125,7 +7125,7 @@ class FullResExtractor:
         사진·원본을 ghost 폴더(규칙이 거른 과속이면 excluded)로 옮깁니다(영상은 녹화가 끝나면 _queue_video_upload)."""
         if meta.get("event_name") != SPEEDING_EVENT:
             return
-        kind = no_vehicle_kind(meta) or "ghost"
+        kind = no_vehicle_kind(meta) or ("excluded" if speeding_in_off_hours(meta) else "ghost")
         mark_unsent_speeding(meta.get("event_id"), kind)
         logger.warning(f"{NO_VEHICLE_LOG_TAG[kind]} 원본 추출 실패({meta.get('status')})로 번호판을 읽지 못한 과속입니다. "
                        f"관제로 보내지 않습니다. event_id={meta.get('event_id')}")
@@ -8153,7 +8153,7 @@ def speeding_api_objects(objects, final):
 #               다른 레이더 점과 한 차량 박스에 GHOST_MIN_BOX_FRAMES 프레임 이상 함께 걸렸고(붙었든 옆에 있었든)
 #               그 박스의 가장 느린 점보다 GHOST_FASTER_KMH 넘게 빨랐음, 붙은 박스보다 GHOST_RANGE_RATIO배 넘게 멀리 찍힘
 #               (둘 다 이 점에 차량 박스가 붙었어도 안 보냅니다, SpeedingDetector),
-#               같은 차량번호를 방금 보냄(same_plate_guard_sec).
+#               같은 차량번호를 방금 보냄(same_plate_guard_sec), 차량 상자가 있어도 관제 전송 꺼짐 시간대(밤)에 남.
 #   "ghost": 그 밖에 안 보낸 것 전부(살펴봐야 할 것, 11/25). 차량 상자는 있었는데 차량번호가 없음: 번호판을 못 찾음(미인식,
 #            번호판이 없는 야드트럭 포함)·멀어지는 차·차량 상자 없음(drop_boxless_plate)·읽기 실패나 시간초과·원본 추출 실패.
 NO_VEHICLE_EVENTS = {}
@@ -8265,6 +8265,12 @@ def run_plr_on_fullres(out_dir, meta):
                                f"(번호판 {(final or {}).get('text') or '-'} {(final or {}).get('status') or '-'}). "
                                f"관제로 보내지 않습니다. event_id={meta.get('event_id')}")
                 final = {"text": "", "status": NO_VEHICLE_STATUS[kind]}
+            elif speeding_in_off_hours(meta):
+                # 차량 상자가 있는 과속이 관제 전송 꺼짐 시간대(밤)에 남: 단속하지 않기로 한 시간이라 excluded 폴더로 갑니다
+                # (전송은 send_event_*_to_receiver가 event_off_hours로 건너뜀).
+                mark_unsent_speeding(event_id, "excluded")
+                logger.info(f"[EXCLUDED] 관제 전송 꺼짐 시간대(밤)에 난 과속입니다(번호판 {(final or {}).get('text') or '-'} "
+                            f"{(final or {}).get('status') or '-'}). 관제로 보내지 않습니다. event_id={event_id}")
             elif not (final or {}).get("text") or event_id in RECEIVER_SKIPPED_EVENTS:
                 # 차량 상자는 있었는데 차량번호가 없어 안 보내는 과속(번호판 못 찾음·멀어지는 차·차량 상자 없음·읽기 실패, 또는
                 # 기다리다 시간이 지나 이미 안 보내기로 함): 규칙이 거른 것이 아니라 살펴봐야 할 것이라 ghost 폴더로 갑니다.
