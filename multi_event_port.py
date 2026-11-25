@@ -302,7 +302,13 @@ def load_system_config():
         "roi_snapshot": {"interval_sec": 3600, "verify_tls": True},
         # PCTC 인터페이스 서버의 크레인 PLC·CPS 최신 값(문서: http://<단말>:24000/docs). PCTC 단말마다 이 서버가 docker로
         # 같이 떠 있어(포트 24000) 자기 자신에게 묻습니다. receiver.site가 pctc일 때만 받습니다.
-        "plc_cps": {"url": "http://localhost:24000/api/v1/edge/cpsPlc", "interval_sec": 1.0, "timeout_sec": 3.0},
+        # use_for_events: 받은 값을 판정에 씁니다(Backreach 감시 ON·OFF = 해치 커버 작업 모드, YT 헤드압착·위험구역 사람
+        #   진입의 대상 YT = 트롤리 위치, 갠트리 이동 중(gantry_cmd)에는 콘 판정을 쉬고 처음부터). CPS 차선은 로그에만 남깁니다.
+        #   실제 값의 뜻을 확인할 때까지 꺼 둡니다(꺼지면 로그만, 판정은 영상만).
+        # stale_sec: plc_update_at(차선은 lane_updated_at)이 이 시간(초) 넘게 안 바뀌면 끊긴 것으로 보고 영상만으로 판정합니다.
+        #   PLC가 값이 그대로여도 주기적으로 보낸다고 보고 정한 값입니다(보내는 주기 확인 필요).
+        "plc_cps": {"url": "http://localhost:24000/api/v1/edge/cpsPlc", "interval_sec": 1.0, "timeout_sec": 3.0,
+                    "use_for_events": False, "stale_sec": 5.0},
         "system_performance": {
             "target_fps": 10.0,
             "dynamic_cpu_adjust_enabled": False,
@@ -380,8 +386,10 @@ def load_system_config():
                 # 2x2 한 영상으로 합칩니다(관제로 보내지 않고 단말에만 저장). 카메라가 1대인 그룹은 만들지 않습니다.
                 "group_video": True
             },
-            # Backreach: 감시 ON일 때 topdown 객체 bbox가 다각형 ROI와 겹치면 이벤트(다른 이벤트와 같은 쿨다운·중복 제한).
-            # PLC 신호를 받을 수 없어 ON·OFF는 화면의 스프레더로 정합니다(BackreachSpreaderGate): topdown이 스프레더를
+            # Backreach: 감시 ON일 때 topdown 사람·차량·YT bbox가 다각형 ROI와 겹치면 이벤트(다른 이벤트와 같은 쿨다운·중복 제한).
+            # 스프레더·컨테이너·탱크는 알람하지 않습니다(BackreachDetector.ALARM_CLASSES).
+            # ON·OFF(BackreachSpreaderGate): PLC 값을 쓸 수 있으면(plc_cps.use_for_events) 해치 커버 작업 모드일 때만 ON.
+            # 아니면 화면의 스프레더로 정합니다: topdown이 스프레더를
             # spreader_on_sec(초) 넘게 보면 ON, spreader_miss_frames(추론 프레임)보다 오래 못 보면 OFF.
             # idle_infer_fps: 감시 OFF인 동안(이벤트를 낼 수 없음) topdown 추론 횟수(초당, 0 = 줄이지 않음).
             "backreach": {"enabled": True, "cooldown_sec": 600, "api_event_type": 12, "blur_face": True, "blur_plate": True,
@@ -4599,6 +4607,29 @@ class ConeNgGroup:
         self.cone_cams = set()
         self.video_started = False
         self.video = None   # 이번 세션 4분할 영상(ConeGroupVideo)
+        self.gantry_moving = False
+
+    def hold_for_gantry(self, plc):
+        """PLC로 갠트리가 움직이는 중(gantry_cmd)이면 True: 묶인 카메라 모두 콘 판정을 쉽니다(plc는 plc_cps_now()["plc"],
+        None이면 쉬지 않음). 카메라가 크레인과 같이 움직여 서 있는 컨테이너도 옆으로 밀려 보이므로, 움직이기 시작할 때
+        판정 상태(착지 위치·세션)를 비우고 멈춘 뒤 처음부터 다시 봅니다(이동 전에 착지한 컨테이너는 판정하지 않음)."""
+        moving = plc is not None and plc["gantry_cmd"] is True
+        with self.lock:
+            if moving == self.gantry_moving:
+                return moving
+            self.gantry_moving = moving
+            if not moving:
+                logger.info(f"[CONE_NG] group={self.name} 갠트리 멈춤(또는 PLC 값 없음) → 콘 판정 처음부터 다시")
+                return False
+            f = self.fusion
+            dropped = f"세션 {f.session} 판정 없이 끝냄" if f.active else "진행 중 세션 없음"
+            # DEPARTED_OK를 내는 세션 끝(ConeNgFusion.update)을 거치지 않고 바로 비웁니다. 다음 컨테이너는 새 세션입니다.
+            # shortcut: 움직이기 직전에 정해진 NG(pending)는 남겨 두어 멈춘 뒤 첫 프레임 사진으로 나갑니다. 드물어서 그대로 둠.
+            f.cams.clear()
+            f.active, f.last_present = False, None
+            f._new_session_flags()
+            logger.info(f"[CONE_NG] group={self.name} 갠트리 이동 시작 → 콘 판정 쉼({dropped})")
+            return True
 
     def update(self, camera_key, obs, image):
         with self.lock:
@@ -4758,6 +4789,9 @@ class ConeNgDetector(BaseEventDetector):
         camera_key = kwargs.get("camera_key")
         if self.group is None:
             self.group = ConeNgGroup.for_camera(camera_key, self.config)
+        if self.group.hold_for_gantry(plc_cps_now()["plc"]):
+            self.overlay = None
+            return []
         image = kwargs.get("source_frame")
         if image is None:
             if not self._warned_no_source:
@@ -5150,12 +5184,14 @@ def format_ai_fps_log(cam):
 
 
 class BackreachSpreaderGate:
-    """Backreach 감시 ON·OFF(카메라마다). PLC 신호를 받을 수 없어(2026-10-30) 화면의 스프레더로 정합니다.
+    """Backreach 감시 ON·OFF(카메라마다).
 
-    topdown이 스프레더를 spreader_on_sec(3초) 넘게 보면 ON, spreader_miss_frames(3) 추론 프레임보다 오래 못 보면 OFF입니다.
+    PLC 값을 쓸 수 있으면(plc_cps_now) 크레인이 해치 커버 작업 중(hatchCover_mode true)일 때만 ON입니다.
+    PLC 값이 없으면(HJIT, use_for_events 꺼짐, 끊김) 화면의 스프레더로 정합니다: topdown이 스프레더를
+    spreader_on_sec(3초) 넘게 보면 ON, spreader_miss_frames(3) 추론 프레임보다 오래 못 보면 OFF입니다.
     그 이하로 끊긴 것은 검출 깜빡임으로 보고 ON 상태와 ON까지의 3초 세기를 이어 갑니다.
-    read_state()는 PLC 때와 같은 (1·0, 변경 번호)입니다. 변경 번호는 ON·OFF가 바뀔 때마다 늘어, 추론·블러 중에
-    구간이 바뀐 이벤트를 버리는 데 씁니다."""
+    read_state()는 (1·0, 변경 번호)입니다. 변경 번호는 ON·OFF가 바뀔 때마다 늘어, 추론·블러 중에
+    구간이 바뀐 이벤트를 버리는 데 씁니다. source는 지금 무엇으로 정하는지("PLC"·"스프레더")입니다."""
 
     def __init__(self, config, name=""):
         self.on_sec = float(config.get("spreader_on_sec", 3.0))
@@ -5167,10 +5203,22 @@ class BackreachSpreaderGate:
         self.generation = 0
         self.seen_since = None   # 스프레더가 (끊김 허용 안에서) 계속 보이기 시작한 시각
         self.missed = 0          # 스프레더를 못 본 연속 추론 프레임 수
+        self.source = None
 
-    def update(self, detections, now=None):
+    def update(self, detections, now=None, plc=None):
         """새로 추론한 topdown 검출(행: x1, y1, x2, y2, 점수, 클래스)로 상태를 갱신합니다.
-        직전 검출을 다시 쓰는 프레임에는 부르지 않습니다(프레임 = topdown 추론 한 번)."""
+        직전 검출을 다시 쓰는 프레임에는 부르지 않습니다(프레임 = topdown 추론 한 번).
+        plc는 plc_cps_now()["plc"]입니다. 있으면 스프레더 대신 해치 커버 작업 모드로 정합니다."""
+        source = "스프레더" if plc is None else "PLC"
+        if source != self.source:
+            logger.info(f"[BACKREACH] {self.name} 감시 ON·OFF 기준: {self.source or '-'} → "
+                        f"{'PLC 해치 커버 작업 모드' if plc is not None else '스프레더'}")
+            self.source = source
+        if plc is not None:
+            self.seen_since, self.missed = None, 0
+            if plc["hatchCover_mode"] != self.on:
+                self._set(plc["hatchCover_mode"], f"PLC 해치 커버 작업 {'시작' if plc['hatchCover_mode'] else '끝'}")
+            return
         now = time.monotonic() if now is None else now
         seen = detections is not None and any(int(d[5]) in self.spreader_ids for d in detections)
         if seen:
@@ -5196,7 +5244,7 @@ class BackreachSpreaderGate:
 
 
 class BackreachDetector(BaseEventDetector):
-    """Backreach 감시. 감시 ON(스프레더, BackreachSpreaderGate)이면 topdown의 모든 클래스(사람·차량 포함) 중
+    """Backreach 감시. 감시 ON(스프레더, BackreachSpreaderGate)이면 topdown의 사람·차량·YT(ALARM_CLASSES) 중
     bbox가 다각형 ROI와 조금이라도 겹치거나 경계에 닿는 객체를 이벤트로 냅니다.
     중심점·하단점 기준이 아니고, 오목한 ROI도 그대로 판정합니다. 빈 ROI에서는 이벤트가 없습니다.
     쿨다운(기본 600초)과 같은 객체 중복 제한은 Camera 공통 처리가 다른 이벤트와 똑같이 적용합니다."""
@@ -5205,6 +5253,10 @@ class BackreachDetector(BaseEventDetector):
     # 가로 720으로 받으면 GPU가 줄인 그림을 CPU가 모델에 넣을 때 다시 1280으로 키워 작은 물체를 놓칠 수 있어,
     # 가로 1280으로 받습니다(GPU가 1920 → 1280으로 바로 줄이고, CPU는 위아래 빈칸만 채움).
     stream_max_width = 1280
+    # 크레인이 옮기는 스프레더·컨테이너·탱크는 빼고, 구역에 들어온 사람·차량·YT만 알람합니다(HJIT 포함, 2026-11-24 결정).
+    # 감시가 켜질 때(스프레더가 보임)는 크레인 자신의 스프레더·매단 컨테이너가 백리치에 닿아 사람 없이도 알람이 났습니다.
+    ALARM_CLASSES = frozenset(TOPDOWN_CLASS_NAMES.index(n) for n in
+                              ("PERSON", "VEHICLE", "YT_HEADER", "YT_CHASSIS_EMPTY", "YT_CHASSIS_HALF"))
 
     def process(self, tracks, track_map, frame, fid, **kwargs):
         if kwargs.get('backreach_on') != 1:
@@ -5218,7 +5270,7 @@ class BackreachDetector(BaseEventDetector):
         tracks = kwargs.get('topdown_tracks')
         for t in (tracks if tracks is not None else []):
             box = [float(v) for v in t[:4]]
-            if not box_overlaps_polygon(box, contour):
+            if int(t[6]) not in self.ALARM_CLASSES or not box_overlaps_polygon(box, contour):
                 continue
             raw_tid, score, class_id = int(t[4]), float(t[5]), int(t[6])
             tid = TOPDOWN_TID_BASE + raw_tid
@@ -5235,7 +5287,8 @@ class BackreachDetector(BaseEventDetector):
                              'class_id': class_id, 'raw_tid': raw_tid}],
                 'decision_trace': {
                     'detector': 'BackreachDetector',
-                    'reason': 'spreader_on_and_bbox_overlaps_roi',
+                    'reason': ('plc_hatch_cover_and_bbox_overlaps_roi' if kwargs.get('backreach_source') == "PLC"
+                               else 'spreader_on_and_bbox_overlaps_roi'),
                     'backreach_on': 1,
                     'signal_generation': kwargs.get('signal_generation'),
                     'model': TOPDOWN_MODEL,
@@ -5264,7 +5317,9 @@ class BackreachDetector(BaseEventDetector):
 #     topdown PERSON·VEHICLE·YT 상자로 합니다.
 #   - 감시 상태: 카메라마다 YTDischargeMonitor 하나(Camera.yt_monitor)를 프레임마다 한 번 갱신하고,
 #     두 이벤트는 그 결과(yt_snapshot)를 받아 판단만 합니다.
-#   - PLC 양하 신호는 없다고 보고 영상으로만 감시를 시작합니다.
+#   - 감시 시작(정차·빈 샤시)은 영상으로만 합니다. PLC 값을 쓸 수 있으면(plc_cps.use_for_events) 컨테이너가
+#     매달린 YT를 트롤리 위치로 골라(plc_lanes) 그 YT만 이탈 시간·위험구역 사람을 셉니다. CPS가 안내한 차선과 달라도
+#     셉니다(다른 차선에 내리는 것은 괜찮고, 그 자리 YT와 겹치는 것이 위험).
 # ============================================================================
 # 클래스 이름은 Backreach와 같은 topdown 표(TOPDOWN_CLASS_NAMES)입니다.
 YT_DEFAULT_CONFIG = {
@@ -5311,6 +5366,19 @@ YT_DEFAULT_CONFIG = {
     # 작업 차선 ROI(초록, 카메라 roi_poly_norm)가 있으면 그 안에 중심이 있는 YT만 감시합니다. 없으면 화면 전체입니다.
     # Backreach와 같은 카메라면 Backreach 다각형 ROI를 같이 씁니다.
     "use_roi": True,
+    # PLC로 컨테이너가 매달린 YT 고르기(plc_cps.use_for_events가 켜져 있고 값이 최신일 때만, 아니면 영상만).
+    # 차선마다 트롤리 위치 범위(mm, [시작, 끝))와 화면에서 그 차선이 차지하는 띠(차선을 가로지르는 방향 0~1, [시작, 끝)).
+    # 스프레더가 잠겨 있으면 트롤리가 있는 차선의 띠 안에 샤시 가운데가 있는 YT만 "컨테이너가 위에 매달린 YT"로 봅니다
+    # (트롤리가 어느 차선에도 없으면 그런 YT 없음). 헤드압착은 그 YT만 이탈 시간을 세고 규격은 스프레더 길이로,
+    # 위험구역 사람 진입은 그 YT 구역만 켭니다. CPS 차선은 판정에 쓰지 않고 로그(보정 확인용)에만 남깁니다.
+    # 더미 값입니다(4차선, 트롤리 4m 간격, 화면 4등분). 크레인·카메라마다 실제 트롤리 위치와 화면을 보고 보정해야 합니다.
+    # shortcut: 차선을 화면의 곧은 띠로 봅니다. 원근 때문에 띠로 안 맞으면 차선마다 다각형으로 바꿉니다.
+    "plc_lanes": [
+        {"lane": 1, "trolley_mm": [0, 4000], "screen": [0.0, 0.25]},
+        {"lane": 2, "trolley_mm": [4000, 8000], "screen": [0.25, 0.5]},
+        {"lane": 3, "trolley_mm": [8000, 12000], "screen": [0.5, 0.75]},
+        {"lane": 4, "trolley_mm": [12000, 16000], "screen": [0.75, 1.0]},
+    ],
 }
 
 
@@ -5354,6 +5422,29 @@ def yt_danger_zone(chassis_box, axis, width_ratio):
         return [center - half, y1, center + half, y2]
     half, center = (x2 - x1) * width_ratio / 2.0, (y1 + y2) / 2.0
     return [x1, center - half, x2, center + half]
+
+
+def yt_plc_target(plc, lane, cfg):
+    """PLC로 본 지금 크레인의 작업 차선. PLC 값을 쓸 수 없으면 None(영상만으로 판정).
+    {"cps_lane": CPS 차선(로그용, 없으면 None), "trolley_lane": 트롤리 위치가 든 차선(plc_lanes에 없으면 None),
+     "locked": 스프레더 잠김, "screen": 트롤리 차선의 화면 띠(없으면 None), "size": 매달린 컨테이너 규격(트윈이면 20ft 둘 = 40ft)}"""
+    if plc is None:
+        return None
+    row = next((row for row in cfg["plc_lanes"]
+                if row["trolley_mm"][0] <= plc["trolley_pos"] < row["trolley_mm"][1]), None)
+    return {"cps_lane": lane, "trolley_lane": row and row["lane"], "locked": plc["spreader_twistLock"],
+            "screen": row and row["screen"],
+            "size": "40ft" if plc["spreader_twinMode"] else f"{plc['spreader_length']}ft"}
+
+
+def yt_plc_over(target, chassis_box, axis, frame_size):
+    """잠근 컨테이너가 이 YT(샤시 박스, 차선 방향 axis 1=세로) 위에 있는지: 잠김, 샤시 가운데가 트롤리 차선의
+    화면 띠 안. frame_size는 (가로, 세로) 픽셀입니다."""
+    if not target["locked"] or target["screen"] is None:
+        return False
+    cross = 0 if axis == 1 else 1   # 차선을 가로지르는 방향(세로 차선이면 x)
+    position = _yt_center(chassis_box)[cross] / frame_size[cross]
+    return target["screen"][0] <= position < target["screen"][1]
 
 
 @dataclass
@@ -5432,6 +5523,9 @@ class _YTUnit:
         self.container_seen = None
         self.evaluation = None
         self.dev_since = None
+        # PLC·CPS로 본 이 YT: None(영상만) 또는 {"over": 잠근 컨테이너가 이 YT 위(yt_plc_over), "size", "cps_lane",
+        # "trolley_lane"}. YTDischargeMonitor.update가 프레임마다 정합니다.
+        self.plc = None
         self.set_geometry(head.box, chassis.box)
 
     def set_geometry(self, head_box, chassis_box, half=None):
@@ -5546,6 +5640,12 @@ class _YTUnit:
             self.last_seen = t
 
     def track_container(self, containers, spreaders, t, cfg):
+        if self.plc is not None and not self.plc["over"]:
+            # PLC·CPS로 보면 이 YT 위에 잠근 컨테이너가 없습니다. 검출 깜빡임이 아니므로 끊김 허용(lost_grace_sec) 없이 바로 비웁니다.
+            if self.container is not None:
+                self._log_deviation_end(t, cfg, "PLC·CPS로 보면 이 YT 위에 잠근 컨테이너가 없음")
+            self.container = self.container_seen = self.evaluation = self.dev_since = None
+            return
         zone = self.container_search_zone(cfg)
         chassis_center = _yt_center(self.chassis_box)
         candidates = []
@@ -5559,7 +5659,8 @@ class _YTUnit:
             candidates.append((math.dist(_yt_center(obj.box), chassis_center), obj, spreader))
         if candidates:
             _, obj, spreader = min(candidates, key=lambda item: item[0])
-            self.container = {"obj": obj, "size": cfg["container_classes"][obj.name], "spreader": spreader}
+            size = self.plc["size"] if self.plc is not None else cfg["container_classes"][obj.name]
+            self.container = {"obj": obj, "size": size, "spreader": spreader}
             self.container_seen = t
             self.last_seen = t
             self.evaluation = self.evaluate(obj, self.container["size"], cfg)
@@ -5579,14 +5680,14 @@ class _YTUnit:
         """컨테이너 중심을 하락 예측 지점으로 보고, 규격 길이만큼의 바닥면이 적재영역 안인지 봅니다.
 
         매달린 컨테이너는 카메라에 가까워 박스가 실제보다 크게 보이므로 박스 크기 대신
-        샤시 길이에 대한 규격 비율(40ft=샤시 전체, 20ft=절반)로 바닥면을 추정합니다.
+        샤시 길이에 대한 규격 비율(40ft=샤시 전체, 20ft=절반, 45ft=45/40)로 바닥면을 추정합니다.
         반 샤시는 상자(비어 있는 절반)의 2배를 샤시 길이로 보므로, 20ft 바닥면이 그 빈 절반만 하고
         적재영역도 빈 절반 + 앞뒤 여유(샤시 전체 길이의 load_margin_ratio)입니다.
         """
         axis, cross = self.axis, 1 - self.axis
         start, end = self.chassis_box[axis], self.chassis_box[axis + 2]
         margin = cfg["load_margin_ratio"] * self.length
-        half = self.length / 2.0 if size == "40ft" else self.length / 4.0
+        half = self.length / 2.0 * {"20ft": 0.5, "40ft": 1.0, "45ft": 45 / 40}[size]
         center = _yt_center(obj.box)
         low, high = center[axis] - half, center[axis] + half
         over_low = max(0.0, (start - margin) - low)
@@ -5636,6 +5737,7 @@ class _YTUnit:
             "load_area": self.load_area(cfg),
             "container": container, "evaluation": copy.deepcopy(self.evaluation),
             "deviation_sec": round(deviation_sec, 2), "deviation_hold_sec": cfg["deviation_hold_sec"],
+            "plc": copy.deepcopy(self.plc),
         }
 
 
@@ -5650,10 +5752,12 @@ class YTDischargeMonitor:
         self.next_uid = 1
         self.frame_key = None
         self.snapshot = {"timestamp": None, "units": []}
+        self._plc_note = None   # PLC·CPS 매칭 결과 로그(바뀔 때만)
 
-    def update(self, fid, t, tracks, roi_poly=None):
+    def update(self, fid, t, tracks, roi_poly=None, frame_size=None, plc=None, lane=None):
         """프레임 하나를 반영합니다. tracks는 topdown 트랙 [x1, y1, x2, y2, 추적 번호, 점수, 클래스] 배열(t_topdown),
-        roi_poly는 카메라 작업 차선 ROI(초록, 픽셀)입니다."""
+        roi_poly는 카메라 작업 차선 ROI(초록, 픽셀), frame_size는 (가로, 세로) 픽셀,
+        plc·lane은 plc_cps_now()의 값입니다(None이면 영상만으로 판정)."""
         with self.lock:
             key = (fid, float(t))
             if key == self.frame_key:
@@ -5684,10 +5788,14 @@ class YTDischargeMonitor:
                     self.units.append(unit)
                 matched.add(unit.uid)
                 unit.observe(head, ch, t, cfg)
+            target = yt_plc_target(plc, lane, cfg) if frame_size else None
             for unit in self.units:
                 if unit.uid not in matched:
                     unit.note_empty_chassis(chassis, t)
                 unit.update_arming(t, cfg)
+                unit.plc = None if target is None else {
+                    "over": yt_plc_over(target, unit.chassis_box, unit.axis, frame_size), "size": target["size"],
+                    "cps_lane": target["cps_lane"], "trolley_lane": target["trolley_lane"]}
                 if unit.armed:
                     unit.track_container(containers, spreaders, t, cfg)
                     unit.keep_alive(heads + chassis + containers, t, cfg)
@@ -5697,8 +5805,26 @@ class YTDischargeMonitor:
                     what = "그 자리에 헤드·빈 샤시·컨테이너가" if unit.armed else "헤드가"
                     unit.log_restart(t, cfg, f"{what} {gone:.1f}초 동안 안 보임(기준 {cfg['release_sec']:g}초)")
             self.units = [unit for unit in self.units if t - unit.last_seen <= cfg["release_sec"]]
+            self._log_plc(target)
             self.snapshot = {"timestamp": t, "units": [unit.view(t, cfg) for unit in self.units]}
             return self.snapshot
+
+    def _log_plc(self, target):
+        """PLC로 고른 YT가 바뀔 때 한 줄 남깁니다(plc_lanes 보정·오탐 분석용: 양하 때 CPS 차선 = 트롤리 차선이어야 맞음)."""
+        note = None if target is None else (
+            target["cps_lane"], target["trolley_lane"], target["locked"],
+            tuple(unit.uid for unit in self.units if unit.plc["over"]))
+        if note == self._plc_note:
+            return
+        self._plc_note = note
+        if target is None:
+            logger.info(f"[YT] {self.name} PLC 안 씀(영상만으로 판정)")
+            return
+        cps_lane, trolley_lane, locked, uids = note
+        logger.info(f"[YT] {self.name} PLC·CPS: CPS 차선 {cps_lane if cps_lane is not None else '없음'}, "
+                    f"트롤리 차선 {trolley_lane if trolley_lane is not None else '없음'}, "
+                    f"스프레더 {'잠김' if locked else '열림'} → 컨테이너가 매달린 YT "
+                    f"{', '.join(f'YT{uid}' for uid in uids) or '없음'}")
 
     def _match_unit(self, head_box, exclude):
         best, best_dist = None, None
@@ -5764,6 +5890,7 @@ class YTHeadCrushDetector(_YTDetectorBase):
                     'evaluation': evaluation, 'load_area': unit["load_area"],
                     'chassis_box': unit["chassis_box"], 'head_box': unit["head_box"],
                     'spreader_box': container["spreader_box"],
+                    'plc': unit["plc"],
                 },
             })
         return triggered
@@ -5783,10 +5910,12 @@ class YTZonePersonDetector(_YTDetectorBase):
         self.last_inside = {}    # 추적 번호 -> 구역 안으로 마지막으로 잡힌 시각(기준 전에 나간 사람 로그용)
 
     def danger_zones(self, snapshot):
-        """감시 중인 YT마다 (YT 상태, 위험구역 [x1, y1, x2, y2]). 화면(Camera.draw)도 이 구역을 그립니다."""
+        """감시 중인 YT마다 (YT 상태, 위험구역 [x1, y1, x2, y2]). 화면(Camera.draw)도 이 구역을 그립니다.
+        PLC·CPS를 쓸 수 있으면 잠근 컨테이너가 그 YT 위에 매달려 있는 동안(unit["plc"]["over"])만 구역을 켭니다."""
         ratio = float(self.config["danger_zone_width_ratio"])
         return [(unit, yt_danger_zone(unit["chassis_box"], unit["axis"], ratio))
-                for unit in snapshot.get("units", []) if unit["armed"]]
+                for unit in snapshot.get("units", [])
+                if unit["armed"] and (unit["plc"] is None or unit["plc"]["over"])]
 
     def process(self, tracks, track_map, frame, fid, **kwargs):
         snapshot = kwargs.get('yt_snapshot') or {}
@@ -5831,6 +5960,7 @@ class YTZonePersonDetector(_YTDetectorBase):
                                     [float(zone[2]), float(zone[3])], [float(zone[0]), float(zone[3])]],
                     'danger_zone_width_ratio': float(self.config["danger_zone_width_ratio"]),
                     'inside_sec': round(t - since, 2), 'person_hold_sec': hold,
+                    'plc': unit["plc"],
                 },
             })
         # 이번 프레임에 구역 안으로 안 잡힌 사람은 끊긴 프레임을 세고, person_miss_frames를 넘으면 지웁니다(다시 0초).
@@ -9710,9 +9840,10 @@ class Camera:
             if handler is not None else None
 
     def update_backreach_gate(self, d_topdown, now=None):
-        """topdown을 새로 추론한 프레임마다 부릅니다(run_camera_inference). 스프레더로 감시 ON·OFF를 정합니다."""
+        """topdown을 새로 추론한 프레임마다 부릅니다(run_camera_inference). PLC 해치 커버 작업 모드(없으면 스프레더)로
+        감시 ON·OFF를 정합니다."""
         if self.backreach_gate is not None:
-            self.backreach_gate.update(d_topdown, now)
+            self.backreach_gate.update(d_topdown, now, plc_cps_now()["plc"])
 
     def _read_backreach_state(self):
         """(감시 ON 1·OFF 0, 변경번호). Backreach가 없는 카메라는 (None, None)입니다."""
@@ -10252,9 +10383,13 @@ class Camera:
             t_topdown = tracks if len(tracks) else np.empty((0, 7))
         # YT 양하 감시 상태는 프레임마다 한 번 갱신하고, YT 두 이벤트가 그 결과(yt_snapshot)를 같이 받습니다.
         # 관제에서 YT 이벤트를 꺼도 화면 표시와 추론 빈도 판단을 위해 상태는 계속 갱신합니다.
-        # PLC 양하 신호는 없다고 보고 영상으로만 판단합니다.
-        yt_snapshot = self.yt_monitor.update(fid, now_t, t_topdown, self.roi_poly) \
-            if self.yt_monitor is not None else None
+        # 감시 시작은 영상으로만 하고, PLC·CPS 값을 쓸 수 있으면 컨테이너가 매달린 YT를 그 값으로 고릅니다(plc_lanes).
+        yt_snapshot = None
+        if self.yt_monitor is not None:
+            plc_now = plc_cps_now()
+            yt_snapshot = self.yt_monitor.update(fid, now_t, t_topdown, self.roi_poly,
+                                                 self.roi_frame_shape[::-1] if self.roi_frame_shape else None,
+                                                 plc_now["plc"], plc_now["lane"])
 
         now = time.time()
         current_alarms = {}
@@ -10294,6 +10429,7 @@ class Camera:
                     'topdown_tracks': t_topdown,
                     'backreach_on': br_state[0],
                     'signal_generation': br_state[1],
+                    'backreach_source': self.backreach_gate.source if self.backreach_gate is not None else None,
                 }
             elif ename in YT_EVENTS:
                 # YT: Backreach와 같은 topdown 추적 결과와 이번 프레임의 양하 감시 상태를 받습니다. 블러도 Backreach와 같습니다.
@@ -10884,9 +11020,68 @@ def get_npu_usage():
     used_gib = float(used) * {"KiB": 1 / 1048576, "MiB": 1 / 1024, "GiB": 1.0}[unit]
     return util, (used_gib, float(total), float(pct))
 
-# PCTC 크레인 PLC·CPS 최신 값(인터페이스 서버 GET plc_cps.url). 아직 이 값을 쓰는 이벤트가 없어, 값이 바뀔 때마다
-# 로그(파일·터미널)에 남기고 마지막 값만 여기에 둡니다. {"data": 응답 dict, "received_at": time.time()}
-PLC_CPS_LATEST = {"data": None, "received_at": None}
+# PCTC 크레인 PLC·CPS 최신 값(인터페이스 서버 GET plc_cps.url, PlcCpsPoller가 채움). 판정에서는 plc_cps_now()로 읽습니다.
+# data: 응답 dict, received_at: 받은 time.time(),
+# plc_changed_at·lane_changed_at: plc_update_at·lane_updated_at이 마지막으로 바뀐 time.monotonic()(앱을 켠 뒤 처음 받은 값은 안 셈),
+# plc_bad·lane_bad: 판정에 못 쓰는 값이면 그 이유(plc_cps_problem), 괜찮으면 None
+PLC_CPS_LATEST = {"data": None, "received_at": None, "plc_changed_at": None, "lane_changed_at": None,
+                  "plc_bad": None, "lane_bad": None}
+PLC_FLAG_KEYS = ("hoist_cmd", "trolley_cmd", "gantry_cmd", "spreader_landPin", "spreader_twistLock",
+                 "spreader_twinMode", "hatchCover_mode")
+PLC_INT_KEYS = ("hoist_pos", "trolley_pos", "gantry_pos", "spreader_length")
+
+
+def plc_cps_problem(data):
+    """판정에 쓰기 전 값 검사 → (PLC 문제, 차선 문제), 문제가 없으면 None. 서버는 형식(400)만 보고 범위는 보지 않습니다.
+    위치(mm)는 0점을 몰라(호이스트는 레일 아래로 내려가면 음수일 수 있음) 정수인지만 봅니다."""
+    bad = [k for k in PLC_FLAG_KEYS if not isinstance(data.get(k), bool)]
+    bad += [k for k in PLC_INT_KEYS if type(data.get(k)) is not int]   # bool도 int라서 type으로 봅니다
+    if not bad and data["spreader_length"] not in (20, 40, 45):
+        bad.append(f"spreader_length={data['spreader_length']}(20·40·45가 아님)")
+    lane = data.get("lane")
+    return ", ".join(bad) or None, None if type(lane) is int and lane >= 1 else f"lane={lane}"
+
+
+def plc_cps_ingest(data, now):
+    """GET 응답 하나를 PLC_CPS_LATEST에 넣습니다(now = time.monotonic()). 서버는 마지막 값을 계속 돌려주므로,
+    plc_update_at·lane_updated_at이 이전 응답과 달라졌을 때만 새로 들어온 값으로 봅니다."""
+    prev = PLC_CPS_LATEST["data"]
+    bads = dict(zip(("plc", "lane"), plc_cps_problem(data)))
+    changed = {key: prev is not None and data.get(at_key) != prev.get(at_key)
+               for key, at_key in (("plc", "plc_update_at"), ("lane", "lane_updated_at"))}
+    for key, name in (("plc", "PLC"), ("lane", "차선")):
+        if changed[key] and bads[key] and bads[key] != PLC_CPS_LATEST[key + "_bad"]:
+            logger.warning(f"[PLC_CPS] {name} 값 이상이라 판정에 안 씀: {bads[key]}")
+    PLC_CPS_LATEST.update(data=data, received_at=time.time(), plc_bad=bads["plc"], lane_bad=bads["lane"])
+    for key in ("plc", "lane"):
+        if changed[key]:
+            PLC_CPS_LATEST[key + "_changed_at"] = now
+
+
+def plc_cps_now(now=None):
+    """판정에 쓸 PLC·CPS 값 {"plc": 값 dict 또는 None, "lane": CPS 차선 또는 None, "why": {"plc"·"lane": 못 쓰는 이유}}.
+    None이면 그 값 없이 지금까지처럼 영상만으로 판정합니다. 못 쓰는 경우: plc_cps.use_for_events 꺼짐(HJIT는 값 자체가 없음),
+    앱을 켠 뒤 시각(plc_update_at·lane_updated_at)이 한 번도 안 바뀜(서버에 남은 시험 값·옛 값), stale_sec 넘게 안 바뀜(끊김),
+    값 이상(plc_cps_problem)."""
+    cfg, latest = SYS_CFG["plc_cps"], PLC_CPS_LATEST
+    now = time.monotonic() if now is None else now
+    out = {"plc": None, "lane": None, "why": {}}
+    for key in ("plc", "lane"):
+        at, bad = latest[f"{key}_changed_at"], latest[f"{key}_bad"]
+        if not cfg.get("use_for_events"):
+            out["why"][key] = "use_for_events 꺼짐"
+        elif at is None:
+            out["why"][key] = "앱을 켠 뒤 새 값이 안 옴"
+        elif now - at > float(cfg["stale_sec"]):
+            out["why"][key] = f"{now - at:.0f}초째 안 바뀜(기준 {float(cfg['stale_sec']):g}초)"
+        elif bad:
+            out["why"][key] = f"값 이상({bad})"
+    data = latest["data"]
+    if "plc" not in out["why"]:
+        out["plc"] = {k: data[k] for k in PLC_FLAG_KEYS + PLC_INT_KEYS}
+    if "lane" not in out["why"]:
+        out["lane"] = data["lane"]
+    return out
 
 
 class PlcCpsPoller:
@@ -10897,6 +11092,7 @@ class PlcCpsPoller:
         self.running = True
         self._failures = 0
         self._last = None
+        self._usable = None   # (PLC를 판정에 씀, 차선을 판정에 씀). 바뀔 때만 로그
         self.thread = threading.Thread(target=self._run, name="plc-cps", daemon=True)
         self.thread.start()
 
@@ -10922,13 +11118,22 @@ class PlcCpsPoller:
                 if self._failures:
                     logger.info(f"[PLC_CPS] 수신 다시 됨 (연속 실패 {self._failures}회 뒤)")
                     self._failures = 0
-                PLC_CPS_LATEST.update(data=data, received_at=time.time())
-                if data != self._last:
-                    self._last = data
+                plc_cps_ingest(data, time.monotonic())
+                # 시각(*_at)만 바뀐 응답은 남기지 않습니다(주기적으로 보내면 매초 한 줄이 됨). 끊김은 아래 판정 사용 로그로 봅니다.
+                values = {k: v for k, v in data.items() if not k.endswith("_at")}
+                if values != self._last:
+                    self._last = values
                     if all(v is None for v in data.values()):
                         logger.info("[PLC_CPS] 데이터 없음 (모든 값 null: CPS·PLC가 아직 보내지 않음)")
                     else:
                         logger.info("[PLC_CPS] " + " ".join(f"{k}={v}" for k, v in data.items()))
+            state = plc_cps_now()
+            usable = (state["plc"] is not None, state["lane"] is not None)
+            if usable != self._usable:
+                self._usable = usable
+                logger.info("[PLC_CPS] 판정에 씀: " + ", ".join(
+                    f"{name} {'예' if ok else '아니오(' + state['why'][key] + ')'}"
+                    for (key, name), ok in zip((("plc", "PLC"), ("lane", "차선")), usable)))
             time.sleep(max(0.0, self.interval - (time.monotonic() - started)))
 
     def stop(self):
