@@ -6128,6 +6128,10 @@ def yt_draw_overlay(image, snapshot, scale=(1.0, 1.0), ui=1.0):
 #   - 판정: 사람 발 위치(박스 아래 가운데)가 옮겨진 위험 구역 안에 있으면 머무름을 셉니다.
 #   - 끝선을 못 찾으면 마지막 위치를 roi_hold_sec 동안 쓰고, 그 뒤에는 판정을 멈춥니다(틀린 구역으로 판정하지 않음).
 #   - 크레인 PLC는 없다고 봅니다.
+# 고정(edge.mode "fixed"): 카메라를 크레인 다리·빔에 달면 크레인이 안벽과 나란히만 움직여 화면 속 끝선이 제자리이므로
+#   그린 구역을 그대로 씁니다. 이때는 위험 구역(zone_norm)만 있으면 판정합니다(PCTC 2호기 224·225·227, 11/25).
+#   배가 붙어 있으면 끝선 옆이 물이 아니라 선체라 vision은 끝선을 못 찾습니다. 끝선·색까지 그려 두면 틀어짐 점검만 합니다.
+# 사람 위치(foot): "bottom" 박스 아래 가운데(비스듬히 볼 때), "center" 박스 가운데(바로 위에서 내려다보는 돔).
 # 묶음: 한 카메라에서 이벤트가 나면 그 카메라 이벤트 1건으로 내고, 묶인 나머지 카메라의 그 순간 사진과 4분할 영상을
 #   같은 이벤트로 남깁니다(콘 NG 묶음과 같은 방식, 카메라 간 같은 사람인지는 따지지 않음). 묶음 쿨다운
 #   group_cooldown_sec 동안 묶음 안에서 새 이벤트를 내지 않습니다(겹치는 화면의 같은 사람이 2~3건으로 나가지 않게).
@@ -6142,8 +6146,9 @@ SEASIDE_DEFAULT_CONFIG = {
     "idle_infer_fps": 3.0,            # 구역 근처에 사람이 없을 때 topdown 추론 횟수(초당, 0 = 줄이지 않음)
     "near_ratio": 0.15,               # 위험 구역에서 화면 높이의 이 비율 안에 사람이 보이면 그 카메라는 매 프레임 추론
     "near_hold_sec": 3.0,             # 근처 사람이 사라진 뒤에도 이만큼 매 프레임 추론
+    "foot": "bottom",                 # 사람 위치: "bottom" 박스 아래 가운데(비스듬히), "center" 박스 가운데(바로 위에서)
     "edge": {
-        "mode": "vision",             # "vision" = 끝선을 따라 구역을 옮김(크레인에 단 카메라), "fixed" = 그린 그대로
+        "mode": "vision",             # "vision" = 끝선을 따라 구역을 옮김, "fixed" = 그린 그대로(크레인 다리·빔에 단 카메라)
         "check_every_sec": 5.0,       # fixed: 끝선으로 카메라 틀어짐 점검 주기
         "drift_px": 20.0,             # fixed: 설치 끝선과 찾은 끝선이 이만큼(가로 640 기준 px) 벌어진 채
         "drift_sec": 30.0,            #        이만큼 이어지면 틀어짐 경고(판정은 계속)
@@ -6167,6 +6172,7 @@ SEASIDE_DEFAULT_CONFIG = {
     "group_video": True               # 묶음 4분할 영상(단말 저장)
 }
 SEASIDE_WORK_W = 640   # 끝선 검출·색 비교 작업 폭(px 기준값도 이 폭 기준)
+SEASIDE_EDGE_KEYS = ("edge_norm", "sea_norm", "land_ref", "water_ref")   # 끝선을 찾는 데 쓰는 설치 값(vision에 필요)
 
 
 class EdgeLine:
@@ -6449,9 +6455,13 @@ class SeaSidePersonDetector(BaseEventDetector):
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(deep_merge_dict(SEASIDE_DEFAULT_CONFIG, config), roi_poly, roi_lines)
         c = self.config
-        self.ready = all(c.get(k) for k in ("edge_norm", "sea_norm", "zone_norm", "land_ref", "water_ref"))
+        self.fixed = str(c["edge"].get("mode", "vision")).lower() == "fixed"
+        # 고정 모드는 그린 구역만 있으면 됩니다. vision은 끝선·바다 점·색이 있어야 끝선을 찾습니다.
+        self.ready = bool(c.get("zone_norm")) and (self.fixed or all(c.get(k) for k in SEASIDE_EDGE_KEYS))
+        self.foot_center = str(c.get("foot", "bottom")).lower() == "center"
         self.exclude = [p for p in (c.get("exclude_polys_norm") or []) if len(p) >= 3]
-        self.tracker = None       # 첫 프레임 크기로 만듦(작업 폭 px 좌표)
+        self.zone_px = None       # 첫 프레임 크기로 만듦(작업 폭 px 좌표)
+        self.tracker = None       # 끝선 추적(고정 모드에 끝선·색이 없으면 없음)
         self.group = None
         self.inside = {}          # topdown 추적 번호 -> {"since", "last"}
         self.near_until = 0.0     # 이 시각(monotonic)까지 매 프레임 추론(Camera.backreach_inference_due)
@@ -6471,11 +6481,13 @@ class SeaSidePersonDetector(BaseEventDetector):
         c = self.config
         h, w = small.shape[:2]
         px = lambda pts: [[float(x) * w, float(y) * h] for x, y in pts]
+        self.zone_px = np.asarray(px(c["zone_norm"]))
+        if not all(c.get(k) for k in SEASIDE_EDGE_KEYS):
+            return   # 고정 모드에 끝선·색이 없음: 구역만 쓰고 틀어짐 점검은 하지 않음
         sea = px([c["sea_norm"]])[0]
         p1, p2 = px(c["edge_norm"])
         ref = EdgeLine(p1, p2)
         ref = EdgeLine(p1, p2, land_n=-ref.n if ref.offset(sea) > 0 else ref.n)   # 바다 점의 반대쪽이 육지
-        self.zone_px = np.asarray(px(c["zone_norm"]))
         self.tracker = SeaSideEdgeTracker(cam_key, c["edge"], ref, np.asarray(c["land_ref"], np.float64),
                                           np.asarray(c["water_ref"], np.float64))
 
@@ -6487,16 +6499,19 @@ class SeaSidePersonDetector(BaseEventDetector):
         if frame is None or not self.ready:
             self.overlay = None
             if not self.ready:
-                self._warn(t, f"[SEASIDE] cam={cam_key} 설치 설정(끝선·바다 점·위험 구역·색)이 없어 판정하지 않습니다. "
-                              f"마법사에서 설정하세요.")
+                need = "위험 구역" if self.fixed else "끝선·바다 점·위험 구역·색"
+                self._warn(t, f"[SEASIDE] cam={cam_key} 설치 설정({need})이 없어 판정하지 않습니다. 마법사에서 설정하세요.")
             return []
         h, w = frame.shape[:2]
         small = cv2.resize(frame, (SEASIDE_WORK_W, max(1, int(h * SEASIDE_WORK_W / w))), interpolation=cv2.INTER_AREA)
-        if self.tracker is None:
+        if self.zone_px is None:
             self._make_tracker(cam_key, small)
-        state = self.tracker.update(small, t)
         sh, sw = small.shape[:2]
-        zone = self.tracker.map_points(self.zone_px) / [sw, sh]
+        if self.tracker is None:
+            state, zone = "CONFIRMED", self.zone_px / [sw, sh]
+        else:
+            state = self.tracker.update(small, t)
+            zone = self.tracker.map_points(self.zone_px) / [sw, sh]
         self.zone_now = zone
         self.overlay = self._overlay(state, sw, sh)
         if state == "UNKNOWN":
@@ -6510,8 +6525,9 @@ class SeaSidePersonDetector(BaseEventDetector):
         for person in _yt_parse_tracks(kwargs.get('topdown_tracks')):
             if person.name not in self.config["person_classes"]:
                 continue
-            # 비스듬한 시점이라 발 위치 = 박스 아래 가운데
-            u, v = (person.box[0] + person.box[2]) / 2.0 / w, person.box[3] / h
+            # 발 위치: 비스듬히 보면 박스 아래 가운데, 바로 위에서 내려다보면(foot "center") 박스 가운데
+            u = (person.box[0] + person.box[2]) / 2.0 / w
+            v = ((person.box[1] + person.box[3]) / 2.0 if self.foot_center else person.box[3]) / h
             dist = cv2.pointPolygonTest(contour, (float(u), float(v)), True)   # 안 +, 밖 -(정규화 단위)
             inside = dist >= 0
             self.overlay["persons"].append((u, v, inside))
@@ -6542,7 +6558,8 @@ class SeaSidePersonDetector(BaseEventDetector):
                     'group': self.group.name,
                     'foot_norm': [round(u, 4), round(v, 4)],
                     'zone_norm': [[round(float(x), 4), round(float(y), 4)] for x, y in zone],
-                    'edge_mode': self.tracker.mode, 'edge_state': state,
+                    'edge_mode': "fixed" if self.fixed else "vision", 'edge_state': state,
+                    'foot': "center" if self.foot_center else "bottom",
                     'inside_sec': round(t - s["since"], 2), 'person_hold_sec': hold,
                 },
             })
@@ -6564,7 +6581,8 @@ class SeaSidePersonDetector(BaseEventDetector):
             return [[q1[0] / sw, q1[1] / sh], [q2[0] / sw, q2[1] / sh]] if ok else []
 
         return {"state": state, "group": self.group.name, "zone": [tuple(p) for p in self.zone_now],
-                "edge": seg(tr.cur), "edge_found": seg(tr.last_found) if tr.last_found is not None else [],
+                "edge": seg(tr.cur) if tr is not None else [],
+                "edge_found": seg(tr.last_found) if tr is not None and tr.last_found is not None else [],
                 "persons": []}
 # ============================================================================
 # [해측 추락 방지 모듈 끝]
@@ -6731,14 +6749,48 @@ def seaside_snap_edge(small, p1, p2, band_px=15):
 
 
 def run_wizard_seaside_setup(frame, ip, old_cfg=None):
-    """해측 추락 방지 카메라 설정(거리 측정 없음): 스냅샷에서 안벽 끝선 두 점 + 바다 쪽 한 점을 클릭하고, 위험 구역을
-    그립니다. 끝선 양옆 육지·물 색은 자동으로 남깁니다. 반환 cameras.json event_config.seaside_person 값(취소하면 None).
-    크레인이 움직이면 앱이 끝선을 다시 찾아 그린 구역을 같이 옮깁니다."""
+    """해측 추락 방지 카메라 설정(거리 측정 없음). 반환 cameras.json event_config.seaside_person 값(취소하면 None).
+    - 고정 f(기본, 카메라를 크레인 다리·빔에 단 경우): 위험 구역과 제외 구역만 그립니다. 크레인이 안벽과 나란히 움직여
+      화면 속 끝선이 제자리라 구역을 옮기지 않습니다.
+    - 끝선 따라가기 v: 스냅샷에서 안벽 끝선 두 점 + 바다 쪽 한 점을 클릭하고 위험 구역을 그립니다. 끝선 양옆 육지·물 색은
+      자동으로 남기고, 앱이 끝선을 다시 찾아 그린 구역을 같이 옮깁니다.
+    사람 위치는 비스듬히 보면 박스 아래(b), 바로 위에서 내려다보면 박스 가운데(c)로 잽니다."""
     old_cfg = old_cfg or {}
-    if old_cfg.get("edge_norm") and old_cfg.get("zone_norm") and guarded_input(
-            f"[{ip}] 기존 해측 설정(끝선·위험 구역)을 그대로 쓸까요? [Y/n]: ").strip().lower() != 'n':
-        return {k: old_cfg[k] for k in ("edge_norm", "sea_norm", "zone_norm", "land_ref", "water_ref",
-                                       "exclude_polys_norm") if k in old_cfg}
+    old_fixed = str((old_cfg.get("edge") or {}).get("mode", "")).lower() == "fixed"
+    if old_cfg.get("zone_norm") and (old_fixed or old_cfg.get("edge_norm")) and guarded_input(
+            f"[{ip}] 기존 해측 설정(위험 구역{'' if old_fixed else '·끝선'})을 그대로 쓸까요? [Y/n]: ").strip().lower() != 'n':
+        return dict(old_cfg)
+    fixed = guarded_input(f"[{ip}] 위험 구역: 크레인에 고정 f(카메라를 크레인 다리·빔에 단 경우, 기본) / 끝선 따라가기 v: "
+                          ).strip().lower() != 'v'
+    foot = "center" if guarded_input(f"[{ip}] 사람 위치: 박스 아래 b(비스듬히 볼 때, 기본) / 박스 가운데 c(바로 위에서 볼 때): "
+                                     ).strip().lower() == 'c' else "bottom"
+    out = {"edge": {"mode": "fixed" if fixed else "vision"}, "foot": foot}
+    if not fixed:
+        edge_cfg = _wizard_seaside_edge(frame, ip)
+        if edge_cfg is None:
+            return None
+        out.update(edge_cfg)
+    zone = get_roi_points_scaled(frame, f"Seaside danger zone - CAM: {ip}", required=True)
+    if polygon_contour(zone) is None:
+        return None
+    excludes = [p for p in (old_cfg.get("exclude_polys_norm") or []) if len(p) >= 3]
+    ans = guarded_input(f"[{ip}] 크레인 구조물 제외 구역 (기존 {len(excludes)}개) 그대로 엔터 / 새로 그리기 y / 모두 지우기 0: ").strip().lower()
+    if ans == '0':
+        excludes = []
+    elif ans == 'y':
+        excludes = []
+        while True:
+            poly = get_roi_points_scaled(frame, f"Seaside exclude {len(excludes) + 1} - CAM: {ip}")
+            if polygon_contour(poly) is not None:
+                excludes.append(poly)
+            if guarded_input("   제외 구역을 더 그릴까요? [y/N]: ").strip().lower() != 'y':
+                break
+    out.update(zone_norm=zone, exclude_polys_norm=excludes)
+    return out
+
+
+def _wizard_seaside_edge(frame, ip):
+    """끝선 따라가기(vision) 설치 값: 끝선 두 점(화면 직선에 맞춤), 바다 쪽 한 점, 끝선 양옆 육지·물 색. 취소하면 None."""
     print(f"[{ip}] 해측 설정: 1·2번 = 안벽 끝선(바다와 안벽 경계) 위 두 점(서로 멀리), 3번 = 바다 쪽 아무 곳. Enter 완료")
     pts = get_numbered_points(frame, f"Seaside quay edge (1,2) + sea (3) - CAM: {ip}", 3)
     if pts is None:
@@ -6756,25 +6808,9 @@ def run_wizard_seaside_setup(frame, ip, old_cfg=None):
         print("   끝선 양옆 색을 읽지 못했습니다(끝선이 화면 가장자리). 다시 설정하세요.")
         return None
     print(f"   육지 색 BGR {np.round(land_ref).astype(int).tolist()}, 물 색 BGR {np.round(water_ref).astype(int).tolist()}")
-    zone = get_roi_points_scaled(frame, f"Seaside danger zone - CAM: {ip}", required=True)
-    if polygon_contour(zone) is None:
-        return None
-    excludes = [p for p in (old_cfg.get("exclude_polys_norm") or []) if len(p) >= 3]
-    ans = guarded_input(f"[{ip}] 크레인 구조물 제외 구역 (기존 {len(excludes)}개) 그대로 엔터 / 새로 그리기 y / 모두 지우기 0: ").strip().lower()
-    if ans == '0':
-        excludes = []
-    elif ans == 'y':
-        excludes = []
-        while True:
-            poly = get_roi_points_scaled(frame, f"Seaside exclude {len(excludes) + 1} - CAM: {ip}")
-            if polygon_contour(poly) is not None:
-                excludes.append(poly)
-            if guarded_input("   제외 구역을 더 그릴까요? [y/N]: ").strip().lower() != 'y':
-                break
     return {"edge_norm": [[round(p1[0] / sw, 6), round(p1[1] / sh, 6)], [round(p2[0] / sw, 6), round(p2[1] / sh, 6)]],
-            "sea_norm": [round(pts[2][0], 6), round(pts[2][1], 6)], "zone_norm": zone,
-            "land_ref": [round(float(v), 1) for v in land_ref], "water_ref": [round(float(v), 1) for v in water_ref],
-            "exclude_polys_norm": excludes}
+            "sea_norm": [round(pts[2][0], 6), round(pts[2][1], 6)],
+            "land_ref": [round(float(v), 1) for v in land_ref], "water_ref": [round(float(v), 1) for v in water_ref]}
 
 
 def run_wizard_batch_mode(rtsp_list, existing_configs=None):
