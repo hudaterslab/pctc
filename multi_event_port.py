@@ -193,6 +193,12 @@ TOPDOWN_MODEL = "TOPDOWN"
 # topdown.dxnn 클래스(최종 구성 9클래스, 1280x736). 트위스트락은 cone.dxnn이 찾습니다.
 TOPDOWN_CLASS_NAMES = ("YT_HEADER", "CONTAINER_40FT", "CONTAINER_20FT", "YT_CHASSIS_EMPTY", "YT_CHASSIS_HALF",
                        "TANK_20FT", "SPREADER", "PERSON", "VEHICLE")
+# hanjin_cctv_v2.dxnn(한진 CCTV 사람 모델, 옆·비스듬한 시점, 8클래스) 모델 키. 해측 추락 방지 사람 검출의 기본입니다
+# (event_config.seaside_person.person_model). 해측만 켠 카메라는 topdown 자리(엔진 결과·추적기 trk_topdown)에 이 모델을
+# 돌리고, 사람 3종(person·lowerbody·signalman)을 topdown PERSON 번호로 바꿔 넣습니다(hanjin_persons_as_topdown).
+HANJIN_MODEL = "HANJIN_V2"
+HANJIN_CLASS_NAMES = ("helmet", "head", "person", "normalvehicle", "lowerbody", "signalman", "trunklinetruck", "xband")
+HANJIN_PERSON_IDS = tuple(HANJIN_CLASS_NAMES.index(name) for name in ("person", "lowerbody", "signalman"))
 # Backreach·YT 이벤트 tid = 이 값 + topdown 추적 번호(과속 1,000,000+·콘 900,000+와 겹치지 않게).
 TOPDOWN_TID_BASE = 3_000_000
 # 개인정보 블러용으로 topdown 클래스 번호를 메인 모델 번호로 바꿉니다(사람=얼굴 블러, 차량·YT=번호판 블러).
@@ -217,7 +223,8 @@ SIDE_CLASS_NAMES = ("container", "tank", "spreader", "person", "YT_HEADER")
 # container_ocr_detector.dxnn(컨테이너 번호 OCR의 글자 영역) 클래스. 0 BIC 컨테이너 번호, 1 TYPE 크기·형식 코드
 CONTAINER_OCR_DET_CLASS_NAMES = ("BIC", "TYPE")
 # 모델의 클래스 이름(model_confidences에 이름으로 적음). 이름이 빈 칸은 아직 없는 클래스입니다(번호로는 적을 수 있음).
-MODEL_CLASS_NAMES = {"MAIN_V2": SPEEDING_CLASS_NAMES, TOPDOWN_MODEL: TOPDOWN_CLASS_NAMES, "FACE": ("face",),
+MODEL_CLASS_NAMES = {"MAIN_V2": SPEEDING_CLASS_NAMES, TOPDOWN_MODEL: TOPDOWN_CLASS_NAMES,
+                     HANJIN_MODEL: HANJIN_CLASS_NAMES, "FACE": ("face",),
                      "PLATE": ("plate",), "SIDE": SIDE_CLASS_NAMES, "CONE": ("cone",),
                      "CONTAINER_OCR_DET": CONTAINER_OCR_DET_CLASS_NAMES}
 
@@ -277,6 +284,8 @@ RECEIVER_EVENT_NAMES = {10: "QC_APRON_HDS", 11: "YT_HEAD_CRUSH", 12: "BACKREACH_
 # PCTC면 PLC·CPS 정보도 받습니다(PlcCpsPoller). 주소는 마법사에서 고칠 수 있습니다.
 RECEIVER_SITES = {"hjit": ("HJIT(인천)", "http://100.105.106.40/hjit/receiver/api/v1/cctv"),
                   "pctc": ("PCTC(평택)", "http://210.182.112.138/pctc/receiver/api/v1/cctv")}
+# 이벤트 영상(앞뒤 30초)을 관제로 보내는지(사이트별). PCTC는 사진만 보냅니다(11/25 사용자 결정). 영상은 단말에 그대로 남습니다.
+RECEIVER_SEND_VIDEO = {"hjit": True, "pctc": False}
 
 
 def deep_merge_dict(base, override):
@@ -309,6 +318,13 @@ def load_system_config():
         #   PLC가 값이 그대로여도 주기적으로 보낸다고 보고 정한 값입니다(보내는 주기 확인 필요).
         "plc_cps": {"url": "http://localhost:24000/api/v1/edge/cpsPlc", "interval_sec": 1.0, "timeout_sec": 3.0,
                     "use_for_events": False, "stale_sec": 5.0},
+        # PCTC 캐빈실 경고음: 이벤트가 나면 지팬스 CPS 단말(TCP 서버 host:port)에 재생할 음성 파일 이름을 보냅니다.
+        # host가 비어 있으면(기본) 보내지 않습니다. cps_name·cps_ip는 그 크레인 CPS의 이름·IP(예 "RMQC#102", 비우면 host).
+        # sounds: 이벤트 → CPS 단말에 있는 음성 파일 이름(지팬스에 보낸 4가지). 값을 ""로 두면 그 이벤트는 안 보냅니다.
+        "cps_alarm": {"host": "", "port": 4010, "cps_name": "", "cps_ip": "", "connect_timeout_sec": 3.0,
+                      "result_wait_sec": 3.0,
+                      "sounds": {"yt_zone_person": "01_hds_person_zone.wav", "yt_head_crush": "02_yt_head_crush.wav",
+                                 "cone_ng": "03_cone_departure.wav", "seaside_person": "04_seaside_fall.wav"}},
         "system_performance": {
             "target_fps": 10.0,
             "dynamic_cpu_adjust_enabled": False,
@@ -407,10 +423,11 @@ def load_system_config():
             # 해측 추락 방지(관제 14 SEASIDE_DETECT). 판정 기준값은 SEASIDE_DEFAULT_CONFIG이고 바꿀 값만 여기에 적습니다.
             # groups: 같은 크레인 카메라 묶음 {"묶음 이름": ["ip", ...]}(마법사가 정함). 카메라별 끝선·위험 구역·색과
             # 제외 구역은 cameras.json 카메라의 event_config.seaside_person에 마법사가 적습니다.
+            # person_model: 사람 검출 모델 "HANJIN_V2"(hanjin_cctv_v2, 옆·비스듬한 시점) 또는 "TOPDOWN"(topdown PERSON).
             SEASIDE_PERSON_EVENT: {"enabled": True, "cooldown_sec": 60, "api_event_type": 14,
-                                   "blur_face": True, "blur_plate": False, "groups": {}}
+                                   "blur_face": True, "blur_plate": False, "groups": {}, "person_model": "HANJIN_V2"}
         },
-        # NPU 모델 7개. 키는 model_confidences·model_output_formats·model_engine_pool_sizes와 같습니다.
+        # NPU 모델 8개. 키는 model_confidences·model_output_formats·model_engine_pool_sizes와 같습니다.
         # - MAIN_V2(speeding 640x384, SPEEDING_CLASS_NAMES): 과속 카메라의 차량·컨테이너·리치스태커·야드트럭.
         #   FACE(face): 사진 얼굴 가리기. PLATE(plate): 사진 번호판 가리기·과속 번호판 인식
         # - TOPDOWN(topdown 1280x736, 9클래스): YT 헤드압착·사람 진입·Backreach
@@ -419,12 +436,14 @@ def load_system_config():
         # - CONE(cone 640x384, 1클래스 콘): 콘 NG 모서리 크롭(1280x736을 반으로 줄여 넣음)
         # - CONTAINER_OCR_DET(container_ocr_detector 1280x736, 2클래스: 0 BIC, 1 TYPE): 컨테이너 번호 OCR의 글자 영역.
         #   콘 NG가 처음 난 뒤에 올립니다(container_ocr).
+        # - HANJIN_V2(hanjin_cctv_v2, PPU, 8클래스): 해측 추락 방지 사람(person·lowerbody·signalman). 해측 카메라에만 올림
         # side·cone은 raw 출력이어야 합니다(PPU는 장치에서 0.25 미만을 버려 콘 0.01 기준을 못 씀).
         "models": {
             "MAIN_V2": "speeding.dxnn",
             "FACE": "face.dxnn",
             "PLATE": "plate.dxnn",
             "TOPDOWN": "topdown.dxnn",
+            "HANJIN_V2": "hanjin_cctv_v2.dxnn",
             "SIDE": "side.dxnn",
             "CONE": "cone.dxnn",
             "CONTAINER_OCR_DET": "container_ocr_detector.dxnn"
@@ -446,6 +465,7 @@ def load_system_config():
             "FACE": {"face": 0.35},
             "PLATE": {"plate": 0.1},
             "TOPDOWN": {name: 0.25 for name in TOPDOWN_CLASS_NAMES},
+            "HANJIN_V2": {"person": 0.5, "lowerbody": 0.5, "signalman": 0.5},
             "SIDE": {"container": 0.25, "tank": 0.25, "spreader": 0.25, "person": 0.5, "YT_HEADER": 0.25},
             "CONE": {"cone": 0.01},
             "CONTAINER_OCR_DET": {"BIC": 0.25, "TYPE": 0.25}
@@ -455,6 +475,7 @@ def load_system_config():
             "FACE": "ppu",
             "PLATE": "yolo",
             "TOPDOWN": "yolo",
+            "HANJIN_V2": "ppu",
             "SIDE": "yolo",
             "CONE": "yolo",
             "CONTAINER_OCR_DET": "yolo"
@@ -468,6 +489,7 @@ def load_system_config():
             "FACE": 1,
             "PLATE": 1,
             "TOPDOWN": 2,
+            "HANJIN_V2": 2,
             "SIDE": 2,
             "CONE": 2,
             "CONTAINER_OCR_DET": 1
@@ -1251,12 +1273,16 @@ def receiver_event_off_hours(cctv_id, event_name, when):
 
 # 현장 IP 스피커 방송. cameras.json 카메라별 ip_speaker(스피커 주소, 예 "172.16.45.97")와 sound(경고 음성 파일 이름,
 # 예 "06_speeding.wav". 프로젝트의 sounds 폴더에서 찾습니다. ffmpeg이 읽는 형식이면 wav·mp3·mp4 등 모두, 절대 경로를
-# 적으면 그 파일)가 둘 다 적혀 있으면 과속 사진이 관제로 전송됐을 때
-# 그 스피커로 음성을 한 번 냅니다. 하나라도 "none"(기본값, 마법사가 과속 카메라에 적음)이면 방송 없이 이벤트만 냅니다.
-# 방송은 같은 카메라의 speaker_enable이 true일 때만 합니다(기본값 false, 마법사가 과속 카메라에 false로 적음).
-# 주소와 음성을 적어 둔 채로 speaker_enable만 바꿔 방송을 켜고 끕니다.
-# 관제로 안 가는 과속(차량 상자 없음, 차량번호 없음, 같은 번호 중복, 꺼짐 시간대 receiver_event_off_hours, 전송 실패)은
-# 방송하지 않습니다.
+# 적으면 그 파일)가 둘 다 적혀 있으면 그 스피커로 음성을 한 번 냅니다. 하나라도 "none"(기본값, 마법사가 적음)이면
+# 방송 없이 이벤트만 냅니다.
+# 방송은 같은 카메라의 speaker_enable이 true일 때만 합니다(기본값 false, 마법사가 false로 적음).
+# 주소와 음성을 적어 둔 채로 speaker_enable만 바꿔 방송을 켜고 끕니다(cameras.json만 고치면 앱을 다시 켜지 않아도 됨).
+# 언제 내나:
+#   - 콘 NG·해측·YT 헤드압착(SITE_SOUND_DETECT_EVENTS): 판정 순간. 관제 전송·회선과 상관없이 현장에 바로 알립니다.
+#     PCTC는 이벤트마다 스피커가 달라(콘 = 육측, 해측 = 해측, 헤드압착 = 헤드압착 스피커) 그 이벤트 카메라에 그 스피커를 적습니다.
+#   - 과속: 사진이 관제로 전송됐을 때. 관제로 안 가는 과속(차량 상자 없음, 차량번호 없음, 같은 번호 중복,
+#     꺼짐 시간대 receiver_event_off_hours, 전송 실패)은 방송하지 않습니다.
+# shortcut: 음성은 카메라마다 하나라, 한 카메라에 위 이벤트를 둘 이상 켜면 같은 음성이 납니다. 그런 카메라가 생기면 이벤트별 음성으로.
 # 스피커(Inter-M IP-1015HS)에는 계정·교환기 없이 SIP 전화를 직접 걸어(sip:<주소>) 음성을 G.711(PCMU) RTP로 보냅니다.
 # 스피커 SIP 계정을 가려야 하면 ip_speaker를 "97@172.16.45.97"처럼 적습니다.
 SITE_SOUND_NONE = "none"
@@ -1265,14 +1291,15 @@ SITE_SOUND_MAX_SEC = 60.0     # 음성 한 번의 최대 길이(초). 더 긴 �
 SITE_SOUND_BY_CAM = {}        # {str(cctv_id): (스피커 주소, 음성 파일)} — Camera가 설정을 읽을 때마다 채웁니다(방송 안 하면 None).
 SITE_SOUND_BUSY = set()       # 지금 방송 중인 스피커 주소. 방송이 끝나기 전에 난 이벤트는 방송하지 않습니다.
 SITE_SOUND_LOCK = threading.Lock()
+SITE_SOUND_DETECT_EVENTS = (CONE_NG_EVENT, SEASIDE_PERSON_EVENT, YT_HEAD_CRUSH_EVENT)   # 판정 순간에 방송하는 이벤트
 SIP_COMPACT_HEADERS = {"v": "via", "f": "from", "t": "to", "i": "call-id", "m": "contact", "l": "content-length",
                        "c": "content-type"}
 
 
 def wizard_site_sound(events, old_conf):
-    """마법사가 cameras.json에 적을 speaker_enable·ip_speaker·sound: 과속을 고른 카메라에 묻지 않고 false·"none"·"none"으로
-    적어 둡니다(사람이 나중에 채움). 전에 적어 둔 값은 그대로 둡니다. 과속을 고르지 않은 카메라에는 적지 않습니다."""
-    if SPEEDING_EVENT not in events:
+    """마법사가 cameras.json에 적을 speaker_enable·ip_speaker·sound: 방송하는 이벤트(과속, SITE_SOUND_DETECT_EVENTS)를
+    고른 카메라에 묻지 않고 false·"none"·"none"으로 적어 둡니다(사람이 나중에 채움). 전에 적어 둔 값은 그대로 둡니다."""
+    if not any(name in events for name in (SPEEDING_EVENT, *SITE_SOUND_DETECT_EVENTS)):
         return {}
     old_conf = old_conf or {}
     return {"speaker_enable": old_conf.get("speaker_enable") is True,
@@ -1431,9 +1458,8 @@ def _site_sound_worker(speaker, sound, tag):
 
 
 def play_site_sound(cctv_id, event_id):
-    """이 카메라에 현장 스피커 방송이 설정돼 있으면(ip_speaker·sound) 별도 스레드로 음성을 냅니다(전송 일꾼을 붙잡지 않음).
-    과속 사진이 관제로 전송됐을 때 부릅니다(_send_event_image_task). 관제로 안 가는 과속(차량 상자 없음, 차량번호 없음,
-    같은 번호 중복, 전송 꺼짐 시간대, 전송 실패)은 방송하지 않습니다.
+    """이 카메라에 현장 스피커 방송이 설정돼 있으면(ip_speaker·sound) 별도 스레드로 음성을 냅니다(부른 쪽을 붙잡지 않음).
+    콘 NG·해측·헤드압착은 판정 순간(Camera 이벤트 처리), 과속은 사진이 관제로 전송됐을 때(_send_event_image_task) 부릅니다.
     방송을 시작했으면 True. 설정이 없으면 아무것도 하지 않고, 방송하지 않는 이유가 있으면 로그만 남깁니다."""
     conf = SITE_SOUND_BY_CAM.get(str(cctv_id))
     if not conf:
@@ -1454,6 +1480,88 @@ def play_site_sound(cctv_id, event_id):
         return False
     logger.info(f"[SITE SOUND] 방송 시작. {tag}")
     threading.Thread(target=_site_sound_worker, args=(speaker, sound, tag), daemon=True, name="site-sound").start()
+    return True
+
+
+# PCTC 캐빈실 경고음(지팬스 CPS 단말의 USB 스피커, SYS_CFG cps_alarm). 지팬스 11/24 메일: CPS 단말이 TCP 서버(4010),
+# 우리 단말이 클라이언트. 이벤트마다 접속해 XML 한 건을 보내고, 결과(ResultCode)를 result_wait_sec까지 기다린 뒤 끊습니다.
+# heartbeat는 보내지 않습니다(지팬스: 선택 사항, 서버는 안 보냄). 관제 전송 성공·꺼짐 시간대와 상관없이 판정 순간에 보냅니다.
+CPS_ALARM_BUSY = set()   # 지금 보내는 중인 (CPS 주소, 음성 파일). 같은 크레인 카메라 여럿이 한꺼번에 내면 한 번만 보냅니다.
+
+
+def cps_alarm_frame(cps_name, cps_ip, alarm, current_time):
+    """지팬스 CPS 알람 요청(11/23 프로토콜 cpsAlarmRequest) → 보낼 바이트. 앞에 SUB(0x1A), 끝에 ESC(0x1B)+CRLF.
+    지팬스가 줄 단위로 읽을 수 있어 XML 안에는 줄바꿈을 넣지 않습니다."""
+    xml = ("<cpsAlarmRequest><header><serviceInfo><serviceID>hjncCps.HandleAlarmInfo</serviceID>"
+           "<protocol>XML</protocol><serviceAlias>CPS</serviceAlias></serviceInfo></header>"
+           f'<body class="handleAlarmInfoParam"><CpsName>{cps_name}</CpsName><CpsIP>{cps_ip}</CpsIP>'
+           f"<CpsAlarm>{alarm}</CpsAlarm><CurrentTime>{current_time}</CurrentTime></body></cpsAlarmRequest>")
+    return b"\x1a" + xml.encode("utf-8") + b"\x1b\r\n"
+
+
+def cps_alarm_send(host, port, frame, connect_timeout, result_wait):
+    """프레임 하나를 보내고 응답(cpsAlarmResponse)을 result_wait초까지 기다린 뒤 끊습니다 → (ResultCode, ResultMsg).
+    응답이 없으면 None. 접속·전송 실패는 OSError로 올립니다."""
+    reply = b""
+    with socket.create_connection((host, port), timeout=connect_timeout) as sock:
+        sock.sendall(frame)
+        deadline = time.monotonic() + result_wait
+        while b"\x1b" not in reply:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            sock.settimeout(left)
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            reply += chunk
+    # 정규식으로 읽습니다: 지팬스 예시는 여는·닫는 태그 이름이 다르기도 합니다(cpsInfoResponse … /cpsInfoRequest).
+    text = reply.decode("utf-8", "replace")
+    found = [re.search(f"<{tag}>(.*?)</{tag}>", text, re.S) for tag in ("ResultCode", "ResultMsg")]
+    if not found[0]:
+        return None
+    return found[0].group(1).strip(), found[1].group(1).strip() if found[1] else ""
+
+
+def _cps_alarm_worker(cfg, key, frame, tag):
+    try:
+        result = cps_alarm_send(key[0], int(cfg["port"]), frame, float(cfg["connect_timeout_sec"]),
+                                float(cfg["result_wait_sec"]))
+        if result is None:
+            logger.warning(f"[CPS ALARM] 보냈지만 결과 응답이 없음({float(cfg['result_wait_sec']):g}초). {tag}")
+        elif result[0] == "SUCCESS":
+            logger.info(f"[CPS ALARM] 재생 정상({result[1]}). {tag}")
+        else:
+            logger.warning(f"[CPS ALARM] 재생 실패 {result[0]}: {result[1]}. {tag}")
+    except OSError as e:
+        logger.warning(f"[CPS ALARM] 보내지 못함: {e}. {tag}")
+    finally:
+        with SITE_SOUND_LOCK:
+            CPS_ALARM_BUSY.discard(key)
+
+
+def send_cps_alarm(event_name, event_id):
+    """PCTC이고 cps_alarm.host와 이 이벤트의 음성 파일이 있으면 별도 스레드로 CPS 단말에 알람을 보냅니다(판정을 붙잡지 않음).
+    보내기 시작했으면 True."""
+    cfg = SYS_CFG["cps_alarm"]
+    host = str(cfg.get("host") or "").strip()
+    alarm = str((cfg.get("sounds") or {}).get(event_name) or "").strip()
+    if not host or not alarm or receiver_site() != "pctc":
+        return False
+    key = (host, alarm)
+    tag = f"event_id={event_id} event={event_name} cps={host}:{cfg['port']} alarm={alarm}"
+    with SITE_SOUND_LOCK:
+        if key in CPS_ALARM_BUSY:
+            logger.info(f"[CPS ALARM] 같은 알람을 아직 보내는 중이라 건너뜀. {tag}")
+            return False
+        CPS_ALARM_BUSY.add(key)
+    frame = cps_alarm_frame(cfg.get("cps_name") or "", str(cfg.get("cps_ip") or "").strip() or host, alarm,
+                            now_kst().isoformat(timespec="seconds"))
+    logger.info(f"[CPS ALARM] 보냄. {tag}")
+    threading.Thread(target=_cps_alarm_worker, args=(cfg, key, frame, tag), daemon=True, name="cps-alarm").start()
     return True
 
 
@@ -2418,6 +2526,10 @@ class VideoRecorder:
             return
         if event_id in RECEIVER_SKIPPED_EVENTS:
             logger.info(f"[VIDEO API] 관제로 보내지 않기로 한 과속 이벤트(차량번호 없음·같은 번호 중복)라 영상도 보내지 않습니다. "
+                        f"event_id={event_id}")
+            return
+        if not RECEIVER_SEND_VIDEO.get(receiver_site(), True):
+            logger.info(f"[VIDEO API] {receiver_site().upper()}는 영상을 관제로 보내지 않습니다(사진만). 단말에 남김: {fpath} "
                         f"event_id={event_id}")
             return
         try:
@@ -5161,9 +5273,34 @@ def event_model_keys(events):
     keys = []
     if SPEEDING_EVENT in events:
         keys.append("MAIN_V2")
-    if any(name in events for name in PERSON_TOPDOWN_EVENTS):
+    if any(name in events for name in PERSON_TOPDOWN_EVENTS if name != SEASIDE_PERSON_EVENT):
         keys.append(TOPDOWN_MODEL)
+    if SEASIDE_PERSON_EVENT in events and seaside_person_model() not in keys:
+        keys.append(seaside_person_model())
     return keys
+
+
+def seaside_person_model():
+    """해측 사람 검출 모델 키(event_config.seaside_person.person_model): HANJIN_V2(기본) 또는 TOPDOWN."""
+    key = str(SYS_CFG["event_config"].get(SEASIDE_PERSON_EVENT, {}).get("person_model") or HANJIN_MODEL).upper()
+    return TOPDOWN_MODEL if key == TOPDOWN_MODEL else HANJIN_MODEL
+
+
+def person_pass_model(events):
+    """카메라의 topdown 자리(검출·추적기 trk_topdown)에서 돌릴 모델 키. Backreach·YT가 있으면 topdown,
+    해측만 있으면 seaside_person_model(), 둘 다 없으면 None."""
+    if any(name in events for name in PERSON_TOPDOWN_EVENTS if name != SEASIDE_PERSON_EVENT):
+        return TOPDOWN_MODEL   # shortcut: 해측을 Backreach·YT와 한 카메라에 켜면 해측도 topdown PERSON을 씀. 그런 카메라가 생기면 모델을 따로 돌림
+    return seaside_person_model() if SEASIDE_PERSON_EVENT in events else None
+
+
+def hanjin_persons_as_topdown(rows):
+    """hanjin_cctv_v2 검출 중 사람 3종(person·lowerbody·signalman)만 topdown PERSON 번호로 바꿉니다.
+    topdown 추적기·해측 판정·화면 표시를 그대로 씁니다. 같은 사람에 person과 lowerbody가 같이 잡혀도 묶음 쿨다운으로 1건."""
+    det = detection_array(rows)
+    det = det[np.isin(det[:, 5].astype(int), HANJIN_PERSON_IDS)].copy()
+    det[:, 5] = TOPDOWN_CLASS_NAMES.index("PERSON")
+    return det
 
 
 def format_ai_fps_log(cam):
@@ -6028,265 +6165,37 @@ def yt_draw_overlay(image, snapshot, scale=(1.0, 1.0), ui=1.0):
 # ============================================================================
 # [해측 추락 방지 모듈 시작] seaside_person (관제 14 SEASIDE_DETECT)
 # ----------------------------------------------------------------------------
-# 크레인에 달려 비스듬히 내려다보는 카메라 묶음(보통 3대)으로 안벽 끝 위험 구역에 사람이 person_hold_sec 이상
-# 머물면 알람합니다.
-# 가변 ROI(거리 보정 없이 화면 좌표만):
-#   - 설치 때(마법사) 카메라마다 스냅샷에서 안벽 끝선 두 점과 바다 쪽 한 점을 클릭하고, 위험 구역 다각형을 그립니다.
-#     끝선 양옆의 육지 색·물 색을 함께 남깁니다(cameras.json event_config.seaside_person).
-#   - 카메라가 크레인과 함께 움직이므로 프레임마다 엣지 검출로 끝선 후보를 찾고, "바다 쪽 옆은 물, 육지 쪽 옆은 물이
-#     아니고 그 안쪽은 육지"인 후보 중 가장 바다 쪽을 끝선으로 고릅니다(SeaSideEdgeTracker).
-#   - 설치 때 끝선 → 지금 끝선으로 옮기는 이동·회전을 그린 위험 구역에 그대로 적용합니다(끝선에 묶인 ROI).
-#   - 판정: 사람 발 위치(박스 아래 가운데)가 옮겨진 위험 구역 안에 있으면 머무름을 셉니다.
-#   - 끝선을 못 찾으면 마지막 위치를 roi_hold_sec 동안 쓰고, 그 뒤에는 판정을 멈춥니다(틀린 구역으로 판정하지 않음).
-#   - 크레인 PLC는 없다고 봅니다.
+# 크레인에 단 카메라 묶음(PCTC 2호기: 224·225 빔 위에서 안벽을 따라, 227 돔으로 바로 위에서)으로 안벽 끝 위험 구역에
+# 사람이 person_hold_sec 이상 머물면 알람합니다.
+# 위험 구역은 설치 때(마법사) 카메라마다 그린 다각형을 그대로 씁니다(화면 좌표, 거리 보정 없음).
+#   카메라를 크레인 다리·빔에 달고 크레인은 안벽과 나란히만 움직여 화면 속 안벽 끝선이 제자리입니다.
+#   끝선을 색으로 찾아 구역을 옮기던 가변 ROI는 11/25에 뺐습니다: 배가 붙으면 끝선 너머가 물이 아니라 선체라 끝선을
+#   못 찾아 판정이 멈췄습니다(2호기 마법사 실행에서 세 카메라 모두 "끝선을 찾지 못해 해측 판정 중지").
+# 판정: 사람 위치(foot "bottom" 박스 아래 가운데 = 비스듬히 볼 때, "center" 박스 가운데 = 바로 위에서 내려다볼 때)가
+#   위험 구역 안이고 크레인 구조물 제외 구역 밖이면 머무름을 셉니다.
 # 묶음: 한 카메라에서 이벤트가 나면 그 카메라 이벤트 1건으로 내고, 묶인 나머지 카메라의 그 순간 사진과 4분할 영상을
 #   같은 이벤트로 남깁니다(콘 NG 묶음과 같은 방식, 카메라 간 같은 사람인지는 따지지 않음). 묶음 쿨다운
 #   group_cooldown_sec 동안 묶음 안에서 새 이벤트를 내지 않습니다(겹치는 화면의 같은 사람이 2~3건으로 나가지 않게).
-# TODO(현장): 실제 카메라·사진이 없어 기준값(머무름·쿨다운·끝선 검출 띠·색 기준)은 합성 장면으로만 정한 임시값입니다.
-# TODO(현장): 끝선이 멀어지면(화면 위로) 같은 거리가 작게 보이는데, 지금은 구역을 이동·회전만 하고 크기는 그대로 둡니다.
+# TODO(현장): 머무름·쿨다운 기준값은 실제 이벤트로 다시 정합니다.
+# shortcut: 카메라가 틀어져도(누가 돌림·진동) 구역은 그대로라 알아채지 못합니다. 설치 사진과 크레인 구조물을 영상끼리
+#   맞춰 보는 틀어짐 점검을 넣을 때까지는 사람이 화면을 보고 확인합니다.
 # ============================================================================
 SEASIDE_DEFAULT_CONFIG = {
-    "person_classes": ["PERSON"],     # topdown 9클래스의 PERSON
+    "person_classes": ["PERSON"],     # topdown PERSON(person_model HANJIN_V2면 한진 사람 3종을 이 번호로 바꿔 넣음)
     "person_hold_sec": 1.0,           # 위험 구역 안에 이만큼 머물면 알람 TODO(현장)
     "gap_tolerance_sec": 0.5,         # 검출이 잠깐 끊겨도 머무름을 이어 셈
     "group_cooldown_sec": 60.0,       # 묶음 쿨다운 TODO(현장)
-    "idle_infer_fps": 3.0,            # 구역 근처에 사람이 없을 때 topdown 추론 횟수(초당, 0 = 줄이지 않음)
+    "idle_infer_fps": 3.0,            # 구역 근처에 사람이 없을 때 사람 검출 추론 횟수(초당, 0 = 줄이지 않음)
     "near_ratio": 0.15,               # 위험 구역에서 화면 높이의 이 비율 안에 사람이 보이면 그 카메라는 매 프레임 추론
     "near_hold_sec": 3.0,             # 근처 사람이 사라진 뒤에도 이만큼 매 프레임 추론
-    "edge": {
-        "mode": "vision",             # "vision" = 끝선을 따라 구역을 옮김(크레인에 단 카메라), "fixed" = 그린 그대로
-        "check_every_sec": 5.0,       # fixed: 끝선으로 카메라 틀어짐 점검 주기
-        "drift_px": 20.0,             # fixed: 설치 끝선과 찾은 끝선이 이만큼(가로 640 기준 px) 벌어진 채
-        "drift_sec": 30.0,            #        이만큼 이어지면 틀어짐 경고(판정은 계속)
-        "update_every_sec": 0.5,      # vision: 화면이 멈춰 있을 때 끝선 검출 주기(움직이는 동안은 매 프레임)
-        "motion_px": 3.0,             # vision: 마지막으로 끝선을 맞춘 뒤 화면 전체가 이만큼(가로 640 기준 px) 밀리면 이동 중
-        "band_px": 40,                # 끝선을 찾는 띠 폭(지금 끝선 위치에서 양쪽, 가로 640 기준 px)
-        "min_confidence": 0.6,        # 끝선 신뢰도(찾은 직선 길이 / 기대 길이의 절반) 하한
-        "color_tol": 40.0,            # 설치 때 육지·물 색과 이만큼(BGR 거리) 안이면 같은 것으로 봄
-        "sea_px": [2, 12],            # 끝선에서 바다 쪽으로 이 범위(px, 가로 640 기준)는 물이어야 함
-        "land_near_px": [2, 10],      # 끝선에서 육지 쪽 바로 옆 이 범위는 물이 아니어야 함
-        "land_px": [8, 30],           # 끝선에서 육지 쪽 이 범위는 육지 색이어야 함
-        "smooth_alpha": 0.3,          # 멈춰 있을 때 끝선 갱신 비율(흔들림 줄이기, 차이가 smooth_within_px 안일 때만)
-        "smooth_within_px": 4.0,
-        "roi_hold_sec": 5.0,          # 끝선을 못 찾으면 마지막 위치를 이만큼만 씀, 그 뒤 판정 중지
-        "max_jump_px": 60.0           # 한 번에 이보다 크게 튀면 잘못 찾은 끝선으로 봄(가로 640 기준 px)
-    },
-    # 카메라별(마법사, cameras.json): edge_norm 끝선 두 점, sea_norm 바다 쪽 한 점, zone_norm 위험 구역,
-    # land_ref·water_ref 육지·물 색(BGR), exclude_polys_norm 크레인 구조물 제외 구역(화면에 고정)
-    "edge_norm": None, "sea_norm": None, "zone_norm": None, "land_ref": None, "water_ref": None,
+    "foot": "bottom",                 # 사람 위치: "bottom" 박스 아래 가운데(비스듬히), "center" 박스 가운데(바로 위에서)
+    # 카메라별(마법사, cameras.json): zone_norm 위험 구역, exclude_polys_norm 크레인 구조물 제외 구역(정규화 좌표)
+    "zone_norm": None,
     "exclude_polys_norm": [],
     "group_video": True               # 묶음 4분할 영상(단말 저장)
 }
-SEASIDE_WORK_W = 640   # 끝선 검출·색 비교 작업 폭(px 기준값도 이 폭 기준)
-
-
-class EdgeLine:
-    """화면 직선(작업 폭 px 좌표): 지나는 점 p0, 방향 u(단위), 육지 쪽 법선 n(단위)."""
-
-    def __init__(self, p1, p2, land_n=None):
-        p1, p2 = np.asarray(p1, np.float64), np.asarray(p2, np.float64)
-        u = p2 - p1
-        u /= (np.linalg.norm(u) or 1.0)
-        n = np.array([-u[1], u[0]])
-        if land_n is not None and np.dot(n, land_n) < 0:
-            n = -n
-        self.p1, self.p2, self.u, self.n = p1, p2, u, n
-
-    def offset(self, point):
-        """점이 선에서 육지 쪽으로 떨어진 거리(px, 바다 쪽은 -)."""
-        return float(np.dot(np.asarray(point, np.float64) - self.p1, self.n))
-
-    def foot(self, point):
-        """점에서 선에 내린 수선의 발."""
-        p = np.asarray(point, np.float64)
-        return self.p1 + np.dot(p - self.p1, self.u) * self.u
-
-
-def seaside_edge_candidates(gray, expected, band_px, max_angle_deg=10.0):
-    """화면 속 안벽 끝선 후보: 지금 끝선(expected EdgeLine) 둘레 band_px 띠에서 Canny + HoughLinesP로 찾은,
-    끝선과 나란한 직선들. 반환 [(p1, p2, 신뢰도 0~1 = 길이 / 화면 폭의 절반), ...].
-    어느 것이 끝선인지는 SeaSideEdgeTracker._pick가 색으로 고릅니다(가장 긴 직선은 선박 난간·안전선일 수 있음).
-    TODO(현장): 야간·우천·그림자·선박 접안 시험. 부족하면 물·안벽 분할 모델이나 안벽 반사 마커로 바꿉니다."""
-    h, w = gray.shape[:2]
-    a, b = expected.p1 - expected.u * 2 * w, expected.p1 + expected.u * 2 * w
-    ok, q1, q2 = cv2.clipLine((0, 0, w, h), (int(a[0]), int(a[1])), (int(b[0]), int(b[1])))
-    if not ok:
-        return []
-    mask = np.zeros_like(gray)
-    cv2.line(mask, q1, q2, 255, max(2, int(2 * band_px)))
-    edges = cv2.bitwise_and(cv2.Canny(gray, 50, 150), mask)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=30, minLineLength=max(10, int(0.1 * w)), maxLineGap=10)
-    if lines is None:
-        return []
-    exp_angle = math.atan2(expected.u[1], expected.u[0])
-    out = []
-    for x1, y1, x2, y2 in np.asarray(lines).reshape(-1, 4):   # OpenCV 판마다 (N, 1, 4) 또는 (N, 4)
-        diff = abs((math.atan2(y2 - y1, x2 - x1) - exp_angle + math.pi / 2) % math.pi - math.pi / 2)
-        if math.degrees(diff) <= max_angle_deg:
-            out.append(((x1, y1), (x2, y2), min(1.0, math.hypot(x2 - x1, y2 - y1) / (0.5 * w))))
-    return out
-
-
-def seaside_strip(image, line, d0, d1, nu=12, nd=3):
-    """선을 따라(10~90%) 육지 쪽 법선 방향 d0~d1 px 띠의 색 표본(N x 3). 화면 밖 점은 뺍니다."""
-    h, w = image.shape[:2]
-    out = []
-    for s in np.linspace(0.1, 0.9, nu):
-        base = line.p1 + (line.p2 - line.p1) * s
-        for d in np.linspace(d0, d1, nd):
-            x, y = base + line.n * d
-            if 0 <= x < w and 0 <= y < h:
-                out.append(image[int(y), int(x)])
-    return np.asarray(out, np.float64).reshape(-1, 3)
-
-
-def seaside_color_refs(image, line):
-    """설치 화면에서 끝선 양옆 색: 육지(육지 쪽 10~40px), 물(바다 쪽 4~16px)의 중앙값 BGR."""
-    land, water = seaside_strip(image, line, 10, 40), seaside_strip(image, line, -16, -4)
-    if not len(land) or not len(water):
-        return None, None
-    return np.median(land, axis=0), np.median(water, axis=0)
-
-
-class SeaSideEdgeTracker:
-    """카메라 한 대의 끝선 추적. 설치 끝선(ref)과 지금 끝선(cur)으로 위험 구역을 옮깁니다(작업 폭 px 좌표).
-    - vision: 화면 밀림(위상 상관)으로 움직임을 알고, 움직이는 동안 매 프레임·멈추면 update_every_sec마다 끝선을 찾습니다.
-      끝선을 못 찾은 채 roi_hold_sec가 지나면 UNKNOWN(판정 중지)입니다.
-    - fixed: 구역은 그린 그대로. 몇 초마다 끝선을 찾아 설치 끝선과 오래 어긋나면 틀어짐 경고만 남깁니다."""
-    TINY_W = 160
-
-    def __init__(self, cam_key, cfg, ref, land_ref, water_ref):
-        self.key, self.cfg = cam_key, cfg
-        self.mode = "fixed" if str(cfg.get("mode", "vision")).lower() == "fixed" else "vision"
-        self.ref, self.cur = ref, ref
-        self.land_ref, self.water_ref = land_ref, water_ref
-        self.found_once = self.mode == "fixed"   # vision은 첫 끝선을 찾아야 확정
-        self.last_fix_t = None
-        self.dirty_since = None    # 움직였는데 아직 끝선으로 다시 맞추지 못한 시작 시각
-        self.next_t = 0.0
-        self.prev_tiny = None
-        self.shift = np.zeros(2)   # 마지막으로 끝선을 맞춘 뒤 쌓인 화면 밀림(작업 폭 px). 느린 이동도 쌓이면 잡습니다.
-        self.moving_until = 0.0    # 움직임을 본 뒤 이 시각까지는 매 프레임 끝선을 찾음(밀림이 기준 아래로 쌓이는 사이 놓치지 않게)
-        self.drift_since, self.warned = None, False
-        self.last_found = None
-
-    def state(self, t):
-        if self.mode == "fixed":
-            return "CONFIRMED"
-        if not self.found_once:
-            return "UNKNOWN"
-        # 크레인에 달린 카메라는 계속 움직이므로, 움직이는 중이라도 방금(0.5초 안) 끝선으로 맞췄으면 확정입니다.
-        if self.dirty_since is None or (self.last_fix_t is not None and t - self.last_fix_t <= 0.5):
-            return "CONFIRMED"
-        return "HOLDING" if t - self.dirty_since <= float(self.cfg["roi_hold_sec"]) else "UNKNOWN"
-
-    def update(self, small, t):
-        """작업 폭으로 줄인 프레임 하나로 끝선을 갱신합니다. 반환 상태."""
-        c = self.cfg
-        moving = False
-        if self.mode == "vision":
-            h, w = small.shape[:2]
-            tiny = cv2.cvtColor(cv2.resize(small, (self.TINY_W, max(1, int(h * self.TINY_W / w))),
-                                           interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY).astype(np.float32)
-            if self.prev_tiny is not None and self.prev_tiny.shape == tiny.shape:
-                (dx, dy), _ = cv2.phaseCorrelate(self.prev_tiny, tiny)
-                self.shift += np.array([dx, dy]) * w / self.TINY_W
-                moving = float(np.linalg.norm(self.shift)) > float(c["motion_px"])
-            self.prev_tiny = tiny
-            if moving:
-                self.moving_until = t + 1.0
-                if self.dirty_since is None:
-                    self.dirty_since = t
-            moving = moving or t < self.moving_until
-        self.last_found = None
-        if t >= self.next_t or moving or self.dirty_since is not None:
-            self.next_t = t + float(c["check_every_sec"] if self.mode == "fixed" else c["update_every_sec"])
-            self._check(small, t, moving)
-        return self.state(t)
-
-    def _pick(self, small, gray, band):
-        """끝선 후보 중 "육지가 끝나고 물이 시작되는 선"을 고릅니다. 반환 EdgeLine 또는 None.
-        바다 쪽 옆(sea_px)은 물, 육지 쪽 바로 옆(land_near_px)은 물이 아님, 그 안쪽(land_px)은 육지인 후보 중
-        가장 바다 쪽. 물속 무늬 선(육지 쪽 옆이 물), 선박 난간(바다 쪽이 선체), 노란 안전선(바다 쪽이 육지)이 걸러집니다.
-        TODO(현장): 물 색은 파도·반사·선박 그림자·야간에 바뀝니다. 실제 화면으로 color_tol과 띠 폭을 다시 정합니다."""
-        c = self.cfg
-        tol = float(c["color_tol"])
-
-        def frac(line, d, ref):
-            samples = seaside_strip(small, line, float(d[0]), float(d[1]))
-            return float(np.mean(np.linalg.norm(samples - ref, axis=1) < tol)) if len(samples) >= 8 else None
-
-        best, best_off = None, None
-        for p1, p2, conf in seaside_edge_candidates(gray, self.cur, band):
-            if conf < float(c["min_confidence"]):
-                continue
-            line = EdgeLine(p1, p2, land_n=self.cur.n)
-            sea = frac(line, (-c["sea_px"][1], -c["sea_px"][0]), self.water_ref)
-            near = frac(line, c["land_near_px"], self.water_ref)
-            land = frac(line, c["land_px"], self.land_ref)
-            if None in (sea, near, land) or sea < 0.6 or near > 0.3 or land < 0.5:
-                continue
-            off = self.cur.offset((line.p1 + line.p2) / 2)   # 지금 끝선보다 육지 쪽 +, 바다 쪽 -
-            if best is None or off < best_off:
-                best, best_off = line, off
-        return best
-
-    def _check(self, small, t, moving):
-        c = self.cfg
-        gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-        # 띠 폭: fixed 점검은 크게 틀어진 카메라도 잡도록 3배. vision에서 위치를 모르면(시작·미확정) 화면 전체.
-        if self.mode == "fixed":
-            band = float(c["band_px"]) * 3.0
-        elif self.state(t) == "UNKNOWN":
-            band = float(small.shape[0])
-        else:
-            band = float(c["band_px"])
-        line = self._pick(small, gray, band)
-        if line is None:
-            return
-        self.last_found = line
-        mid = (line.p1 + line.p2) / 2
-        if self.mode == "fixed":
-            drift = abs(self.ref.offset(mid))
-            if drift <= float(c["drift_px"]):
-                self.drift_since, self.warned = None, False
-            else:
-                self.drift_since = self.drift_since or t
-                if not self.warned and t - self.drift_since >= float(c["drift_sec"]):
-                    self.warned = True
-                    logger.warning(f"[SEASIDE] cam={self.key} 카메라 틀어짐 의심: 찾은 끝선이 설치 끝선과 {drift:.0f}px"
-                                   f"(가로 {SEASIDE_WORK_W} 기준) 벌어진 지 {t - self.drift_since:.0f}초. 마법사에서 다시 그리세요.")
-            return
-        jump = abs(self.cur.offset(mid))
-        if self.state(t) != "UNKNOWN" and jump > float(c["max_jump_px"]):
-            logger.debug(f"[SEASIDE] cam={self.key} 끝선이 {jump:.0f}px 튀어 버립니다")
-            return
-        if self.found_once and not moving and jump <= float(c["smooth_within_px"]):
-            # 멈춰 있을 때 작은 흔들림은 조금씩만 따라갑니다(같은 방향 직선이라 끝점을 섞어도 됨).
-            a = float(c["smooth_alpha"])
-            p1 = self.cur.foot(line.p1) * (1 - a) + line.p1 * a
-            p2 = self.cur.foot(line.p2) * (1 - a) + line.p2 * a
-            line = EdgeLine(p1, p2, land_n=self.cur.n)
-        self.cur = line
-        self.found_once = True
-        self.last_fix_t = t
-        self.shift[:] = 0.0
-        self.dirty_since = t if moving else None
-
-    def map_points(self, points):
-        """설치 화면의 점들(작업 폭 px)을 지금 끝선에 맞춰 옮깁니다. 설치 끝선 기준 (따라가는 거리, 육지 쪽 거리)를
-        지금 끝선의 같은 자리로 옮깁니다(기준 = 설치 끝선 가운데와, 그 점에서 지금 끝선에 내린 수선의 발).
-        크레인 주행으로 화면이 끝선을 따라 미끄러지는 것은 따지지 않습니다(위험 구역이 끝선을 따라 길게 그려져 있으면 같음)."""
-        if self.cur is self.ref:
-            return np.asarray(points, np.float64)
-        o_ref = (self.ref.p1 + self.ref.p2) / 2
-        o_cur = self.cur.foot(o_ref)
-        out = []
-        for p in np.asarray(points, np.float64):
-            s, d = np.dot(p - o_ref, self.ref.u), np.dot(p - o_ref, self.ref.n)
-            u = self.cur.u if np.dot(self.cur.u, self.ref.u) >= 0 else -self.cur.u
-            out.append(o_cur + s * u + d * self.cur.n)
-        return np.asarray(out)
+# 가변 ROI 때 마법사가 적던 값. 지금은 읽지 않고, 마법사가 기존 설정을 그대로 쓸 때 지웁니다.
+SEASIDE_OLD_KEYS = ("edge", "edge_norm", "sea_norm", "land_ref", "water_ref")
 
 
 SEASIDE_GROUP_RECORDERS = {}   # 해측 카메라 키 -> (VideoRecorder, cam_id): 묶음 4분할 영상·함께 저장 사진
@@ -6351,23 +6260,24 @@ class SeaSideGroup:
 
 
 class SeaSidePersonDetector(BaseEventDetector):
-    """해측 위험 구역(설치 때 그린 구역을 지금 끝선에 맞춰 옮긴 것) 안에 사람 발 위치가 person_hold_sec 이상 머물면
-    알람합니다(카메라마다 판정). 이벤트를 낼지는 Camera가 묶음 쿨다운(SeaSideGroup.claim)으로 한 번 더 봅니다."""
+    """해측 위험 구역(설치 때 그린 그대로) 안에 사람 위치가 person_hold_sec 이상 머물면 알람합니다(카메라마다 판정).
+    이벤트를 낼지는 Camera가 묶음 쿨다운(SeaSideGroup.claim)으로 한 번 더 봅니다."""
     gui_name = "SEASIDE PERSON"
-    # topdown(1280 입력)을 Backreach·YT와 같이 쓰므로 가로 1280으로 받습니다.
+    # 사람 검출 모델(한진 640·topdown 1280 입력) 중 큰 쪽에 맞춰 가로 1280으로 받습니다.
     stream_max_width = 1280
 
     def __init__(self, config, roi_poly=None, roi_lines=None):
         super().__init__(deep_merge_dict(SEASIDE_DEFAULT_CONFIG, config), roi_poly, roi_lines)
         c = self.config
-        self.ready = all(c.get(k) for k in ("edge_norm", "sea_norm", "zone_norm", "land_ref", "water_ref"))
+        zone = c.get("zone_norm") or []
+        self.zone = np.asarray(zone, np.float64).reshape(-1, 2) if len(zone) >= 3 else None
+        self.ready = self.zone is not None
+        self.foot_center = str(c.get("foot", "bottom")).lower() == "center"
         self.exclude = [p for p in (c.get("exclude_polys_norm") or []) if len(p) >= 3]
-        self.tracker = None       # 첫 프레임 크기로 만듦(작업 폭 px 좌표)
         self.group = None
-        self.inside = {}          # topdown 추적 번호 -> {"since", "last"}
+        self.inside = {}          # 추적 번호 -> {"since", "last"}
         self.near_until = 0.0     # 이 시각(monotonic)까지 매 프레임 추론(Camera.backreach_inference_due)
         self.overlay = None       # 화면 그리기(Camera.draw, 정규화 좌표)
-        self.zone_now = None      # 지금 위험 구역(정규화 좌표)
         self._last_warn = 0.0
 
     def near(self, now):
@@ -6378,18 +6288,6 @@ class SeaSidePersonDetector(BaseEventDetector):
             self._last_warn = t
             logger.warning(text)
 
-    def _make_tracker(self, cam_key, small):
-        c = self.config
-        h, w = small.shape[:2]
-        px = lambda pts: [[float(x) * w, float(y) * h] for x, y in pts]
-        sea = px([c["sea_norm"]])[0]
-        p1, p2 = px(c["edge_norm"])
-        ref = EdgeLine(p1, p2)
-        ref = EdgeLine(p1, p2, land_n=-ref.n if ref.offset(sea) > 0 else ref.n)   # 바다 점의 반대쪽이 육지
-        self.zone_px = np.asarray(px(c["zone_norm"]))
-        self.tracker = SeaSideEdgeTracker(cam_key, c["edge"], ref, np.asarray(c["land_ref"], np.float64),
-                                          np.asarray(c["water_ref"], np.float64))
-
     def process(self, tracks, track_map, frame, fid, **kwargs):
         cam_key = kwargs.get('camera_key')
         t = time.monotonic()
@@ -6398,22 +6296,11 @@ class SeaSidePersonDetector(BaseEventDetector):
         if frame is None or not self.ready:
             self.overlay = None
             if not self.ready:
-                self._warn(t, f"[SEASIDE] cam={cam_key} 설치 설정(끝선·바다 점·위험 구역·색)이 없어 판정하지 않습니다. "
-                              f"마법사에서 설정하세요.")
+                self._warn(t, f"[SEASIDE] cam={cam_key} 위험 구역(zone_norm)이 없어 판정하지 않습니다. 마법사에서 그리세요.")
             return []
         h, w = frame.shape[:2]
-        small = cv2.resize(frame, (SEASIDE_WORK_W, max(1, int(h * SEASIDE_WORK_W / w))), interpolation=cv2.INTER_AREA)
-        if self.tracker is None:
-            self._make_tracker(cam_key, small)
-        state = self.tracker.update(small, t)
-        sh, sw = small.shape[:2]
-        zone = self.tracker.map_points(self.zone_px) / [sw, sh]
-        self.zone_now = zone
-        self.overlay = self._overlay(state, sw, sh)
-        if state == "UNKNOWN":
-            self.inside = {}
-            self._warn(t, f"[SEASIDE] cam={cam_key} 끝선을 찾지 못해 위험 구역을 모름 → 해측 판정 중지")
-            return []
+        zone = self.zone
+        self.overlay = {"group": self.group.name, "zone": [tuple(p) for p in zone], "persons": []}
         contour = zone.astype(np.float32).reshape(-1, 1, 2)
         hold, gap = float(self.config["person_hold_sec"]), float(self.config["gap_tolerance_sec"])
         near_d = float(self.config["near_ratio"])
@@ -6421,8 +6308,9 @@ class SeaSidePersonDetector(BaseEventDetector):
         for person in _yt_parse_tracks(kwargs.get('topdown_tracks')):
             if person.name not in self.config["person_classes"]:
                 continue
-            # 비스듬한 시점이라 발 위치 = 박스 아래 가운데
-            u, v = (person.box[0] + person.box[2]) / 2.0 / w, person.box[3] / h
+            # 발 위치: 비스듬히 보면 박스 아래 가운데, 바로 위에서 내려다보면(foot "center") 박스 가운데
+            u = (person.box[0] + person.box[2]) / 2.0 / w
+            v = ((person.box[1] + person.box[3]) / 2.0 if self.foot_center else person.box[3]) / h
             dist = cv2.pointPolygonTest(contour, (float(u), float(v)), True)   # 안 +, 밖 -(정규화 단위)
             inside = dist >= 0
             self.overlay["persons"].append((u, v, inside))
@@ -6453,7 +6341,7 @@ class SeaSidePersonDetector(BaseEventDetector):
                     'group': self.group.name,
                     'foot_norm': [round(u, 4), round(v, 4)],
                     'zone_norm': [[round(float(x), 4), round(float(y), 4)] for x, y in zone],
-                    'edge_mode': self.tracker.mode, 'edge_state': state,
+                    'foot': "center" if self.foot_center else "bottom",
                     'inside_sec': round(t - s["since"], 2), 'person_hold_sec': hold,
                 },
             })
@@ -6465,18 +6353,6 @@ class SeaSidePersonDetector(BaseEventDetector):
         self.inside = {tid: s for tid, s in self.inside.items() if t - s["last"] <= gap}
         return triggered
 
-    def _overlay(self, state, sw, sh):
-        """화면에 그릴 것(정규화 좌표): 지금 위험 구역, 지금 끝선(따라가는 선), 이번에 찾은 끝선, 사람 발 위치."""
-        tr = self.tracker
-
-        def seg(line):
-            a, b = line.p1 - line.u * 2 * sw, line.p1 + line.u * 2 * sw
-            ok, q1, q2 = cv2.clipLine((0, 0, sw, sh), (int(a[0]), int(a[1])), (int(b[0]), int(b[1])))
-            return [[q1[0] / sw, q1[1] / sh], [q2[0] / sw, q2[1] / sh]] if ok else []
-
-        return {"state": state, "group": self.group.name, "zone": [tuple(p) for p in self.zone_now],
-                "edge": seg(tr.cur), "edge_found": seg(tr.last_found) if tr.last_found is not None else [],
-                "persons": []}
 # ============================================================================
 # [해측 추락 방지 모듈 끝]
 # ============================================================================
@@ -6627,46 +6503,16 @@ def get_numbered_points(frame, title, count):
     return None if pts is None else normalize_roi_points(pts, orig_w, orig_h)
 
 
-def seaside_snap_edge(small, p1, p2, band_px=15):
-    """클릭한 끝선 두 점(작업 폭 px)을 근처(band_px)에서 클릭한 선에 가장 가까운 나란한 직선에 맞춥니다.
-    가장 긴 직선을 고르면 바로 옆 노란 안전선·흰 테두리 반대편에 붙을 수 있습니다. 없으면 클릭 그대로."""
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    clicked = EdgeLine(p1, p2)
-    cands = [c for c in seaside_edge_candidates(gray, clicked, band_px, max_angle_deg=5.0) if c[2] >= 0.2]
-    if not cands:
-        return p1, p2, False
-    q1, q2, _ = min(cands, key=lambda c: max(abs(EdgeLine(c[0], c[1]).offset(p)) for p in (p1, p2)))
-    line = EdgeLine(q1, q2)
-    # 클릭한 두 점의 자리(따라가는 위치)는 그대로 두고 직선 위로만 옮깁니다.
-    return line.foot(p1).tolist(), line.foot(p2).tolist(), True
-
-
 def run_wizard_seaside_setup(frame, ip, old_cfg=None):
-    """해측 추락 방지 카메라 설정(거리 측정 없음): 스냅샷에서 안벽 끝선 두 점 + 바다 쪽 한 점을 클릭하고, 위험 구역을
-    그립니다. 끝선 양옆 육지·물 색은 자동으로 남깁니다. 반환 cameras.json event_config.seaside_person 값(취소하면 None).
-    크레인이 움직이면 앱이 끝선을 다시 찾아 그린 구역을 같이 옮깁니다."""
-    old_cfg = old_cfg or {}
-    if old_cfg.get("edge_norm") and old_cfg.get("zone_norm") and guarded_input(
-            f"[{ip}] 기존 해측 설정(끝선·위험 구역)을 그대로 쓸까요? [Y/n]: ").strip().lower() != 'n':
-        return {k: old_cfg[k] for k in ("edge_norm", "sea_norm", "zone_norm", "land_ref", "water_ref",
-                                       "exclude_polys_norm") if k in old_cfg}
-    print(f"[{ip}] 해측 설정: 1·2번 = 안벽 끝선(바다와 안벽 경계) 위 두 점(서로 멀리), 3번 = 바다 쪽 아무 곳. Enter 완료")
-    pts = get_numbered_points(frame, f"Seaside quay edge (1,2) + sea (3) - CAM: {ip}", 3)
-    if pts is None:
-        return None
-    h, w = frame.shape[:2]
-    small = cv2.resize(frame, (SEASIDE_WORK_W, max(1, int(h * SEASIDE_WORK_W / w))), interpolation=cv2.INTER_AREA)
-    sh, sw = small.shape[:2]
-    p1, p2, snapped = seaside_snap_edge(small, [pts[0][0] * sw, pts[0][1] * sh], [pts[1][0] * sw, pts[1][1] * sh])
-    print("   끝선을 화면의 직선에 맞췄습니다." if snapped else "   근처에 직선이 없어 클릭한 그대로 씁니다.")
-    sea = [pts[2][0] * sw, pts[2][1] * sh]
-    line = EdgeLine(p1, p2)
-    line = EdgeLine(p1, p2, land_n=-line.n if line.offset(sea) > 0 else line.n)
-    land_ref, water_ref = seaside_color_refs(small, line)
-    if land_ref is None:
-        print("   끝선 양옆 색을 읽지 못했습니다(끝선이 화면 가장자리). 다시 설정하세요.")
-        return None
-    print(f"   육지 색 BGR {np.round(land_ref).astype(int).tolist()}, 물 색 BGR {np.round(water_ref).astype(int).tolist()}")
+    """해측 추락 방지 카메라 설정(거리 측정 없음): 사람 위치 기준을 고르고 위험 구역과 크레인 구조물 제외 구역을 그립니다.
+    반환 cameras.json event_config.seaside_person 값(취소하면 None). 사람 위치는 비스듬히 보면 박스 아래(b),
+    바로 위에서 내려다보면 박스 가운데(c)로 잽니다."""
+    old_cfg = {k: v for k, v in (old_cfg or {}).items() if k not in SEASIDE_OLD_KEYS}
+    if old_cfg.get("zone_norm") and guarded_input(
+            f"[{ip}] 기존 해측 설정(위험 구역)을 그대로 쓸까요? [Y/n]: ").strip().lower() != 'n':
+        return old_cfg
+    foot = "center" if guarded_input(f"[{ip}] 사람 위치: 박스 아래 b(비스듬히 볼 때, 기본) / 박스 가운데 c(바로 위에서 볼 때): "
+                                     ).strip().lower() == 'c' else "bottom"
     zone = get_roi_points_scaled(frame, f"Seaside danger zone - CAM: {ip}", required=True)
     if polygon_contour(zone) is None:
         return None
@@ -6682,10 +6528,7 @@ def run_wizard_seaside_setup(frame, ip, old_cfg=None):
                 excludes.append(poly)
             if guarded_input("   제외 구역을 더 그릴까요? [y/N]: ").strip().lower() != 'y':
                 break
-    return {"edge_norm": [[round(p1[0] / sw, 6), round(p1[1] / sh, 6)], [round(p2[0] / sw, 6), round(p2[1] / sh, 6)]],
-            "sea_norm": [round(pts[2][0], 6), round(pts[2][1], 6)], "zone_norm": zone,
-            "land_ref": [round(float(v), 1) for v in land_ref], "water_ref": [round(float(v), 1) for v in water_ref],
-            "exclude_polys_norm": excludes}
+    return {"foot": foot, "zone_norm": zone, "exclude_polys_norm": excludes}
 
 
 def run_wizard_batch_mode(rtsp_list, existing_configs=None):
@@ -6810,8 +6653,8 @@ def run_wizard_batch_mode(rtsp_list, existing_configs=None):
                     # 관제 전송 꺼짐 시간대(receiver_event_off_hours): 과속을 고르면 기본값 17:30~08:00을 적고, 전에 적어 둔
                     # 값은 그대로 둡니다.
                     off_hours = wizard_receiver_off_hours(events, old_conf.get("receiver_event_off_hours"))
-                    # 현장 스피커 방송(speaker_enable·ip_speaker·sound): 과속 카메라에 묻지 않고 false·"none"·"none"으로 적어
-                    # 둡니다(사람이 나중에 채움).
+                    # 현장 스피커 방송(speaker_enable·ip_speaker·sound): 과속·콘 NG·해측·헤드압착 카메라에 묻지 않고
+                    # false·"none"·"none"으로 적어 둡니다(사람이 나중에 채움).
                     configs[ip].update(wizard_site_sound(events, old_conf))
                     if off_hours:
                         configs[ip]["receiver_event_off_hours"] = off_hours
@@ -10560,6 +10403,9 @@ class Camera:
                     if ename == BACKREACH_EVENT and self._read_backreach_state() != br_state:
                         # 블러 처리 중 감시 구간이 바뀌어도 이전 구간 결과는 저장하지 않습니다.
                         break
+                    send_cps_alarm(ename, event_id)   # PCTC 캐빈실 경고음(cps_alarm). 사진 저장·관제 전송을 기다리지 않음
+                    if ename in SITE_SOUND_DETECT_EVENTS:
+                        play_site_sound(self.cam_id, event_id)   # 현장 스피커(카메라별 speaker_enable·ip_speaker·sound), 판정 순간
 
                     # 블러 처리 메타데이터 로깅 (추적용)
                     privacy_blur_meta["scope"] = "event_snapshot"
@@ -10876,7 +10722,7 @@ class Camera:
         seaside_handler = self.handlers.get(SEASIDE_PERSON_EVENT)
         seaside_overlay = getattr(seaside_handler, "overlay", None)
         if seaside_overlay:
-            # 해측 가변 ROI(정규화 좌표): 위험 구역(반투명 빨강), 따라가는 끝선(파랑), 이번에 찾은 끝선(하늘색), 사람 발 위치
+            # 해측(정규화 좌표): 위험 구역(반투명 빨강), 사람 위치(구역 안 빨강 IN, 밖 초록 OUT)
             def norm_pts(pts):
                 return np.array([[int(u * w_frame), int(v * h_frame)] for u, v in pts], np.int32)
             if len(seaside_overlay["zone"]) >= 3:
@@ -10885,18 +10731,12 @@ class Camera:
                 cv2.fillPoly(layer, [poly], (0, 0, 255))
                 fr[:] = cv2.addWeighted(fr, 0.75, layer, 0.25, 0)
                 cv2.polylines(fr, [poly], True, (0, 0, 255), th(1))
-            if len(seaside_overlay["edge"]) >= 2:
-                cv2.polylines(fr, [norm_pts(seaside_overlay["edge"])], False, (255, 0, 0), th(2))
-            if seaside_overlay["edge_found"]:
-                cv2.polylines(fr, [norm_pts(seaside_overlay["edge_found"])], False, (255, 255, 0), th(2))
             for u, v, inside in seaside_overlay["persons"]:
                 pt = (int(u * w_frame), int(v * h_frame))
                 cv2.circle(fr, pt, px(4), (0, 0, 255) if inside else (0, 255, 0), -1)
                 cv2.putText(fr, "IN" if inside else "OUT", (pt[0] + px(6), pt[1]), cv2.FONT_HERSHEY_SIMPLEX, fs(0.45),
                             (0, 0, 255) if inside else (0, 255, 0), th(1))
-            state_color = {"CONFIRMED": (0, 255, 0), "HOLDING": (0, 200, 255)}.get(seaside_overlay["state"], (0, 0, 255))
-            hud_text(f"SEASIDE {seaside_overlay['group']} {seaside_overlay['state']}", (px(10), h_frame - px(12)),
-                     state_color, 0.55)
+            hud_text(f"SEASIDE {seaside_overlay['group']}", (px(10), h_frame - px(12)), (0, 255, 0), 0.55)
 
         if self.yt_monitor is not None:
             # YT 양하 감시: 적재영역(빨강)·하락 예측 바닥면(정상 초록, 이탈 자홍)·대기 시간(위험구역 노랑은 위에서 그림)
@@ -11645,7 +11485,7 @@ def main():
             ip, conf,
             event_models.get("MAIN_V2") if "MAIN_V2" in event_model_keys(events) else None,
             d_face, d_plate, cam_id=cam_id,
-            det_topdown=event_models.get(TOPDOWN_MODEL) if any(name in events for name in PERSON_TOPDOWN_EVENTS) else None,
+            det_topdown=event_models.get(person_pass_model(events)) if person_pass_model(events) else None,
         )
 
     cams = []
@@ -11727,8 +11567,14 @@ def main():
             # Backreach 감시 OFF이고 YT 양하 감시 중도 아닌 동안은 초당 idle_infer_fps장만 추론하고,
             # 그 사이 프레임은 직전 검출을 다시 씁니다(Camera.backreach_inference_due).
             if cam.backreach_inference_due():
-                model = event_models.get(TOPDOWN_MODEL)
-                cam.last_topdown_res = detection_array(model.infer(fr)) if model is not None else None
+                key = person_pass_model(cam.events)
+                model = event_models.get(key)
+                if model is None:
+                    cam.last_topdown_res = None
+                elif key == HANJIN_MODEL:   # 해측만 켠 카메라: 한진 모델의 사람만 topdown PERSON으로
+                    cam.last_topdown_res = hanjin_persons_as_topdown(model.infer(fr))
+                else:
+                    cam.last_topdown_res = detection_array(model.infer(fr))
                 # 새로 추론한 검출의 스프레더로 Backreach 감시 ON·OFF를 정합니다(다시 쓰는 검출은 세지 않음).
                 cam.update_backreach_gate(cam.last_topdown_res)
             d_topdown = cam.last_topdown_res
