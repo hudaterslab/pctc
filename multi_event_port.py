@@ -309,6 +309,13 @@ def load_system_config():
         #   PLC가 값이 그대로여도 주기적으로 보낸다고 보고 정한 값입니다(보내는 주기 확인 필요).
         "plc_cps": {"url": "http://localhost:24000/api/v1/edge/cpsPlc", "interval_sec": 1.0, "timeout_sec": 3.0,
                     "use_for_events": False, "stale_sec": 5.0},
+        # PCTC 캐빈실 경고음: 이벤트가 나면 지팬스 CPS 단말(TCP 서버 host:port)에 재생할 음성 파일 이름을 보냅니다.
+        # host가 비어 있으면(기본) 보내지 않습니다. cps_name·cps_ip는 그 크레인 CPS의 이름·IP(예 "RMQC#102", 비우면 host).
+        # sounds: 이벤트 → CPS 단말에 있는 음성 파일 이름(지팬스에 보낸 4가지). 값을 ""로 두면 그 이벤트는 안 보냅니다.
+        "cps_alarm": {"host": "", "port": 4010, "cps_name": "", "cps_ip": "", "connect_timeout_sec": 3.0,
+                      "result_wait_sec": 3.0,
+                      "sounds": {"yt_zone_person": "01_hds_person_zone.wav", "yt_head_crush": "02_yt_head_crush.wav",
+                                 "cone_ng": "03_cone_departure.wav", "seaside_person": "04_seaside_fall.wav"}},
         "system_performance": {
             "target_fps": 10.0,
             "dynamic_cpu_adjust_enabled": False,
@@ -1454,6 +1461,88 @@ def play_site_sound(cctv_id, event_id):
         return False
     logger.info(f"[SITE SOUND] 방송 시작. {tag}")
     threading.Thread(target=_site_sound_worker, args=(speaker, sound, tag), daemon=True, name="site-sound").start()
+    return True
+
+
+# PCTC 캐빈실 경고음(지팬스 CPS 단말의 USB 스피커, SYS_CFG cps_alarm). 지팬스 11/24 메일: CPS 단말이 TCP 서버(4010),
+# 우리 단말이 클라이언트. 이벤트마다 접속해 XML 한 건을 보내고, 결과(ResultCode)를 result_wait_sec까지 기다린 뒤 끊습니다.
+# heartbeat는 보내지 않습니다(지팬스: 선택 사항, 서버는 안 보냄). 관제 전송 성공·꺼짐 시간대와 상관없이 판정 순간에 보냅니다.
+CPS_ALARM_BUSY = set()   # 지금 보내는 중인 (CPS 주소, 음성 파일). 같은 크레인 카메라 여럿이 한꺼번에 내면 한 번만 보냅니다.
+
+
+def cps_alarm_frame(cps_name, cps_ip, alarm, current_time):
+    """지팬스 CPS 알람 요청(11/23 프로토콜 cpsAlarmRequest) → 보낼 바이트. 앞에 SUB(0x1A), 끝에 ESC(0x1B)+CRLF.
+    지팬스가 줄 단위로 읽을 수 있어 XML 안에는 줄바꿈을 넣지 않습니다."""
+    xml = ("<cpsAlarmRequest><header><serviceInfo><serviceID>hjncCps.HandleAlarmInfo</serviceID>"
+           "<protocol>XML</protocol><serviceAlias>CPS</serviceAlias></serviceInfo></header>"
+           f'<body class="handleAlarmInfoParam"><CpsName>{cps_name}</CpsName><CpsIP>{cps_ip}</CpsIP>'
+           f"<CpsAlarm>{alarm}</CpsAlarm><CurrentTime>{current_time}</CurrentTime></body></cpsAlarmRequest>")
+    return b"\x1a" + xml.encode("utf-8") + b"\x1b\r\n"
+
+
+def cps_alarm_send(host, port, frame, connect_timeout, result_wait):
+    """프레임 하나를 보내고 응답(cpsAlarmResponse)을 result_wait초까지 기다린 뒤 끊습니다 → (ResultCode, ResultMsg).
+    응답이 없으면 None. 접속·전송 실패는 OSError로 올립니다."""
+    reply = b""
+    with socket.create_connection((host, port), timeout=connect_timeout) as sock:
+        sock.sendall(frame)
+        deadline = time.monotonic() + result_wait
+        while b"\x1b" not in reply:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            sock.settimeout(left)
+            try:
+                chunk = sock.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            reply += chunk
+    # 정규식으로 읽습니다: 지팬스 예시는 여는·닫는 태그 이름이 다르기도 합니다(cpsInfoResponse … /cpsInfoRequest).
+    text = reply.decode("utf-8", "replace")
+    found = [re.search(f"<{tag}>(.*?)</{tag}>", text, re.S) for tag in ("ResultCode", "ResultMsg")]
+    if not found[0]:
+        return None
+    return found[0].group(1).strip(), found[1].group(1).strip() if found[1] else ""
+
+
+def _cps_alarm_worker(cfg, key, frame, tag):
+    try:
+        result = cps_alarm_send(key[0], int(cfg["port"]), frame, float(cfg["connect_timeout_sec"]),
+                                float(cfg["result_wait_sec"]))
+        if result is None:
+            logger.warning(f"[CPS ALARM] 보냈지만 결과 응답이 없음({float(cfg['result_wait_sec']):g}초). {tag}")
+        elif result[0] == "SUCCESS":
+            logger.info(f"[CPS ALARM] 재생 정상({result[1]}). {tag}")
+        else:
+            logger.warning(f"[CPS ALARM] 재생 실패 {result[0]}: {result[1]}. {tag}")
+    except OSError as e:
+        logger.warning(f"[CPS ALARM] 보내지 못함: {e}. {tag}")
+    finally:
+        with SITE_SOUND_LOCK:
+            CPS_ALARM_BUSY.discard(key)
+
+
+def send_cps_alarm(event_name, event_id):
+    """PCTC이고 cps_alarm.host와 이 이벤트의 음성 파일이 있으면 별도 스레드로 CPS 단말에 알람을 보냅니다(판정을 붙잡지 않음).
+    보내기 시작했으면 True."""
+    cfg = SYS_CFG["cps_alarm"]
+    host = str(cfg.get("host") or "").strip()
+    alarm = str((cfg.get("sounds") or {}).get(event_name) or "").strip()
+    if not host or not alarm or receiver_site() != "pctc":
+        return False
+    key = (host, alarm)
+    tag = f"event_id={event_id} event={event_name} cps={host}:{cfg['port']} alarm={alarm}"
+    with SITE_SOUND_LOCK:
+        if key in CPS_ALARM_BUSY:
+            logger.info(f"[CPS ALARM] 같은 알람을 아직 보내는 중이라 건너뜀. {tag}")
+            return False
+        CPS_ALARM_BUSY.add(key)
+    frame = cps_alarm_frame(cfg.get("cps_name") or "", str(cfg.get("cps_ip") or "").strip() or host, alarm,
+                            now_kst().isoformat(timespec="seconds"))
+    logger.info(f"[CPS ALARM] 보냄. {tag}")
+    threading.Thread(target=_cps_alarm_worker, args=(cfg, key, frame, tag), daemon=True, name="cps-alarm").start()
     return True
 
 
@@ -10515,6 +10604,7 @@ class Camera:
                     if ename == BACKREACH_EVENT and self._read_backreach_state() != br_state:
                         # 블러 처리 중 감시 구간이 바뀌어도 이전 구간 결과는 저장하지 않습니다.
                         break
+                    send_cps_alarm(ename, event_id)   # PCTC 캐빈실 경고음(cps_alarm). 사진 저장·관제 전송을 기다리지 않음
 
                     # 블러 처리 메타데이터 로깅 (추적용)
                     privacy_blur_meta["scope"] = "event_snapshot"
