@@ -7935,7 +7935,8 @@ UNSENT_EVIDENCE_MAX_DT = 0.2        # 판정 순간과 이 안(초)의 원본 �
 def make_unsent_evidence_image(out_dir, meta, result, kind, reason):
     """관제로 보내지 않은 과속(kind: ghost·excluded)의 증거 사진(evidence.jpg). 왜 안 보냈는지 사진으로 보려는 것입니다.
     ① 판정 순간에 가장 가까운 원본 프레임에 과속을 낸 레이더 점(빨강)과 지나온 경로, 그 점이 붙은 상자(굵게)와 종류 이름,
-    같은 상자에 걸린 다른 레이더 점과 속도(노랑), 그 밖의 상자·점(회색) ② 그 점 둘레 확대 ③ 찾은 번호판(있으면),
+    같은 상자에 걸린 다른 레이더 점과 속도(노랑), 더 가까운 느린 점(하늘색, 허상 규칙), 그 밖의 상자·점(회색). 노랑·하늘색
+    점이 화면 밖이면 가장자리에 화살표로 그립니다. ② 그 점 둘레 확대 ③ 찾은 번호판(있으면),
     안 보낸 까닭(reason: 로그에 찍는 문장)을 적습니다. 상자·점은 evidence.scene(speeding_scene)에서 옵니다.
     번호판을 읽어 만든 evidence.jpg(make_evidence_image)가 있으면 이것으로 바뀝니다. 관제로 가는 사진과는 무관합니다.
     만들면 파일 이름, 못 만들면 None."""
@@ -7980,12 +7981,26 @@ def make_unsent_evidence_image(out_dir, meta, result, kind, reason):
         if rid == radar_id:
             spot = (x, y, float(kmh))
             continue
-        same = rid in same_box
+        same, near = rid in same_box, rid == ev.get("nearer_slower_id")
         if same:
             others.append(f"R{rid} {float(kmh):.1f}km/h")
-        cv2.circle(img, (x, y), 22 if same else 14, (0, 255, 255) if same else (200, 200, 200), -1, cv2.LINE_AA)
-        cv2.circle(img, (x, y), 22 if same else 14, (0, 0, 0), 3, cv2.LINE_AA)
-        label(f"R{rid} {float(kmh):.0f}", x + 30, y + 16, (0, 255, 255) if same else (200, 200, 200), 1.6)
+        color = (0, 255, 255) if same else (255, 200, 0) if near else (200, 200, 200)
+        if not (0 <= x < W and 0 <= y < H):
+            # 화면 밖 점: 이 과속과 얽힌 점(같은 상자·더 가까운 느린 점)만 가장자리에 그쪽을 가리키는 화살표로 그립니다.
+            if not (same or near):
+                continue
+            cx, cy = min(max(x, 60), W - 60), min(max(y, 60), H - 60)
+            gap = max(1.0, math.hypot(x - cx, y - cy))
+            sx0, sy0 = int(cx - (x - cx) / gap * 160), int(cy - (y - cy) / gap * 160)
+            cv2.arrowedLine(img, (sx0, sy0), (cx, cy), (0, 0, 0), 20, cv2.LINE_AA, tipLength=0.45)
+            cv2.arrowedLine(img, (sx0, sy0), (cx, cy), color, 10, cv2.LINE_AA, tipLength=0.45)
+            label(f"R{rid} {float(kmh):.0f}km/h", min(max(cx + 40, 10), W - 520), min(max((sy0 + cy) // 2 + 20, 70), H - 20),
+                  color, 1.8)
+            continue
+        big = same or near
+        cv2.circle(img, (x, y), 22 if big else 14, color, -1, cv2.LINE_AA)
+        cv2.circle(img, (x, y), 22 if big else 14, (0, 0, 0), 3, cv2.LINE_AA)
+        label(f"R{rid} {float(kmh):.0f}", x + 30, y + 16, color, 1.6)
     if spot is None:
         # 판정 순간 기록에 이 점이 없거나 판정 순간 프레임이 아님: 이 프레임 시각의 레이더 경로 위치를 씁니다.
         uv = radar_point_at(meta.get("radar_path"), frame.get("pts"), inf)
@@ -8013,7 +8028,7 @@ def make_unsent_evidence_image(out_dir, meta, result, kind, reason):
     canvas[120:900, 0:1000] = evidence_fit(img, 1000, 780)
     canvas[120:520, 1010:1600] = evidence_fit(zoom, 590, 400)
     canvas[535:665, 1010:1600] = evidence_fit(plate, 590, 130)
-    plate_line = ("번호판  찾지 않음" if speeding_plate_skipped(meta) else
+    plate_line = ("번호판  찾지 않음" if result is None and speeding_plate_skipped(meta) else
                   f"번호판  {final.get('no_box_text') or final.get('away_text') or final.get('text') or '-'}  "
                   f"[{final.get('status') or '없음'}]")
     shared = int(ev.get("shared_box_frames") or 0)
@@ -8025,11 +8040,11 @@ def make_unsent_evidence_image(out_dir, meta, result, kind, reason):
                       f"(기준 {float(ev.get('threshold_kmh') or 0):.0f})", 26, (255, 120, 120)),
         ((1010, 718), f"붙은 상자  {held_name or '없음'} · 판정 구간 차량 상자 {ev.get('vehicle_box_frames')}프레임",
          22, (255, 170, 60)),
-        ((1010, 752), (f"더 가까운 느린 점  R{ev.get('nearer_slower_id')} {ev.get('nearer_slower_kmh')}km/h "
+        ((1010, 752), (f"더 가까운 느린 점 R{ev.get('nearer_slower_id')} {ev.get('nearer_slower_kmh')}km/h "
                        f"({ev.get('nearer_slower_frames')}프레임, {ev.get('nearer_faster_kmh')}km/h 빠름)"
                        if speeding_point_nearer_ghost(ev) else
-                       "같은 상자의 다른 점  " + (", ".join(others) if others else "없음")
-                       + (f" ({shared}프레임 함께, {ev.get('shared_faster_kmh')}km/h 빠름)" if shared else "")), 22, (240, 240, 100)),
+                       "같은 상자의 다른 점 " + (", ".join(others) if others else "없음")
+                       + (f" ({shared}프레임 함께, {ev.get('shared_faster_kmh')}km/h 빠름)" if shared else "")), 20, (240, 240, 100)),
         ((1010, 786), plate_line, 22, (120, 240, 120)),
         ((1010, 820), f"판정 {float(frame['dt_from_event']):+.2f}초 원본 프레임"
                       + ("" if at_event else " (판정 순간이 아니라 상자는 안 그림)"), 20, (180, 180, 180)),
@@ -8190,7 +8205,7 @@ def speeding_api_objects(objects, final):
 #               같은 차량번호를 방금 보냄(same_plate_guard_sec), 차량 상자가 있어도 관제 전송 꺼짐 시간대(밤)에 남.
 #   "ghost": 그 밖에 안 보낸 것 전부(살펴봐야 할 것, 11/25). 차량 상자는 있었는데 차량번호가 없음: 번호판을 못 찾음(미인식,
 #            번호판이 없는 야드트럭 포함)·멀어지는 차·차량 상자 없음(drop_boxless_plate)·읽기 실패나 시간초과·원본 추출 실패.
-#            판정 구간에 차량 상자가 안 붙었는데 레이더 점 근처에서 번호판이 잡힘(차량 모델이 차를 놓침, 11/26).
+#            판정 구간에 차량 상자가 안 붙었는데 레이더 점 근처에서 번호판이 잡힘(차량 모델이 차를 놓쳤을 수 있음, 11/26).
 NO_VEHICLE_EVENTS = {}
 NO_VEHICLE_EVENTS_MAX = 2000
 
@@ -8202,6 +8217,7 @@ def mark_unsent_speeding(event_id, kind):
         NO_VEHICLE_EVENTS.pop(next(iter(NO_VEHICLE_EVENTS)), None)
 NO_VEHICLE_STATUS = {"ghost": "확인 필요", "excluded": "과속 대상 아님"}   # 번호판 결과 자리에 넣는 상태(안 보낸 까닭)
 NO_VEHICLE_LOG_TAG = {"ghost": "[GHOST]", "excluded": "[EXCLUDED]"}
+PLATE_SKIPPED_STATUS = "번호판 찾지 않음"                                # 번호판을 찾지 않은 과속의 번호판 상태(speeding_plate_skipped)
 GHOST_MIN_BOX_FRAMES = 5            # 판정 구간 동안 그 레이더 점에 차량 박스가 이만큼(프레임) 이상 붙어야 차가 있었던 것.
                                     # 다른 점과 한 박스에 이만큼 함께 걸렸는지도 이 값으로 봅니다(no_vehicle_kind)
 GHOST_FASTER_KMH = 5.0              # 같은 박스의 가장 느린 점보다 이만큼(km/h) 넘게 빠른 점이면 안 보냄(같은 차의 다른 점은 속도가 같음)
@@ -8230,7 +8246,8 @@ def no_vehicle_kind(meta, result=None):
       점이 있었음(그 차의 허상, evidence.nearer_slower_frames). 뒤의 세 가지는 박스가 붙었어도 SpeedingDetector가
       vehicle_box를 False로 둡니다.
     - "ghost": 위 어디에도 안 걸리고(대상 아닌 물체·밤·다른 레이더 점과 한 박스에 걸림·박스보다 멀리 찍힘·허상이 아님)
-      레이더 점 근처에서 번호판이 잡힌 것(plates_at_radar_point). 차가 실제로 있었는데 차량 모델이 놓친 것으로 봅니다.
+      레이더 점 근처에서 번호판이 잡힌 것(plates_at_radar_point). 차가 실제로 있었는데 차량 모델이 놓쳤을 수 있어
+      살펴봐야 합니다.
       번호판도 안 잡혔으면 레이더 노이즈로 보고 excluded입니다.
     차량 상자는 있었는데 차량번호가 없어 안 보내는 과속은 여기서 가르지 않습니다("ghost", run_plr_on_fullres)."""
     evidence = meta.get("evidence") or {}
@@ -8244,12 +8261,20 @@ def no_vehicle_kind(meta, result=None):
 
 
 def speeding_plate_skipped(meta):
-    """레이더 점이 과속 대상이 아닌 물체(컨테이너·리치스태커) 상자에 붙어 걸러지는 과속이면 그 물체 이름, 아니면 None.
-    판정 순간에 정해져 번호판과 상관없이 안 보내므로 번호판을 찾지 않습니다(run_plr_on_fullres)."""
+    """번호판과 상관없이 판정 순간에 안 보내기로(excluded) 정해진 과속이면 True. 번호판을 찾지 않습니다(run_plr_on_fullres).
+    - 관제 전송 꺼짐 시간대(밤)에 난 과속(차량 상자가 있든 없든)
+    - 차량 상자가 안 붙은 과속(evidence.vehicle_box False) 가운데 대상 아닌 물체(컨테이너·리치스태커) 상자에 붙음,
+      다른 레이더 점과 한 박스에 걸림, 박스보다 멀리 찍힘, 가까운 느린 점의 허상
+    어느 상자에도 안 걸린 낮의 과속은 번호판 유무로 ghost·excluded를 가르므로 번호판을 찾습니다(no_vehicle_kind)."""
+    if meta.get("event_name") != SPEEDING_EVENT:
+        return False
+    if speeding_in_off_hours(meta):
+        return True
     evidence = meta.get("evidence") or {}
-    if meta.get("event_name") != SPEEDING_EVENT or evidence.get("vehicle_box") is not False:
-        return None
-    return evidence.get("excluded_class") or None
+    if evidence.get("vehicle_box") is not False:
+        return False
+    beside = int(evidence.get("shared_box_frames") or 0) >= GHOST_MIN_BOX_FRAMES
+    return bool(evidence.get("excluded_class") or beside or speeding_point_far(evidence) or speeding_point_nearer_ghost(evidence))
 
 
 def speeding_point_nearer_ghost(evidence):
@@ -8298,8 +8323,8 @@ def run_plr_on_fullres(out_dir, meta):
     """원본 프레임에서 번호판을 읽습니다(_plr_on_fullres). 과속이면 관제 사진이 기다리는 번호판 결과를 넘깁니다
     (못 읽었으면 None). 차량 상자가 안 붙은 과속(no_vehicle_kind: excluded, 레이더 점 근처에서 번호판이 잡혔으면 ghost)이면
     결과를 NO_VEHICLE_STATUS로 넘겨 관제로 보내지 않습니다. 차량번호가 없어 안 보내는 과속은 ghost, 같은 차량번호를 방금
-    보내 안 보내는 과속은 excluded로 적습니다. 컨테이너·리치스태커 상자에 붙은 과속(speeding_plate_skipped)은 번호판을
-    찾지 않고 바로 excluded로 적습니다(plr_meta.json 없음, 뽑은 원본 프레임은 모두 남음).
+    보내 안 보내는 과속은 excluded로 적습니다. 밤 시간대 과속과 판정 순간에 excluded로 정해진 과속(speeding_plate_skipped)은
+    번호판을 찾지 않고 바로 excluded로 적습니다(plr_meta.json 없음, 뽑은 원본 프레임은 모두 남음).
     안 보내는 과속은 모두 까닭을 그린 증거 사진을 남깁니다(make_unsent_evidence_image)
     (사진·원본은 FullResExtractor._process가 안 쓴 원본을 지운 뒤 ghost·excluded 폴더로 옮김)."""
     result = None
@@ -8313,6 +8338,8 @@ def run_plr_on_fullres(out_dir, meta):
             final = (result or {}).get("final")
             event_id = str(meta.get("event_id"))
             reason = None       # 관제로 안 보내는 과속이면 그 까닭(로그 문장). 증거 사진에 적습니다
+            plate_note = (PLATE_SKIPPED_STATUS if speeding_plate_skipped(meta)
+                          else f"번호판 {(final or {}).get('text') or '-'} {(final or {}).get('status') or '-'}")
             kind = no_vehicle_kind(meta, result)
             if kind:
                 mark_unsent_speeding(event_id, kind)
@@ -8338,11 +8365,9 @@ def run_plr_on_fullres(out_dir, meta):
                        else f"판정 구간에 차량 박스가 {GHOST_MIN_BOX_FRAMES}프레임 이상 붙지 않았습니다"
                             f"({evidence.get('vehicle_box_frames')}프레임)")
                 if kind == "ghost":
-                    why += (f". 레이더 점 근처에서 번호판이 {plates_at_radar_point(result)}장 잡혀 "
-                            f"차량 모델이 차를 놓친 것으로 봅니다")
+                    why += (f". 레이더 점 근처에서 번호판이 {plates_at_radar_point(result)}장 잡혔습니다. "
+                            f"차량 모델이 차를 놓쳤는지 확인이 필요합니다")
                 reason = why
-                plate_note = ("번호판 찾지 않음" if speeding_plate_skipped(meta)
-                              else f"번호판 {(final or {}).get('text') or '-'} {(final or {}).get('status') or '-'}")
                 logger.warning(f"{NO_VEHICLE_LOG_TAG[kind]} {why}({plate_note}). "
                                f"관제로 보내지 않습니다. event_id={meta.get('event_id')}")
                 final = {"text": "", "status": NO_VEHICLE_STATUS[kind]}
@@ -8351,8 +8376,8 @@ def run_plr_on_fullres(out_dir, meta):
                 # (전송은 send_event_*_to_receiver가 event_off_hours로 건너뜀).
                 mark_unsent_speeding(event_id, "excluded")
                 reason = "관제 전송 꺼짐 시간대(밤)에 난 과속입니다"
-                logger.info(f"[EXCLUDED] 관제 전송 꺼짐 시간대(밤)에 난 과속입니다(번호판 {(final or {}).get('text') or '-'} "
-                            f"{(final or {}).get('status') or '-'}). 관제로 보내지 않습니다. event_id={event_id}")
+                logger.info(f"[EXCLUDED] {reason}({plate_note}). 관제로 보내지 않습니다. event_id={event_id}")
+                final = {"text": "", "status": PLATE_SKIPPED_STATUS}
             elif not (final or {}).get("text") or event_id in RECEIVER_SKIPPED_EVENTS:
                 # 차량 상자는 있었는데 차량번호가 없어 안 보내는 과속(번호판 못 찾음·멀어지는 차·차량 상자 없음·읽기 실패, 또는
                 # 기다리다 시간이 지나 이미 안 보내기로 함): 규칙이 거른 것이 아니라 살펴봐야 할 것이라 ghost 폴더로 갑니다.
