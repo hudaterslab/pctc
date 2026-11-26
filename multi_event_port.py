@@ -10928,7 +10928,9 @@ class Camera:
         if len(alarms) > 0:
             cv2.rectangle(fr, (0, 0), (w_frame, h_frame), (0, 0, 255), th(20))
 
-        if len(self.roi_poly) > 2:
+        # 해측만 켠 카메라는 일반 ROI를 쓰지 않습니다(위험 구역 zone_norm으로 판정하고 관제와도 그것을 주고받음).
+        # 예전 관제 ROI가 roi_poly_norm에 남아 있어도 노란 선으로 따로 그리지 않고 위험 구역(빨강)만 보입니다(11/27).
+        if len(self.roi_poly) > 2 and set(self.handlers) != {SEASIDE_PERSON_EVENT}:
             # YT 작업 차선 ROI(4번)는 초록입니다(노랑은 5번 위험구역). Backreach가 있으면 Backreach 감시 영역이라 노랑 그대로입니다.
             roi_color = (0, 255, 0) if self.yt_monitor is not None and BACKREACH_EVENT not in self.handlers else (0, 255, 255)
             cv2.polylines(fr, [(np.asarray(self.roi_poly) * scale).astype(np.int32)], True, roi_color, th(2))
