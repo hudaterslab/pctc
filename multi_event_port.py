@@ -284,8 +284,13 @@ RECEIVER_EVENT_NAMES = {10: "QC_APRON_HDS", 11: "YT_HEAD_CRUSH", 12: "BACKREACH_
 # PCTC면 PLC·CPS 정보도 받습니다(PlcCpsPoller). 주소는 마법사에서 고칠 수 있습니다.
 RECEIVER_SITES = {"hjit": ("HJIT(인천)", "http://100.105.106.40/hjit/receiver/api/v1/cctv"),
                   "pctc": ("PCTC(평택)", "http://210.182.112.138/pctc/receiver/api/v1/cctv")}
-# 이벤트 영상(앞뒤 30초)을 관제로 보내는지(사이트별). PCTC는 사진만 보냅니다(11/25 사용자 결정). 영상은 단말에 그대로 남습니다.
+# 이벤트 영상(앞뒤 30초)을 관제로 보내는지(사이트별 기본값). PCTC는 사진만 보냅니다(11/25 사용자 결정). 영상은 단말에 그대로 남습니다.
+# 헬스체크 응답에 activeStreaming이 오면 그 값을 따릅니다(RECEIVER_ACTIVE_STREAMING, 11/26).
 RECEIVER_SEND_VIDEO = {"hjit": True, "pctc": False}
+# 헬스체크 응답의 관제 설정(HealthCheckDaemon._apply_active_settings가 채움). 켠 뒤 처음 받기 전과 헬스체크가 실패하는 동안은
+# 마지막 값을 씁니다(처음에는 activeSettings 없음 = 모두 보냄, activeStreaming 없음 = RECEIVER_SEND_VIDEO).
+RECEIVER_ACTIVE_SETTINGS = {}      # {관제 이벤트 이름(RECEIVER_EVENT_NAMES 값): bool} false면 그 이벤트는 관제 전송만 막음
+RECEIVER_ACTIVE_STREAMING = None   # bool: 이벤트 영상을 관제로 보내는지
 
 
 def deep_merge_dict(base, override):
@@ -721,9 +726,10 @@ def create_roi_snapshot(cam, frame):
     """현재 카메라 프레임에 ROI와 설정된 이벤트 명만 그립니다."""
     img = frame.copy()
 
-    # 1. ROI Polygon 그리기
-    if len(cam.roi_poly) > 2:
-        cv2.polylines(img, [np.array(cam.roi_poly, np.int32)], True, (0, 255, 255), 2)
+    # 1. ROI Polygon 그리기(해측 카메라는 위험 구역)
+    poly = denormalize_roi_points(control_roi_poly_norm(cam.conf), img.shape[1], img.shape[0])
+    if len(poly) > 2:
+        cv2.polylines(img, [np.array(poly, np.int32)], True, (0, 255, 255), 2)
 
     # 2. ROI Line 그리기(두 점이 선 하나)
     for p1, p2 in zip(cam.roi_lines[0::2], cam.roi_lines[1::2]):
@@ -1121,6 +1127,16 @@ def denormalize_roi_points(points, width, height):
         return []
     return [[int(round(float(x) * width)), int(round(float(y) * height))] for x, y in points]
 
+
+def control_roi_poly_norm(conf):
+    """관제와 주고받는 ROI 다각형(정규화). 해측 카메라는 판정에 쓰는 위험 구역(event_config.seaside_person.zone_norm),
+    나머지는 roi_poly_norm입니다.
+    shortcut: 해측과 roi_poly_norm을 쓰는 이벤트를 한 카메라에 같이 켜면 관제에는 위험 구역만 오갑니다. 그런 카메라가 생기면 나눠 보냅니다."""
+    conf = conf or {}
+    if SEASIDE_PERSON_EVENT in (conf.get("events") or []):
+        return ((conf.get("event_config") or {}).get(SEASIDE_PERSON_EVENT) or {}).get("zone_norm") or []
+    return conf.get("roi_poly_norm") or []
+
 def create_mosaic_image(images, screen_w=SCREEN_WIDTH, screen_h=SCREEN_HEIGHT):
     """여러 카메라의 영상을 하나의 모자이크 화면으로 합성합니다."""
     if not images:
@@ -1207,8 +1223,8 @@ def receiver_response_ok(response):
 
 
 # cameras.json 카메라별 receiver_event_status {이벤트 이름: false}로 사람이 끈 이벤트: 판정·녹화·번호판 읽기는 그대로 하고
-# 관제 전송(사진·영상)만 막습니다. 관제(헬스체크 activeSettings)의 켜기·끄기는 따르지 않습니다
-# (단말기는 설정대로 보내고, 표출 여부는 관제가 정함).
+# 관제 전송(사진·영상)만 막습니다. 관제가 헬스체크 activeSettings로 끈 이벤트도 같은 방식으로 관제 전송만 막습니다
+# (RECEIVER_ACTIVE_SETTINGS, _send_receiver_file. 현장 스피커·CPS 알람은 그대로, 11/26 사용자 결정).
 # {str(cctv_id): {이벤트 이름: bool}} — Camera가 설정을 읽을 때마다 채웁니다.
 RECEIVER_EVENT_STATUS_BY_CAM = {}
 
@@ -1582,6 +1598,8 @@ def _send_receiver_file(file_path, file_field, config_key, event_meta, extra_fie
         reason = "missing_event_identity"
     elif event_meta.get("api_event_type") is None:
         reason = "unknown_event_type"
+    elif RECEIVER_ACTIVE_SETTINGS.get(RECEIVER_EVENT_NAMES.get(int(event_meta["api_event_type"]))) is False:
+        reason = "event_off_in_control"  # 관제 activeSettings에서 끈 이벤트: 전송만 막음(판정·저장·스피커·CPS 알람은 했음)
     elif receiver_event_off_hours(event_meta.get("cctv_id"), event_meta.get("event_name"),
                                   datetime.datetime.fromisoformat(str(event_meta["collected_at"]))):
         reason = "event_off_hours"  # cameras.json receiver_event_off_hours 시간대에 난 이벤트: 전송만 막음(판정·저장은 했음)
@@ -2528,9 +2546,11 @@ class VideoRecorder:
             logger.info(f"[VIDEO API] 관제로 보내지 않기로 한 과속 이벤트(차량번호 없음·같은 번호 중복)라 영상도 보내지 않습니다. "
                         f"event_id={event_id}")
             return
-        if not RECEIVER_SEND_VIDEO.get(receiver_site(), True):
-            logger.info(f"[VIDEO API] {receiver_site().upper()}는 영상을 관제로 보내지 않습니다(사진만). 단말에 남김: {fpath} "
-                        f"event_id={event_id}")
+        send_video = (RECEIVER_ACTIVE_STREAMING if RECEIVER_ACTIVE_STREAMING is not None
+                      else RECEIVER_SEND_VIDEO.get(receiver_site(), True))
+        if not send_video:
+            why = "관제 activeStreaming false" if RECEIVER_ACTIVE_STREAMING is False else f"{receiver_site().upper()} 기본값"
+            logger.info(f"[VIDEO API] 영상을 관제로 보내지 않습니다({why}, 사진만). 단말에 남김: {fpath} event_id={event_id}")
             return
         try:
             submit_event_send(send_event_video_to_receiver, fpath, copy.deepcopy(meta),
@@ -11505,7 +11525,23 @@ class HealthCheckDaemon:
                     new_conf.update(disk_conf)
 
                 item_changed = False
+                seaside = SEASIDE_PERSON_EVENT in (new_conf.get("events") or [])
                 for key, value in roi_updates.items():
+                    if seaside and key == "roi_poly_norm":
+                        # 해측 카메라의 관제 ROI는 위험 구역(zone_norm)입니다. 3점이 안 되면 위험 구역이 없어져 판정이
+                        # 멈추므로 받지 않고 단말 값을 둡니다.
+                        if len(value) < 3:
+                            logger.warning(f"[Health Check] 해측 위험 구역은 3점 이상이어야 해 받지 않습니다: "
+                                           f"cctvId={item.get('cctvId')!r} points={len(value)}")
+                            continue
+                        event_cfg = dict(new_conf.get("event_config") or {})
+                        seaside_cfg = dict(event_cfg.get(SEASIDE_PERSON_EVENT) or {})
+                        if self._coerce_roi_norm_points(seaside_cfg.get("zone_norm")) != value:
+                            seaside_cfg["zone_norm"] = value
+                            event_cfg[SEASIDE_PERSON_EVENT] = seaside_cfg
+                            new_conf["event_config"] = event_cfg
+                            item_changed = True
+                        continue
                     key_was_present = key in new_conf
                     old_value = new_conf.get(key)
                     try:
@@ -11544,7 +11580,7 @@ class HealthCheckDaemon:
                 logger.info(
                     f"[Health Check] ROI settings applied: "
                     f"cctvId={cam.cam_id} camera={cam.ip} keys={','.join(sorted(roi_updates.keys()))} "
-                    f"poly={len(new_conf.get('roi_poly_norm', []) or [])} "
+                    f"poly={len(control_roi_poly_norm(new_conf))} "
                     f"lines={len(new_conf.get('roi_lines_norm', []) or [])}"
                 )
             except Exception as e:
@@ -11571,6 +11607,25 @@ class HealthCheckDaemon:
                         enabled = name in cam.handlers and cam.receiver_event_status.get(name, True) is not False
                         statuses[remote_name] = statuses.get(remote_name, False) or enabled
         return [{"event_type": name, "event_status": enabled} for name, enabled in sorted(statuses.items())]
+
+    @staticmethod
+    def _apply_active_settings(payload):
+        """응답의 activeSettings(이벤트별 관제 전송 켜짐)와 activeStreaming(이벤트 영상 전송)을 기억합니다.
+        없거나 형식이 틀린 값은 건너뛰고 전 값을 둡니다. 바뀔 때만 로그를 남깁니다."""
+        global RECEIVER_ACTIVE_STREAMING
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            return
+        active = {item["eventType"]: item["eventStatus"] for item in (data.get("activeSettings") or [])
+                  if isinstance(item, dict) and isinstance(item.get("eventType"), str)
+                  and isinstance(item.get("eventStatus"), bool)}
+        if any(RECEIVER_ACTIVE_SETTINGS.get(name) is not value for name, value in active.items()):
+            RECEIVER_ACTIVE_SETTINGS.update(active)
+            logger.info(f"[Health Check] 관제 이벤트 전송 설정(activeSettings, false면 관제 전송만 막음): {active}")
+        streaming = data.get("activeStreaming")
+        if isinstance(streaming, bool) and streaming is not RECEIVER_ACTIVE_STREAMING:
+            RECEIVER_ACTIVE_STREAMING = streaming
+            logger.info(f"[Health Check] 관제 이벤트 영상 전송(activeStreaming): {streaming}")
 
     def post_health(self, data):
         if not self.url or not receiver_send_enabled():
@@ -11636,6 +11691,7 @@ class HealthCheckDaemon:
                     try:
                         payload = response.json()
                         logger.debug("[Health Check] response=%s", json.dumps(to_json_safe(payload), ensure_ascii=False)[:2000])
+                        self._apply_active_settings(payload)
                         updated_ids = self._apply_roi_settings_from_response(payload)
                         if updated_ids:
                             self.request_roi_snapshot_refresh(updated_ids, reason="roi_settings_applied_from_health_response")
@@ -12079,7 +12135,7 @@ def main():
                     c._ensure_roi(blurred_snap)
                     snap_img = create_roi_snapshot(c, blurred_snap)
                     h, w = snap_img.shape[:2]
-                    roi_info = {"roi_poly_norm": c.roi_poly_norm, "roi_lines_norm": c.roi_lines_norm}
+                    roi_info = {"roi_poly_norm": control_roi_poly_norm(c.conf), "roi_lines_norm": c.roi_lines_norm}
 
                     # 켠 뒤 카메라마다 처음 보내는 사진은 1시간 정기 전송이 아니라 시작 사진입니다(로그 이름만 다름).
                     snapshot_send_type = ("roi_refresh" if force_camera_snapshot
