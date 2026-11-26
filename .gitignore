@@ -25,3 +25,6 @@ __pycache__/
 
 # Exclude backup files (e.g. system_config.json.bak.<time> from install.sh)
 *.bak.*
+
+# Local test scripts and baselines (kept on each PC, not committed)
+tests/
