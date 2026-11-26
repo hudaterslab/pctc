@@ -195,10 +195,10 @@ TOPDOWN_CLASS_NAMES = ("YT_HEADER", "CONTAINER_40FT", "CONTAINER_20FT", "YT_CHAS
                        "TANK_20FT", "SPREADER", "PERSON", "VEHICLE")
 # hanjin_cctv_v2.dxnn(한진 CCTV 사람 모델, 옆·비스듬한 시점, 8클래스) 모델 키. 해측 추락 방지 사람 검출의 기본입니다
 # (event_config.seaside_person.person_model). 해측만 켠 카메라는 topdown 자리(엔진 결과·추적기 trk_topdown)에 이 모델을
-# 돌리고, 사람 3종(person·lowerbody·signalman)을 topdown PERSON 번호로 바꿔 넣습니다(hanjin_persons_as_topdown).
+# 돌리고, 사람 2종(person·signalman)을 topdown PERSON 번호로 바꿔 넣습니다(hanjin_persons_as_topdown). lowerbody는 쓰지 않습니다(11/26 결정).
 HANJIN_MODEL = "HANJIN_V2"
 HANJIN_CLASS_NAMES = ("helmet", "head", "person", "normalvehicle", "lowerbody", "signalman", "trunklinetruck", "xband")
-HANJIN_PERSON_IDS = tuple(HANJIN_CLASS_NAMES.index(name) for name in ("person", "lowerbody", "signalman"))
+HANJIN_PERSON_IDS = tuple(HANJIN_CLASS_NAMES.index(name) for name in ("person", "signalman"))
 # Backreach·YT 이벤트 tid = 이 값 + topdown 추적 번호(과속 1,000,000+·콘 900,000+와 겹치지 않게).
 TOPDOWN_TID_BASE = 3_000_000
 # 개인정보 블러용으로 topdown 클래스 번호를 메인 모델 번호로 바꿉니다(사람=얼굴 블러, 차량·YT=번호판 블러).
@@ -436,7 +436,7 @@ def load_system_config():
         # - CONE(cone 640x384, 1클래스 콘): 콘 NG 모서리 크롭(1280x736을 반으로 줄여 넣음)
         # - CONTAINER_OCR_DET(container_ocr_detector 1280x736, 2클래스: 0 BIC, 1 TYPE): 컨테이너 번호 OCR의 글자 영역.
         #   콘 NG가 처음 난 뒤에 올립니다(container_ocr).
-        # - HANJIN_V2(hanjin_cctv_v2, PPU, 8클래스): 해측 추락 방지 사람(person·lowerbody·signalman). 해측 카메라에만 올림
+        # - HANJIN_V2(hanjin_cctv_v2, PPU, 8클래스): 해측 추락 방지 사람(person·signalman). 해측 카메라에만 올림
         # side·cone은 raw 출력이어야 합니다(PPU는 장치에서 0.25 미만을 버려 콘 0.01 기준을 못 씀).
         "models": {
             "MAIN_V2": "speeding.dxnn",
@@ -465,7 +465,7 @@ def load_system_config():
             "FACE": {"face": 0.35},
             "PLATE": {"plate": 0.1},
             "TOPDOWN": {name: 0.25 for name in TOPDOWN_CLASS_NAMES},
-            "HANJIN_V2": {"person": 0.5, "lowerbody": 0.5, "signalman": 0.5},
+            "HANJIN_V2": {"person": 0.5, "signalman": 0.5},
             "SIDE": {"container": 0.25, "tank": 0.25, "spreader": 0.25, "person": 0.5, "YT_HEADER": 0.25},
             "CONE": {"cone": 0.01},
             "CONTAINER_OCR_DET": {"BIC": 0.25, "TYPE": 0.25}
@@ -5363,8 +5363,8 @@ def person_pass_model(events):
 
 
 def hanjin_persons_as_topdown(rows):
-    """hanjin_cctv_v2 검출 중 사람 3종(person·lowerbody·signalman)만 topdown PERSON 번호로 바꿉니다.
-    topdown 추적기·해측 판정·화면 표시를 그대로 씁니다. 같은 사람에 person과 lowerbody가 같이 잡혀도 묶음 쿨다운으로 1건."""
+    """hanjin_cctv_v2 검출 중 사람 2종(person·signalman)만 topdown PERSON 번호로 바꿉니다(lowerbody는 11/26 결정으로 뺌).
+    단말 system_config.json에 lowerbody 점수 기준이 남아 있어도 여기서 걸러집니다. topdown 추적기·해측 판정·화면 표시를 그대로 씁니다."""
     det = detection_array(rows)
     det = det[np.isin(det[:, 5].astype(int), HANJIN_PERSON_IDS)].copy()
     det[:, 5] = TOPDOWN_CLASS_NAMES.index("PERSON")
