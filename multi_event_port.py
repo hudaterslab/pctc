@@ -11133,10 +11133,13 @@ class Camera:
             display_name = EVENT_REGISTRY[evt].gui_name if evt in EVENT_REGISTRY else evt.upper()
             color = (0, 0, 255) if evt in active_alarms else (0, 255, 0)
             prefix = "[!] " if evt in active_alarms else " -  "
+            api_type = receiver_event_type(evt, ((self.conf.get("event_config") or {}).get(evt) or {}).get("api_event_type"))
             if (self.receiver_event_status.get(evt, True) is False or not receiver_send_enabled(self.cam_id)
+                    or RECEIVER_ACTIVE_SETTINGS.get(RECEIVER_EVENT_NAMES.get(api_type)) is False
                     or receiver_event_off_hours(self.cam_id, evt, datetime.datetime.now(pytz.timezone("Asia/Seoul")))):
                 # 설정에서 관제 전송을 끈 이벤트(cameras.json receiver_event_status false·지금이 receiver_event_off_hours
-                # 시간대, 또는 system_config.json receiver.enabled false·cctv_ids에 없는 카메라): 관제 전송만 꺼짐(판정은 계속).
+                # 시간대, system_config.json receiver.enabled false·cctv_ids에 없는 카메라, 또는 관제 activeSettings false):
+                # 관제 전송만 꺼짐(판정은 계속).
                 color, prefix = (160, 160, 160), "[API OFF] "
             hud_text(f"{prefix}{display_name}", (w_frame - px(10), y_pos), color, 0.5, align_right=True)
             y_pos += px(24)
