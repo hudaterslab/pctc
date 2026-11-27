@@ -313,7 +313,8 @@ def load_system_config():
         "health_check": {"interval_sec": 60, "verify_tls": True},
         "event_api": {"verify_tls": True},
         "video_api": {"verify_tls": True, "timeout_sec": 60},
-        "roi_snapshot": {"interval_sec": 3600, "verify_tls": True},
+        # timeout_sec: 업로드가 느린 현장(4호기 11/27, 1080p 한 장 12~15초)에서 15초면 화면이 복잡한 카메라 사진이 잘려 20초로 둡니다.
+        "roi_snapshot": {"interval_sec": 3600, "verify_tls": True, "timeout_sec": 20},
         # PCTC 인터페이스 서버의 크레인 PLC·CPS 최신 값(문서: http://<단말>:24000/docs). PCTC 단말마다 이 서버가 docker로
         # 같이 떠 있어(포트 24000) 자기 자신에게 묻습니다. receiver.site가 pctc일 때만 받습니다.
         # use_for_events: 받은 값을 판정에 씁니다(Backreach 감시 ON·OFF = 해치 커버 작업 모드, YT 헤드압착·위험구역 사람
@@ -776,7 +777,8 @@ def _send_roi_snapshot_task(cam_id, crane_id, img, roi_info_str, w, h, send_type
             "image": (f"snapshot_cam{cam_id}.jpg", img_encoded.tobytes(), "image/jpeg")
         }
 
-        resp = requests.post(url, data=data, files=files, verify=SYS_CFG["roi_snapshot"]["verify_tls"], timeout=15)
+        resp = requests.post(url, data=data, files=files, verify=SYS_CFG["roi_snapshot"]["verify_tls"],
+                             timeout=SYS_CFG["roi_snapshot"]["timeout_sec"])
 
         if receiver_response_ok(resp):
             logger.info(f" [ROI Snapshot][{send_label}] CAM:{cam_id} 전송 성공")
